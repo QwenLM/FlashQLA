@@ -3,7 +3,7 @@
 
 import os
 import subprocess
-from setuptools import setup
+from setuptools import setup, find_packages
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -19,7 +19,7 @@ setup(
     name="flash_qla",
     version="0.1.0" + rev,
     description="FlashQLA: Fused TileLang kernels for Linear Attention",
-    packages=["flash_qla"],
+    packages=find_packages(),
     license="MIT",
     python_requires=">=3.10",
     install_requires=[
