@@ -230,7 +230,6 @@ def chunk_gated_delta_rule(
         initial_state,
         output_final_state,
         cu_seqlens,
-        use_qk_l2norm_in_kernel,
     )
 
     return o, final_state
