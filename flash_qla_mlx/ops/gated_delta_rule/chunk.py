@@ -31,9 +31,9 @@ def _chunk_local_cumsum(
     g = pad_and_reshape(g, dim=1, chunk_size=chunk_size)  # [B, N, C, H]
 
     if reverse:
-        g = mx.flip(g, axis=2)
+        g = g[:, :, ::-1, :]
         g = mx.cumsum(g, axis=2)
-        g = mx.flip(g, axis=2)
+        g = g[:, :, ::-1, :]
     else:
         g = mx.cumsum(g, axis=2)
 
@@ -466,7 +466,7 @@ def _chunk_dqkwg_bwd(
     dg_last = dg_last * mx.exp(g_last)
     dq = dq * mx.exp(g)[..., None] * scale
     dg = (q * dq).sum(axis=-1)
-    dk = dk * mx.exp(g_last[:, :, None, :, None] - g)[..., None]
+    dk = dk * mx.exp(g_last[:, :, None, :] - g)[..., None]
     dg = dg - (k * dk).sum(axis=-1)
     dg_last = dg_last + (k * dk).sum(axis=-1).sum(axis=-2)
     ds = ds * decay_mask * scale
