@@ -27,5 +27,8 @@ setup(
         "tilelang==0.1.8",
         "apache-tvm-ffi==0.1.9",
     ],
+    extras_require={
+        "mlx": ["mlx>=0.24.0"],
+    },
     zip_safe=False,
 )
