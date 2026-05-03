@@ -95,13 +95,18 @@ def _kkt_solve(
     x = -pad_and_reshape(x, dim=1, chunk_size=chunk_size)  # [B, N, C, H, D]
     x = mx.swapaxes(x, 2, 3)  # [B, N, H, C, D]
 
+    # Forward substitution without in-place mutation.
+    # Accumulate solved rows into a growing matrix [B, N, H, i, C].
+    accumulated = x[..., 0:1, :]  # row 0 unchanged, [B, N, H, 1, C]
     for i in range(1, chunk_size):
-        row = x[..., i, :i]          # [B, N, H, i]
-        sub = x[..., :i, :i]         # [B, N, H, i, i]
-        new_val = row + (row[..., None] * sub).sum(axis=-2)
-        x[..., i, :i] = new_val
+        sub_i = accumulated[..., :i]               # [B, N, H, i, i]
+        row_i = x[..., i:i+1, :i]                 # [B, N, H, 1, i]
+        new_val = row_i + mx.matmul(row_i, sub_i)  # [B, N, H, 1, i]
+        pad = mx.zeros((*new_val.shape[:-1], chunk_size - i), dtype=x.dtype)
+        new_row = mx.concatenate([new_val, pad], axis=-1)  # [B, N, H, 1, C]
+        accumulated = mx.concatenate([accumulated, new_row], axis=-2)
 
-    x = x + mx.eye(chunk_size, dtype=x.dtype)
+    x = accumulated + mx.eye(chunk_size, dtype=x.dtype)
     x = mx.swapaxes(x, 2, 3)        # [B, N, C, H, D]
     x = x.reshape(batch_size, -1, num_heads, chunk_size)[:, :num_tokens]
 
