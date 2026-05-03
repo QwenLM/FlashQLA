@@ -58,22 +58,31 @@ def _kkt_fwd(
 
     batch_size, num_tokens, num_k_heads, head_dim = k.shape
     num_v_heads = g.shape[-1]
+    gqa_ratio = num_v_heads // num_k_heads
 
-    if num_k_heads != num_v_heads:
-        k = mx.repeat(k, num_v_heads // num_k_heads, axis=2)
-
-    k = pad_and_reshape(k, dim=1, chunk_size=chunk_size)      # [B, N, C, H, K]
-    g = pad_and_reshape(g, dim=1, chunk_size=chunk_size)      # [B, N, C, H]
-    beta = pad_and_reshape(beta, dim=1, chunk_size=chunk_size)  # [B, N, C, H]
+    k = pad_and_reshape(k, dim=1, chunk_size=chunk_size)      # [B, N, C, Hk, K]
+    g = pad_and_reshape(g, dim=1, chunk_size=chunk_size)      # [B, N, C, Hv]
+    beta = pad_and_reshape(beta, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv]
 
     mask = mx.triu(mx.ones((chunk_size, chunk_size), dtype=mx.bool_), k=0)
-    decay_mask = mx.exp(g[:, :, :, None, :] - g[:, :, None, :, :])  # [B, N, C, C, H]
+    decay_mask = mx.exp(g[:, :, :, None, :] - g[:, :, None, :, :])  # [B, N, C, C, Hv]
     decay_mask = mx.where(mask[None, None, :, :, None], mx.zeros_like(decay_mask), decay_mask)
 
-    # attn[b, n, c, h, d] = (k_beta[b,n,c,h,:] . k[b,n,d,h,:]) * decay[b,n,c,d,h]
-    attn = mx.einsum(
-        "bnchk,bndhk->bnchd", k * beta[:, :, :, :, None], k
-    ) * mx.swapaxes(decay_mask, -2, -1)
+    # Compute gram matrix using Hk heads only, then combine with Hv-dimensional
+    # beta/decay via a reshape+broadcast (zero-copy) to avoid expanding k by gqa_ratio.
+    # attn[c,h,d] = beta[c,h] * (k[c,g,:] . k[d,g,:]) * decay[c,d,h]  g = h // gqa_ratio
+    gram = mx.einsum("bnchk,bndhk->bnchd", k, k)          # [B, N, C, Hk, D]
+    if gqa_ratio > 1:
+        B, N = gram.shape[:2]
+        # beta_decay: [B, N, C, Hk, gqa_ratio, D]  (no copy of gram needed)
+        beta_decay = (
+            beta[:, :, :, :, None] * mx.swapaxes(decay_mask, -2, -1)
+        ).reshape(B, N, chunk_size, num_k_heads, gqa_ratio, chunk_size)
+        attn = (gram[:, :, :, :, None, :] * beta_decay).reshape(
+            B, N, chunk_size, num_v_heads, chunk_size
+        )
+    else:
+        attn = gram * beta[:, :, :, :, None] * mx.swapaxes(decay_mask, -2, -1)
     attn = attn.reshape(batch_size, -1, num_v_heads, chunk_size)[:, :num_tokens]
 
     if cu_seqlens is not None:
