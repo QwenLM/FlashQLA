@@ -718,6 +718,14 @@ def chunk_gated_delta_rule_bwd(
     return dq, dk, dv_out, db, dg, dh0
 
 
+# Compiled variants for the common cu_seqlens=None path.
+# mx.compile traces all Python loops once at first call per shape, unrolling
+# them into a static Metal graph.  Falls back to uncompiled for variable-length
+# (cu_seqlens) inputs because those paths call .item() during tracing.
+_compiled_fwd = mx.compile(chunk_gated_delta_rule_fwd)
+_compiled_bwd = mx.compile(chunk_gated_delta_rule_bwd)
+
+
 def chunk_gated_delta_rule(
     q: mx.array,
     k: mx.array,
@@ -771,11 +779,13 @@ def chunk_gated_delta_rule(
     # We use closures to capture scale, cu_seqlens, and the presence of h0.
     _scale = scale
     _cu_seqlens = cu_seqlens
+    _fwd = _compiled_fwd if cu_seqlens is None else chunk_gated_delta_rule_fwd
+    _bwd = _compiled_bwd if cu_seqlens is None else chunk_gated_delta_rule_bwd
 
     if initial_state is not None:
         @mx.custom_function
         def _fn(q, k, v, g, beta, h0):
-            g_out, A, o, _, fs = chunk_gated_delta_rule_fwd(
+            g_out, A, o, _, fs = _fwd(
                 q=q, k=k, v=v, g=g, beta=beta,
                 scale=_scale, initial_state=h0,
                 cu_seqlens=_cu_seqlens,
@@ -789,7 +799,7 @@ def chunk_gated_delta_rule(
             q, k, v, g, beta, h0 = primals
             do, dfs, _, _ = cotangents
             _, _, g_out, A = outputs
-            dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
+            dq, dk, dv, db, dg, dh0 = _bwd(
                 q=q, k=k, v=v, g=g_out, beta=beta, A=A,
                 do=do, dht=dfs, scale=_scale,
                 initial_state=h0, cu_seqlens=_cu_seqlens,
@@ -800,7 +810,7 @@ def chunk_gated_delta_rule(
     else:
         @mx.custom_function
         def _fn(q, k, v, g, beta):
-            g_out, A, o, _, fs = chunk_gated_delta_rule_fwd(
+            g_out, A, o, _, fs = _fwd(
                 q=q, k=k, v=v, g=g, beta=beta,
                 scale=_scale, initial_state=None,
                 cu_seqlens=_cu_seqlens,
@@ -814,7 +824,7 @@ def chunk_gated_delta_rule(
             q, k, v, g, beta = primals
             do, _, _, _ = cotangents
             _, _, g_out, A = outputs
-            dq, dk, dv, db, dg, _ = chunk_gated_delta_rule_bwd(
+            dq, dk, dv, db, dg, _ = _bwd(
                 q=q, k=k, v=v, g=g_out, beta=beta, A=A,
                 do=do, dht=None, scale=_scale,
                 initial_state=None, cu_seqlens=_cu_seqlens,
