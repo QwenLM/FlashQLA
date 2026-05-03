@@ -90,6 +90,54 @@ def _kkt_fwd(
     return attn
 
 
+# Module-level cache for Metal kkt_solve kernels, keyed by chunk_size.
+# Each kernel solves (I - x_in)^{-1} for a batch of C×C lower-triangular
+# matrices in a single GPU dispatch: one thread per (batch, column) pair,
+# computing that column of the inverse via forward substitution.
+_KKT_SOLVE_KERNELS: dict = {}
+
+
+def _get_kkt_solve_kernel(chunk_size: int):
+    if chunk_size not in _KKT_SOLVE_KERNELS:
+        C = chunk_size
+        # Each threadgroup handles one (batch, n, h) element; C threads handle
+        # C columns in parallel.  Columns are independent so no barrier is needed.
+        # Threadgroup memory avoids the register-spill bug seen with T x_col[C]
+        # at C=64 in Metal's shader compiler.
+        source = f"""
+            uint b = threadgroup_position_in_grid.x;
+            uint j = thread_position_in_threadgroup.x;
+
+            // Column j of (I - x_in)^{{-1}} via forward substitution.
+            // x_in holds strictly-lower-triangular entries -L (negative values).
+            // X[i, j] = delta(i==j) + sum_{{d<i}} x_in[i, d] * X[d, j]
+            threadgroup float X_tg[{C * C}];
+
+            for (uint i = 0; i < {C}u; i++) {{
+                X_tg[i * {C}u + j] = (i == j) ? 1.0f : 0.0f;
+            }}
+
+            for (uint i = 1; i < {C}u; i++) {{
+                float acc = X_tg[i * {C}u + j];
+                for (uint d = 0; d < i; d++) {{
+                    acc += (float)x_in[b * {C * C}u + i * {C}u + d] * X_tg[d * {C}u + j];
+                }}
+                X_tg[i * {C}u + j] = acc;
+            }}
+
+            for (uint i = 0; i < {C}u; i++) {{
+                out[b * {C * C}u + i * {C}u + j] = (T)X_tg[i * {C}u + j];
+            }}
+        """
+        _KKT_SOLVE_KERNELS[chunk_size] = mx.fast.metal_kernel(
+            name=f"kkt_solve_cs{C}",
+            input_names=["x_in"],
+            output_names=["out"],
+            source=source,
+        )
+    return _KKT_SOLVE_KERNELS[chunk_size]
+
+
 def _kkt_solve(
     x: mx.array,
     cu_seqlens: mx.array = None,
@@ -100,23 +148,29 @@ def _kkt_solve(
 
     batch_size, num_tokens, num_heads, _ = x.shape
 
-    # x: [B, T, H, D] -> [B, N, H, C, D] (negated, lower-tri solve)
-    x = -pad_and_reshape(x, dim=1, chunk_size=chunk_size)  # [B, N, C, H, D]
-    x = mx.swapaxes(x, 2, 3)  # [B, N, H, C, D]
+    # x: [B, T, H, D] -> [B, N, H, C, C] (negated, lower-tri solve)
+    x = -pad_and_reshape(x, dim=1, chunk_size=chunk_size)  # [B, N, C, H, C]
+    x = mx.swapaxes(x, 2, 3)  # [B, N, H, C, C]
 
-    # Forward substitution without in-place mutation.
-    # Accumulate solved rows into a growing matrix [B, N, H, i, C].
-    accumulated = x[..., 0:1, :]  # row 0 unchanged, [B, N, H, 1, C]
-    for i in range(1, chunk_size):
-        sub_i = accumulated[..., :i]               # [B, N, H, i, i]
-        row_i = x[..., i:i+1, :i]                 # [B, N, H, 1, i]
-        new_val = row_i + mx.matmul(row_i, sub_i)  # [B, N, H, 1, i]
-        pad = mx.zeros((*new_val.shape[:-1], chunk_size - i), dtype=x.dtype)
-        new_row = mx.concatenate([new_val, pad], axis=-1)  # [B, N, H, 1, C]
-        accumulated = mx.concatenate([accumulated, new_row], axis=-2)
+    B, N, H, C, _ = x.shape
+    batch_total = B * N * H
 
-    x = accumulated + mx.eye(chunk_size, dtype=x.dtype)
-    x = mx.swapaxes(x, 2, 3)        # [B, N, C, H, D]
+    # Single Metal dispatch: one threadgroup per batch element, C threads per
+    # group each solving one column of (I - x)^{-1} independently.
+    # Replaces the (chunk_size - 1)-step Python loop with one GPU kernel call.
+    # NOTE: grid = total threads (not threadgroups). With threadgroup=(C,1,1),
+    # number of threadgroups = grid.x / C = batch_total. So grid.x = batch_total * C.
+    x = _get_kkt_solve_kernel(C)(
+        inputs=[mx.contiguous(x).reshape(batch_total, C, C)],
+        template=[("T", x.dtype)],
+        grid=(batch_total * C, 1, 1),
+        threadgroup=(C, 1, 1),
+        output_shapes=[(batch_total, C, C)],
+        output_dtypes=[x.dtype],
+    )[0].reshape(B, N, H, C, C)
+
+    x = mx.swapaxes(x, 2, 3)        # [B, N, C, H, C] — non-contiguous after swapaxes
+    x = mx.contiguous(x)            # merge dims (N,C) requires C-contiguous layout
     x = x.reshape(batch_size, -1, num_heads, chunk_size)[:, :num_tokens]
 
     if cu_seqlens is not None:
