@@ -9,37 +9,35 @@ def unpack(
     cu_seqlens: mx.array,
 ) -> mx.array:
     assert x.shape[0] == 1
-    batch_size = cu_seqlens.shape[0] - 1
-    seqlens = [
-        int((cu_seqlens[i + 1] - cu_seqlens[i]).item()) for i in range(batch_size)
-    ]
-    max_len = max(seqlens)
-    rest = x.shape[2:]
+    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]              # [B]
+    max_len = int(mx.max(seqlens).item())
 
-    parts = []
-    for i in range(batch_size):
-        start = int(cu_seqlens[i].item())
-        end = int(cu_seqlens[i + 1].item())
-        chunk = x[0, start:end]
-        if end - start < max_len:
-            pad_width = [(0, max_len - (end - start))] + [(0, 0)] * len(rest)
-            chunk = mx.pad(chunk, pad_width)
-        parts.append(chunk)
-    return mx.stack(parts, axis=0)  # [B, max_len, *dims]
+    t = mx.arange(max_len, dtype=mx.int32)                   # [max_len]
+    src = mx.expand_dims(cu_seqlens[:-1], 1) + t             # [B, max_len]
+    src = mx.clip(src, 0, x.shape[1] - 1)
+
+    out = x[0][src]                                          # [B, max_len, *dims]
+
+    valid = t < mx.expand_dims(seqlens, 1)                   # [B, max_len]
+    for _ in x.shape[2:]:
+        valid = mx.expand_dims(valid, -1)
+    return mx.where(valid, out, mx.zeros_like(out))
 
 
 def pack(
     x: mx.array,  # [B, max_T, *dims]
     cu_seqlens: mx.array,
 ) -> mx.array:
-    batch_size = cu_seqlens.shape[0] - 1
-    parts = []
-    for i in range(batch_size):
-        start = int(cu_seqlens[i].item())
-        end = int(cu_seqlens[i + 1].item())
-        parts.append(x[i, : end - start])
-    packed = mx.concatenate(parts, axis=0)  # [sum_T, *dims]
-    return packed[None]  # [1, sum_T, *dims]
+    sum_T = int(cu_seqlens[-1].item())
+
+    i = mx.arange(sum_T, dtype=mx.int32)                     # [sum_T]
+    # b_idx[i] = batch element that packed position i belongs to
+    b_idx = (
+        mx.expand_dims(i, 1) >= mx.expand_dims(cu_seqlens[1:], 0)
+    ).sum(axis=1).astype(mx.int32)                           # [sum_T]
+    t_idx = (i - cu_seqlens[b_idx]).astype(mx.int32)         # [sum_T]
+
+    return x[b_idx, t_idx][None]                             # [1, sum_T, *dims]
 
 
 def pad_and_reshape(
@@ -138,10 +136,9 @@ def fill_last_chunk_of_g(
 
 
 def prepare_chunk_offsets(cu_seqlens: mx.array, chunk_size: int) -> mx.array:
-    batch_size = cu_seqlens.shape[0] - 1
-    offsets = [0]
-    for i in range(batch_size):
-        seqlen = int((cu_seqlens[i + 1] - cu_seqlens[i]).item())
-        n_chunks = (seqlen + chunk_size - 1) // chunk_size
-        offsets.append(offsets[-1] + n_chunks)
-    return mx.array(offsets, dtype=mx.int32)
+    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]              # [B]
+    n_chunks = (seqlens + chunk_size - 1) // chunk_size      # ceiling division
+    return mx.concatenate([
+        mx.array([0], dtype=mx.int32),
+        mx.cumsum(n_chunks).astype(mx.int32),
+    ])
