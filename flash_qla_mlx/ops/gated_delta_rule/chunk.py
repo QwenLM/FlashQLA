@@ -205,6 +205,12 @@ def _chunk_gdr_fwd(
     else:
         last_state = initial_state.astype(g.dtype)
 
+    # Inter-chunk recurrence: h_i = A_i @ h_{i-1} + b_i (linear recurrence).
+    # A parallel prefix scan is theoretically possible but costs O(K^3) per
+    # operator composition vs O(K^2) sequential, giving 512-1280x more FLOPs
+    # for typical head dims (K=64-128) and sequence lengths.  Sequential is
+    # the correct algorithm here.  With mx.compile, this loop is unrolled into
+    # a static Metal graph so Python dispatch overhead is paid only once.
     h_list, vn_list = [], []
     for i in range(k.shape[1]):
         h_list.append(last_state)
