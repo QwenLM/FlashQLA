@@ -64,7 +64,7 @@ def _kkt_fwd(
     g = pad_and_reshape(g, dim=1, chunk_size=chunk_size)      # [B, N, C, Hv]
     beta = pad_and_reshape(beta, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv]
 
-    mask = mx.triu(mx.ones((chunk_size, chunk_size), dtype=mx.bool_), k=0)
+    mask = _get_mask(chunk_size, diagonal=0)
     decay_mask = mx.exp(g[:, :, :, None, :] - g[:, :, None, :, :])  # [B, N, C, C, Hv]
     decay_mask = mx.where(mask[None, None, :, :, None], mx.zeros_like(decay_mask), decay_mask)
 
@@ -90,52 +90,63 @@ def _kkt_fwd(
     return attn
 
 
-# Module-level cache for Metal kkt_solve kernels, keyed by chunk_size.
-# Each kernel solves (I - x_in)^{-1} for a batch of C×C lower-triangular
-# matrices in a single GPU dispatch: one thread per (batch, column) pair,
-# computing that column of the inverse via forward substitution.
+# Module-level caches.
 _KKT_SOLVE_KERNELS: dict = {}
+_TRIU_MASKS: dict = {}
 
 
-def _get_kkt_solve_kernel(chunk_size: int):
-    if chunk_size not in _KKT_SOLVE_KERNELS:
+def _get_mask(size: int, diagonal: int = 0) -> mx.array:
+    key = (size, diagonal)
+    if key not in _TRIU_MASKS:
+        _TRIU_MASKS[key] = mx.triu(mx.ones((size, size), dtype=mx.bool_), k=diagonal)
+    return _TRIU_MASKS[key]
+
+
+def _get_kkt_solve_kernel(chunk_size: int, num_heads: int):
+    """Return a cached Metal kernel for the KKT triangular solve.
+
+    Input/output layout: [B*N, C, H, C]  (the natural output of pad_and_reshape).
+    Each of the B*N*H matrices is accessed with stride H*C between rows so we
+    never need swapaxes or mx.contiguous — the reshape B*N from [B,N,...] is
+    always a valid contiguous merge of leading dims.
+    """
+    key = (chunk_size, num_heads)
+    if key not in _KKT_SOLVE_KERNELS:
         C = chunk_size
-        # Each threadgroup handles one (batch, n, h) element; C threads handle
-        # C columns in parallel.  Columns are independent so no barrier is needed.
-        # Threadgroup memory avoids the register-spill bug seen with T x_col[C]
-        # at C=64 in Metal's shader compiler.
+        H = num_heads
+        HC = H * C
+        CHC = C * H * C
+        # Threadgroup b_total maps to matrix (bn, h):  bn = b_total / H, h = b_total % H.
+        # Row i of that matrix: flat offset bn*CHC + i*HC + h*C  (stride HC between rows).
+        # Column j is thread index (one thread per column, parallel and independent).
         source = f"""
-            uint b = threadgroup_position_in_grid.x;
+            uint b_total = threadgroup_position_in_grid.x;
             uint j = thread_position_in_threadgroup.x;
-
-            // Column j of (I - x_in)^{{-1}} via forward substitution.
-            // x_in holds strictly-lower-triangular entries -L (negative values).
-            // X[i, j] = delta(i==j) + sum_{{d<i}} x_in[i, d] * X[d, j]
+            uint bn = b_total / {H}u;
+            uint h  = b_total % {H}u;
             threadgroup float X_tg[{C * C}];
-
             for (uint i = 0; i < {C}u; i++) {{
                 X_tg[i * {C}u + j] = (i == j) ? 1.0f : 0.0f;
             }}
-
             for (uint i = 1; i < {C}u; i++) {{
                 float acc = X_tg[i * {C}u + j];
                 for (uint d = 0; d < i; d++) {{
-                    acc += (float)x_in[b * {C * C}u + i * {C}u + d] * X_tg[d * {C}u + j];
+                    acc += (float)x_in[bn * {CHC}u + i * {HC}u + h * {C}u + d]
+                           * X_tg[d * {C}u + j];
                 }}
                 X_tg[i * {C}u + j] = acc;
             }}
-
             for (uint i = 0; i < {C}u; i++) {{
-                out[b * {C * C}u + i * {C}u + j] = (T)X_tg[i * {C}u + j];
+                out[bn * {CHC}u + i * {HC}u + h * {C}u + j] = (T)X_tg[i * {C}u + j];
             }}
         """
-        _KKT_SOLVE_KERNELS[chunk_size] = mx.fast.metal_kernel(
-            name=f"kkt_solve_cs{C}",
+        _KKT_SOLVE_KERNELS[key] = mx.fast.metal_kernel(
+            name=f"kkt_solve_cs{C}_h{H}",
             input_names=["x_in"],
             output_names=["out"],
             source=source,
         )
-    return _KKT_SOLVE_KERNELS[chunk_size]
+    return _KKT_SOLVE_KERNELS[key]
 
 
 def _kkt_solve(
@@ -148,30 +159,22 @@ def _kkt_solve(
 
     batch_size, num_tokens, num_heads, _ = x.shape
 
-    # x: [B, T, H, D] -> [B, N, H, C, C] (negated, lower-tri solve)
+    # pad_and_reshape → [B, N, C, H, C] (contiguous).
+    # Reshape to [B*N, C, H, C] — valid contiguous merge of leading dims.
+    # The kernel uses strided row access (stride HC between rows) so no
+    # swapaxes or mx.contiguous is needed before or after dispatch.
     x = -pad_and_reshape(x, dim=1, chunk_size=chunk_size)  # [B, N, C, H, C]
-    x = mx.swapaxes(x, 2, 3)  # [B, N, H, C, C]
-
-    B, N, H, C, _ = x.shape
+    B, N, C, H, _ = x.shape
     batch_total = B * N * H
 
-    # Single Metal dispatch: one threadgroup per batch element, C threads per
-    # group each solving one column of (I - x)^{-1} independently.
-    # Replaces the (chunk_size - 1)-step Python loop with one GPU kernel call.
-    # NOTE: grid = total threads (not threadgroups). With threadgroup=(C,1,1),
-    # number of threadgroups = grid.x / C = batch_total. So grid.x = batch_total * C.
-    x = _get_kkt_solve_kernel(C)(
-        inputs=[mx.contiguous(x).reshape(batch_total, C, C)],
+    x = _get_kkt_solve_kernel(C, H)(
+        inputs=[x.reshape(B * N, C, H, C)],
         template=[("T", x.dtype)],
         grid=(batch_total * C, 1, 1),
         threadgroup=(C, 1, 1),
-        output_shapes=[(batch_total, C, C)],
+        output_shapes=[(B * N, C, H, C)],
         output_dtypes=[x.dtype],
-    )[0].reshape(B, N, H, C, C)
-
-    x = mx.swapaxes(x, 2, 3)        # [B, N, C, H, C] — non-contiguous after swapaxes
-    x = mx.contiguous(x)            # merge dims (N,C) requires C-contiguous layout
-    x = x.reshape(batch_size, -1, num_heads, chunk_size)[:, :num_tokens]
+    )[0].reshape(batch_size, -1, num_heads, chunk_size)[:, :num_tokens]
 
     if cu_seqlens is not None:
         x = pack(x, cu_seqlens)
@@ -334,9 +337,7 @@ def _chunk_o_fwd(
 
     q = q * scale
 
-    mask = mx.triu(
-        mx.ones((chunk_size, chunk_size), dtype=mx.bool_), k=1
-    )
+    mask = _get_mask(chunk_size, diagonal=1)
     decay_mask = mx.exp(g[:, :, :, None, :] - g[:, :, None, :, :])
     decay_mask = mx.where(mask[None, None, :, :, None], mx.zeros_like(decay_mask), decay_mask)
 
@@ -386,7 +387,7 @@ def _chunk_dv_bwd(
 
     q = q * scale
 
-    mask = mx.triu(mx.ones((chunk_size, chunk_size), dtype=mx.bool_), k=1)
+    mask = _get_mask(chunk_size, diagonal=1)
     decay_mask = mx.exp(g[:, :, :, None, :] - g[:, :, None, :, :])
     decay_mask = mx.where(mask[None, None, :, :, None], mx.zeros_like(decay_mask), decay_mask)
 
@@ -450,17 +451,17 @@ def _chunk_gdr_bwd(
         "bnchk,bnchv->bnhkv", q * mx.exp(g)[..., None], do
     )
 
-    dh_list = []
-    dv_list = list(mx.split(dv, dv.shape[1], axis=1))  # list of [B,1,C,Hv,V]
+    dh_acc = []
+    dv_acc = []
+    dv_slices = list(mx.split(dv, dv.shape[1], axis=1))  # list of [B,1,C,Hv,V]
     for i in reversed(range(k.shape[1])):
-        dh_list.insert(0, dstate)
-        dv_i = dv_list[i][:, 0]  # [B, C, Hv, V]
-        dv_i = dv_i + mx.einsum(
+        dh_acc.append(dstate)
+        dv_i = dv_slices[i][:, 0] + mx.einsum(
             "bchk,bhkv->bchv",
             k[:, i] * mx.exp(g[:, i, -1:, :, None] - g[:, i, :, :, None]),
             dstate,
         )
-        dv_list[i] = dv_i
+        dv_acc.append(dv_i)
         dstate = dstate * mx.exp(g[:, i, -1, :])[:, :, None, None]
         dstate = (
             dstate
@@ -468,10 +469,10 @@ def _chunk_gdr_bwd(
             - mx.einsum("bchk,bchv->bhkv", w[:, i], dv_i)
         )
 
-    dh = mx.stack(dh_list, axis=1)
+    dh = mx.stack(dh_acc[::-1], axis=1)
 
     dh0 = None if h0 is None else dstate
-    dv = mx.stack(dv_list, axis=1).reshape(
+    dv = mx.stack(dv_acc[::-1], axis=1).reshape(
         batch_size, -1, num_v_heads, head_dim_v
     )[:, :num_tokens]
 
@@ -526,7 +527,7 @@ def _chunk_dqkwg_bwd(
     dv = pad_and_reshape(dv, dim=1, chunk_size=chunk_size)
     g = fill_last_chunk_of_g(g, num_tokens, cu_seqlens, chunk_size=chunk_size)
 
-    mask = mx.triu(mx.ones((chunk_size, chunk_size), dtype=mx.bool_), k=1)
+    mask = _get_mask(chunk_size, diagonal=1)
     decay_mask = mx.exp(g[:, :, :, None, :] - g[:, :, None, :, :])
     decay_mask = mx.where(mask[None, None, :, :, None], mx.zeros_like(decay_mask), decay_mask)
 
@@ -619,7 +620,7 @@ def _chunk_wy_bwd(
     dv = dv_beta * beta[..., None]
     db = db + (dv_beta * v).sum(axis=-1)
 
-    mask = mx.triu(mx.ones((chunk_size_A, chunk_size_A), dtype=mx.bool_), k=0)
+    mask = _get_mask(chunk_size_A, diagonal=0)
     decay_mask = mx.exp(g[:, :, :, None, :] - g[:, :, None, :, :])
     decay_mask = mx.where(
         mask[None, None, :, :, None], mx.zeros_like(decay_mask), decay_mask
