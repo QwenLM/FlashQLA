@@ -156,7 +156,7 @@ def _w_u_fwd(
     v_beta = pad_and_reshape(
         v * beta[..., None], dim=1, chunk_size=chunk_size
     )  # [B, N, C, Hv, V]
-    A = pad_and_reshape(A, dim=1)  # [B, N, C, Hv, D]
+    A = pad_and_reshape(A, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv, D]
 
     w = mx.einsum("bnchd,bndhk->bnchk", A, k_beta).reshape(
         batch_size, -1, num_v_heads, head_dim_k
@@ -532,7 +532,7 @@ def _chunk_wy_bwd(
     k = pad_and_reshape(k, dim=1, chunk_size=chunk_size_A)
     v = pad_and_reshape(v, dim=1, chunk_size=chunk_size_A)
     beta = pad_and_reshape(beta, dim=1, chunk_size=chunk_size_A)
-    A = pad_and_reshape(A, dim=1)
+    A = pad_and_reshape(A, dim=1, chunk_size=chunk_size_A)
     g = pad_and_reshape(g, dim=1, chunk_size=chunk_size_A)
     dw = pad_and_reshape(dw, dim=1, chunk_size=chunk_size_A)
     du = pad_and_reshape(du, dim=1, chunk_size=chunk_size_A)
@@ -608,6 +608,7 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: mx.array = None,
     output_final_state: bool = True,
     output_h: bool = False,
+    chunk_size: int = 64,
 ) -> tuple:
     """
     Forward pass of the Gated Delta Rule.
@@ -623,6 +624,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens:     Optional [S+1] int32, for variable-length inputs
         output_final_state: Whether to return the final state
         output_h:       Whether to return the chunk-level states h
+        chunk_size:     Tokens per chunk (default 64; tune for your hardware)
 
     Returns:
         (g_cumsum, A, o, h, final_state)
@@ -630,8 +632,6 @@ def chunk_gated_delta_rule_fwd(
     """
     if scale is None:
         scale = k.shape[-1] ** -0.5
-
-    chunk_size = 64
 
     g_cumsum = _chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
     A = _kkt(k=k, beta=beta, g=g_cumsum, cu_seqlens=cu_seqlens, chunk_size=chunk_size)
@@ -667,6 +667,7 @@ def chunk_gated_delta_rule_bwd(
     scale: float = None,
     initial_state: mx.array = None,
     cu_seqlens: mx.array = None,
+    chunk_size: int = 64,
 ) -> tuple:
     """
     Backward pass of the Gated Delta Rule.
@@ -676,14 +677,13 @@ def chunk_gated_delta_rule_bwd(
         do:           Gradient of the output [B, T, Hv, V]
         dht:          Gradient of the final state [B, Hv, K, V] or None
         scale, initial_state, cu_seqlens: same as forward
+        chunk_size:   Must match the value used in the forward pass
 
     Returns:
         (dq, dk, dv, db, dg, dh0)
     """
     if scale is None:
         scale = k.shape[-1] ** -0.5
-
-    chunk_size = 64
 
     w, u = _w_u_fwd(k=k, v=v, beta=beta, A=A, g=g, cu_seqlens=cu_seqlens)
     h, vn, _ = _chunk_gdr_fwd(
@@ -738,6 +738,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: mx.array = None,
     head_first: bool = False,
+    chunk_size: int = 64,
 ) -> tuple:
     """
     Gated Delta Rule: end-to-end forward with MLX-native gradient support.
@@ -754,6 +755,7 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel: L2-normalize q and k before computation
         cu_seqlens:     Optional variable-length sequence boundaries
         head_first:     Not supported (must be False)
+        chunk_size:     Tokens per chunk (default 64; tune for your hardware)
 
     Returns:
         (o, final_state)  — final_state is None if output_final_state=False
@@ -779,6 +781,7 @@ def chunk_gated_delta_rule(
     # We use closures to capture scale, cu_seqlens, and the presence of h0.
     _scale = scale
     _cu_seqlens = cu_seqlens
+    _chunk_size = chunk_size
     _fwd = _compiled_fwd if cu_seqlens is None else chunk_gated_delta_rule_fwd
     _bwd = _compiled_bwd if cu_seqlens is None else chunk_gated_delta_rule_bwd
 
@@ -790,6 +793,7 @@ def chunk_gated_delta_rule(
                 scale=_scale, initial_state=h0,
                 cu_seqlens=_cu_seqlens,
                 output_final_state=True, output_h=False,
+                chunk_size=_chunk_size,
             )
             fs_safe = fs if fs is not None else mx.zeros_like(h0)
             return o, fs_safe, g_out, A
@@ -803,6 +807,7 @@ def chunk_gated_delta_rule(
                 q=q, k=k, v=v, g=g_out, beta=beta, A=A,
                 do=do, dht=dfs, scale=_scale,
                 initial_state=h0, cu_seqlens=_cu_seqlens,
+                chunk_size=_chunk_size,
             )
             return dq, dk, dv, dg, db, dh0
 
@@ -815,6 +820,7 @@ def chunk_gated_delta_rule(
                 scale=_scale, initial_state=None,
                 cu_seqlens=_cu_seqlens,
                 output_final_state=output_final_state, output_h=False,
+                chunk_size=_chunk_size,
             )
             _dummy = mx.zeros((1,), dtype=q.dtype)
             return o, _dummy, g_out, A
@@ -828,6 +834,7 @@ def chunk_gated_delta_rule(
                 q=q, k=k, v=v, g=g_out, beta=beta, A=A,
                 do=do, dht=None, scale=_scale,
                 initial_state=None, cu_seqlens=_cu_seqlens,
+                chunk_size=_chunk_size,
             )
             return dq, dk, dv, dg, db
 
