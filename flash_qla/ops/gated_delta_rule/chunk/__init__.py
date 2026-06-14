@@ -7,11 +7,37 @@ import tilelang
 from flash_qla.utils import l2norm
 from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 
-if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
-    from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
-else:
-    raise ValueError("FlashQLA now support sm90 only.")
 from .cp_context import intra_card_cp_preprocess
+
+_target_compute_version = tilelang.contrib.nvcc.get_target_compute_version()
+if _target_compute_version == "9.0":
+    from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
+
+    _chunk_backend = "hopper"
+elif _target_compute_version == "10.0":
+    from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
+
+    _chunk_backend = "blackwell"
+else:
+    raise ValueError("FlashQLA now supports sm90/sm100 only.")
+
+
+def _check_backend_matches_device(x: torch.Tensor):
+    if not x.is_cuda:
+        return
+    major = torch.cuda.get_device_capability(x.device)[0]
+    if major >= 10 and _chunk_backend != "blackwell":
+        raise RuntimeError(
+            "FlashQLA was imported with the SM90/Hopper TileLang target, but the "
+            "input tensor is on an SM100+ Blackwell GPU. Re-import FlashQLA with "
+            "TileLang target 10.0 enabled."
+        )
+    if major == 9 and _chunk_backend != "hopper":
+        raise RuntimeError(
+            "FlashQLA was imported with the SM100/Blackwell TileLang target, but "
+            "the input tensor is on an SM90 Hopper GPU. Re-import FlashQLA with "
+            "TileLang target 9.0 enabled."
+        )
 
 
 def chunk_gated_delta_rule_fwd(
@@ -25,8 +51,19 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     output_final_state: bool = True,
     output_h: bool = False,
-    auto_cp: bool = True,
+    auto_cp: bool | None = None,
 ):
+    _check_backend_matches_device(q)
+    sm100_or_newer = q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 10
+    if auto_cp is None:
+        auto_cp = not sm100_or_newer
+    elif auto_cp and sm100_or_newer:
+        raise RuntimeError(
+            "FlashQLA auto_cp=True is not supported on SM100+ Blackwell GPUs. "
+            "Use auto_cp=None or auto_cp=False so the Blackwell fused path runs "
+            "without context-parallel splitting."
+        )
+
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     A = kkt_solve(
         k=k,
@@ -80,6 +117,7 @@ def chunk_gated_delta_rule_bwd(
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
 ):
+    _check_backend_matches_device(q)
     h, _, _ = fused_gdr_h(
         k=k,
         v=v,

@@ -8,13 +8,38 @@ import tilelang
 
 from flash_qla.utils import tensor_cache
 
-if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
+_target_compute_version = tilelang.contrib.nvcc.get_target_compute_version()
+if _target_compute_version == "9.0":
     from .hopper import get_warmup_chunks, fused_gdr_h, correct_initial_states
+
+    _chunk_backend = "hopper"
+elif _target_compute_version == "10.0":
+    from .blackwell import get_warmup_chunks, fused_gdr_h, correct_initial_states
+
+    _chunk_backend = "blackwell"
 else:
-    raise ValueError("FlashQLA now support sm90 only.")
+    raise ValueError("FlashQLA now supports sm90/sm100 only.")
 
 
 MULTI_PROCESSOR_COUNT = torch.cuda.get_device_properties().multi_processor_count
+
+
+def _check_backend_matches_device(x: torch.Tensor):
+    if not x.is_cuda:
+        return
+    major = torch.cuda.get_device_capability(x.device)[0]
+    if major >= 10 and _chunk_backend != "blackwell":
+        raise RuntimeError(
+            "FlashQLA was imported with the SM90/Hopper TileLang target, but the "
+            "input tensor is on an SM100+ Blackwell GPU. Re-import FlashQLA with "
+            "TileLang target 10.0 enabled."
+        )
+    if major == 9 and _chunk_backend != "hopper":
+        raise RuntimeError(
+            "FlashQLA was imported with the SM100/Blackwell TileLang target, but "
+            "the input tensor is on an SM90 Hopper GPU. Re-import FlashQLA with "
+            "TileLang target 9.0 enabled."
+        )
 
 
 @tensor_cache
@@ -113,6 +138,7 @@ def intra_card_cp_preprocess(
     raw_cu_seqlens: torch.Tensor,
     warmup_threshold: float = -10.0,
 ):
+    _check_backend_matches_device(k)
     batch_size, num_tokens, num_k_heads, k_head_dim = k.shape
     _, _, num_v_heads, v_head_dim = v.shape
     chunk_size = a.shape[-1]
