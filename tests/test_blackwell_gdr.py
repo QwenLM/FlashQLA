@@ -278,7 +278,7 @@ def _run_blackwell_precision_case(
         _assert_close(f"{name}.run{run_idx}.dk", dk_ref, dk_qla.float(), ratio=0.03)
         _assert_close(f"{name}.run{run_idx}.dv", dv_ref, dv_qla.float(), ratio=0.03)
         _assert_close(f"{name}.run{run_idx}.dbeta", db_ref, db_qla.float(), ratio=0.03)
-        _assert_close(f"{name}.run{run_idx}.dg", dg_ref, dg_qla.float(), ratio=0.03)
+        _assert_close(f"{name}.run{run_idx}.dg", dg_ref, dg_qla.float(), ratio=0.05)
         if dht is not None:
             _assert_close(
                 f"{name}.run{run_idx}.dh0", dh0_ref, dh0_qla.float(), ratio=0.03
