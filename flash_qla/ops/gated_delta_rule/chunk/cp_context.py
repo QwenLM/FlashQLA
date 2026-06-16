@@ -17,6 +17,10 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "10.0":
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     ARCH = "SM100"
+elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
+    from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
+    from .blackwell_sm120.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
+    ARCH = "SM120"
 else:
     raise ValueError("FlashQLA now support sm90 and sm100 only.")
 
@@ -100,7 +104,7 @@ def _calc_cp_seqs(
 
     if force_cp == 1:
         use_cp = True
-    elif ARCH == "SM90":
+    elif ARCH == "SM90" or ARCH == "SM120":
         use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
     elif ARCH == "SM100":
         # SM100 uses separate thresholds for fwd and bwd:

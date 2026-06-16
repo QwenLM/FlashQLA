@@ -15,6 +15,10 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "10.0":
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
+elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
+    from .blackwell_sm120 import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h,kkt_solve
+    from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
+    from .blackwell_sm120.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
 else:
     raise ValueError("FlashQLA now support sm90 and sm100 only.")
 from .cp_context import intra_card_cp_preprocess, intra_card_cp_preprocess_bwd, _calc_cp_seqs, _create_cu_seqlens
@@ -37,7 +41,8 @@ def chunk_gated_delta_rule_fwd(
     state_v_first: bool = False,
     enable_fwd_cp_cache: bool = False,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    # todo add chunk_size 
+    g = chunk_local_cumsum(g, chunk_size=32, cu_seqlens=cu_seqlens)
     A = kkt_solve(
         k=k,
         b=beta,
