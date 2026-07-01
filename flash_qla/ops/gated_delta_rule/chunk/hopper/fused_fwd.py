@@ -421,8 +421,8 @@ def tilelang_fused_chunk_gdr_fwd(
                     T.copy(p_fragment, p_shared)
                     T.barrier_arrive(bar_3)
                     # O = s * g * O
-                    for j_s, j_k in T.Parallel(block_S, DK):
-                        o_fragment[j_s, j_k] *= scale * g_exp_shared[j_s]
+                    for j_s, j_v in T.Parallel(block_S, block_DV):
+                        o_fragment[j_s, j_v] *= scale * g_exp_shared[j_s]
 
                     # [STAGE 0] 4
                     T.barrier_wait(bar_4, i_s % 2)
