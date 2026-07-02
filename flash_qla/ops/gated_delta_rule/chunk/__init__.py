@@ -25,6 +25,14 @@ from .cp_context import intra_card_cp_preprocess, intra_card_cp_preprocess_bwd, 
 
 from flash_qla.utils import input_guard
 
+def _get_default_chunk_size() -> int:
+    """Return the optimal default chunk_size based on the detected GPU compute capability."""
+    version = tilelang.contrib.nvcc.get_target_compute_version()
+    # SM90 (9.0) and SM100 (10.0) use 64; SM120 (12.0) uses 32
+    if version == "12.0":
+        return 32
+    # Default for SM90, SM100, and any fallback
+    return 64
 
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
@@ -41,8 +49,8 @@ def chunk_gated_delta_rule_fwd(
     state_v_first: bool = False,
     enable_fwd_cp_cache: bool = False,
 ):
-    # todo add chunk_size 
-    g = chunk_local_cumsum(g, chunk_size=32, cu_seqlens=cu_seqlens)
+    chunk_size = _get_default_chunk_size()
+    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
     A = kkt_solve(
         k=k,
         b=beta,
