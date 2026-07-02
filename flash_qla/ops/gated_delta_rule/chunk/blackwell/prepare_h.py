@@ -7,6 +7,8 @@ import tilelang.language as T
 
 from flash_qla.utils import prepare_chunk_offsets
 
+from ..head_dim import BLACKWELL_FWD_HEAD_DIM_K, blackwell_fwd_head_dim_v_supported
+
 
 @tilelang.jit(
     pass_configs={
@@ -674,7 +676,6 @@ def fused_gdr_h(
 ):
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H, V = v.shape
-    from ..head_dim import BLACKWELL_FWD_HEAD_DIM_K, blackwell_fwd_head_dim_v_supported
     assert K in BLACKWELL_FWD_HEAD_DIM_K and blackwell_fwd_head_dim_v_supported(V), f"unsupported head dims K={K} V={V}"
     assert chunk_size == 64
     output_final_state = output_final_state or False

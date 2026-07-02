@@ -90,21 +90,18 @@ def _make_inputs(
     varlen, cu_seqlens_list, use_h0, state_v_first, seed=42,
     head_dim_k=HEAD_DIM_K, head_dim_v=HEAD_DIM_V,
 ):
-    # Shadow the module-level defaults so a caller can request a non-128 head dim
-    # (e.g. head_dim_k=64) without touching the rest of the builder.
-    HEAD_DIM_K, HEAD_DIM_V = head_dim_k, head_dim_v
     torch.manual_seed(seed)
 
     q = l2norm(torch.randn(
-        batch_size, num_tokens, num_k_heads, HEAD_DIM_K,
+        batch_size, num_tokens, num_k_heads, head_dim_k,
         device=DEVICE, dtype=DATA_DTYPE,
     ))
     k = l2norm(torch.randn(
-        batch_size, num_tokens, num_k_heads, HEAD_DIM_K,
+        batch_size, num_tokens, num_k_heads, head_dim_k,
         device=DEVICE, dtype=DATA_DTYPE,
     ))
     v = torch.randn(
-        batch_size, num_tokens, num_v_heads, HEAD_DIM_V,
+        batch_size, num_tokens, num_v_heads, head_dim_v,
         device=DEVICE, dtype=DATA_DTYPE,
     )
     g = torch.nn.functional.logsigmoid(torch.randn(
@@ -127,11 +124,11 @@ def _make_inputs(
     dht_ref = None
     if use_h0:
         h0_ref = torch.randn(
-            batch_size, num_v_heads, HEAD_DIM_K, HEAD_DIM_V,
+            batch_size, num_v_heads, head_dim_k, head_dim_v,
             device=DEVICE, dtype=torch.float32,
         )
         dht_ref = torch.randn(
-            batch_size, num_v_heads, HEAD_DIM_K, HEAD_DIM_V,
+            batch_size, num_v_heads, head_dim_k, head_dim_v,
             device=DEVICE, dtype=torch.float32,
         ) / 8
 
@@ -148,11 +145,11 @@ def _make_inputs(
             if use_h0:
                 real_batch_size = cu_seqlens.shape[0] - 1
                 h0_ref = torch.randn(
-                    real_batch_size, num_v_heads, HEAD_DIM_K, HEAD_DIM_V,
+                    real_batch_size, num_v_heads, head_dim_k, head_dim_v,
                     device=DEVICE, dtype=torch.float32,
                 )
                 dht_ref = torch.randn(
-                    real_batch_size, num_v_heads, HEAD_DIM_K, HEAD_DIM_V,
+                    real_batch_size, num_v_heads, head_dim_k, head_dim_v,
                     device=DEVICE, dtype=torch.float32,
                 ) / 8
         else:
@@ -183,7 +180,7 @@ def _make_inputs(
             if state_v_first else dht_ref
         )
 
-    scale = HEAD_DIM_K ** (-0.5)
+    scale = head_dim_k ** (-0.5)
 
     return (
         q, k, v, g, beta, do,
@@ -331,6 +328,7 @@ def test_fwd(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
+@pytest.mark.blackwell
 @pytest.mark.parametrize("head_dim_k", [64, 128], ids=["dk64", "dk128"])
 @pytest.mark.parametrize(
     "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list",
@@ -371,6 +369,7 @@ def test_fwd_head_dim_k(
 
 
 @pytest.mark.gpu
+@pytest.mark.blackwell
 @pytest.mark.parametrize(
     "head_dim_v", [32, 48, 64, 96, 128, 160, 192, 256],
     ids=[f"dv{d}" for d in (32, 48, 64, 96, 128, 160, 192, 256)],
@@ -409,9 +408,10 @@ def test_fwd_head_dim_v(
 
 
 @pytest.mark.gpu
+@pytest.mark.blackwell
 @pytest.mark.parametrize(
     "bad_dk", [16, 32, 96, 160],
-    ids=["dk16_raise", "dk32_vk_silentwrong", "dk96_silentwrong", "dk160_silentwrong"],
+    ids=["dk16_raise", "dk32_layout_unsafe", "dk96_silentwrong", "dk160_silentwrong"],
 )
 def test_fwd_head_dim_k_unsupported_raises(bad_dk):
     """Unsupported head_dim_k must be rejected up front with ValueError.
@@ -430,6 +430,7 @@ def test_fwd_head_dim_k_unsupported_raises(bad_dk):
 
 
 @pytest.mark.gpu
+@pytest.mark.blackwell
 @pytest.mark.parametrize("bad_dv", [100, 320], ids=["dv100_nonmul16", "dv320_out_of_range"])
 def test_fwd_head_dim_v_unsupported_raises(bad_dv):
     """Unsupported head_dim_v (non-multiple-of-16, or outside the validated range)

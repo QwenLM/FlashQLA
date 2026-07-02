@@ -9,6 +9,8 @@ import tilelang.language as T
 
 from flash_qla.utils import prepare_chunk_indices
 
+from ..head_dim import BLACKWELL_FWD_HEAD_DIM_K
+
 
 @tilelang.jit(
     # out_idx=[-1],
@@ -288,7 +290,6 @@ def kkt_solve(
 ):
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H = b.shape
-    from ..head_dim import BLACKWELL_FWD_HEAD_DIM_K
     assert K in BLACKWELL_FWD_HEAD_DIM_K, f"unsupported head_dim_k={K}"
     assert chunk_size == 64
 
