@@ -494,7 +494,8 @@ def correct_initial_states(
         v_head_dim, k_head_dim = dim_2, dim_3
     else:
         k_head_dim, v_head_dim = dim_2, dim_3
-    assert k_head_dim == v_head_dim == 128
+    from ..head_dim import BLACKWELL_FWD_HEAD_DIM_K, blackwell_fwd_head_dim_v_supported
+    assert k_head_dim in BLACKWELL_FWD_HEAD_DIM_K and blackwell_fwd_head_dim_v_supported(v_head_dim), f"unsupported head dims K={k_head_dim} V={v_head_dim}"
 
     if raw_h0 is None:
         res_dtype = torch.float32
@@ -558,7 +559,8 @@ def correct_terminal_states(
         v_head_dim, k_head_dim = dim_2, dim_3
     else:
         k_head_dim, v_head_dim = dim_2, dim_3
-    assert k_head_dim == v_head_dim == 128
+    from ..head_dim import BLACKWELL_FWD_HEAD_DIM_K, blackwell_fwd_head_dim_v_supported
+    assert k_head_dim in BLACKWELL_FWD_HEAD_DIM_K and blackwell_fwd_head_dim_v_supported(v_head_dim), f"unsupported head dims K={k_head_dim} V={v_head_dim}"
 
     if raw_dht is None:
         res_dtype = torch.float32

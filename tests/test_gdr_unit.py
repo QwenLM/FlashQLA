@@ -88,7 +88,11 @@ ALL_CONFIGS = CORE_CONFIGS + DEVELOP_CONFIGS + VARLEN_CONFIGS + PRODUCT_CONFIGS
 def _make_inputs(
     batch_size, num_tokens, num_k_heads, num_v_heads,
     varlen, cu_seqlens_list, use_h0, state_v_first, seed=42,
+    head_dim_k=HEAD_DIM_K, head_dim_v=HEAD_DIM_V,
 ):
+    # Shadow the module-level defaults so a caller can request a non-128 head dim
+    # (e.g. head_dim_k=64) without touching the rest of the builder.
+    HEAD_DIM_K, HEAD_DIM_V = head_dim_k, head_dim_v
     torch.manual_seed(seed)
 
     q = l2norm(torch.randn(
@@ -302,6 +306,141 @@ def test_fwd(
     _assert_relative(h_qla_cmp, h_ref, "h_qla")
     if h0_ref is not None:
         _assert_relative(s_qla_cmp, s_ref, "s_qla")
+
+
+# ---------------------------------------------------------------------------
+# Generalized head-dim FORWARD coverage.
+#
+# The chunk kernels are parameterized on DK/DV, but the tcgen05 MMA atoms only
+# support a discrete set of *contraction* (K) widths. Empirically (forward parity
+# vs the fp64 reference on B200, full config matrix, head_dim_v=128):
+#   head_dim_k: 64/128 -> correct (all configs);  16/48/80/256 -> raise;
+#               96/160/192 -> run but SILENTLY WRONG (rel-err ~0.4);
+#               32 -> correct only for state_v_first=False, SILENTLY WRONG for vk.
+# So head_dim_k is guarded to the explicit set {64, 128} (a *range* guard would
+# admit the silently-wrong widths, and even 32 is layout-unsafe). head_dim_v is
+# the free/output dim and
+# is more flexible: every multiple of 16 in [32, 256] validated (no silent-wrong).
+# The guard lives in flash_qla.ops...chunk.head_dim (ValueError, not assert, so it
+# survives `python -O`); the checks below cover both the accepted and rejected dims.
+#
+# Scope: Blackwell (SM100) only -- Hopper (SM90) uses different MMA atoms and was
+# not swept, so it stays at head_dim == 128. Forward only: the backward kernels
+# retain `K == V == 128` because non-128 backward produces incorrect gradients
+# (all such bwd parity checks fail vs the fp64 reference). Follow-up.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("head_dim_k", [64, 128], ids=["dk64", "dk128"])
+@pytest.mark.parametrize(
+    "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list",
+    CORE_CONFIGS,
+)
+@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
+@pytest.mark.parametrize("use_h0", [False, True], ids=["no_h0", "h0"])
+def test_fwd_head_dim_k(
+    head_dim_k, batch_size, num_tokens, num_k_heads, num_v_heads,
+    varlen, cu_seqlens_list, state_v_first, use_h0,
+):
+    """Forward parity for head_dim_k in {64, 128} (head_dim_v=128), across the full
+    CORE_CONFIGS matrix (GQA, varlen, h0, both state layouts). head_dim_k=32 is
+    excluded: it is correct for state_v_first=False but silently wrong for
+    state_v_first=True (see test_fwd_head_dim_k_unsupported_raises)."""
+    (
+        q, k, v, g, beta, do,
+        h0_ref, dht_ref, h0_qla, dht_qla,
+        cu_seqlens, scale,
+    ) = _make_inputs(
+        batch_size, num_tokens, num_k_heads, num_v_heads,
+        varlen, cu_seqlens_list, use_h0, state_v_first,
+        head_dim_k=head_dim_k, head_dim_v=128,
+    )
+
+    (
+        g_ref, o_ref, A_ref, h_ref, s_ref,
+        g_qla, A_qla, o_qla, h_qla, s_qla,
+    ) = _run_fwd(q, k, v, g, beta, scale, h0_ref, h0_qla, cu_seqlens,
+                 state_v_first, auto_cp=True)
+
+    h_qla_cmp = h_qla.transpose(-1, -2) if state_v_first else h_qla
+    s_qla_cmp = s_qla.transpose(-1, -2) if state_v_first else s_qla
+    _assert_relative(o_qla, o_ref, "o_qla")
+    _assert_relative(h_qla_cmp, h_ref, "h_qla")
+    if h0_ref is not None:
+        _assert_relative(s_qla_cmp, s_ref, "s_qla")
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "head_dim_v", [32, 48, 64, 96, 128, 160, 192, 256],
+    ids=[f"dv{d}" for d in (32, 48, 64, 96, 128, 160, 192, 256)],
+)
+@pytest.mark.parametrize(
+    "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list",
+    CORE_CONFIGS[:3],
+)
+@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
+def test_fwd_head_dim_v(
+    head_dim_v, batch_size, num_tokens, num_k_heads, num_v_heads,
+    varlen, cu_seqlens_list, state_v_first,
+):
+    """Forward parity for head_dim_v (free dim) across a multiple-of-16 range
+    {32,48,64,96,128,160,192,256} at head_dim_k=64 -- V is flexible, never silently
+    wrong (unlike K)."""
+    (
+        q, k, v, g, beta, do,
+        h0_ref, dht_ref, h0_qla, dht_qla,
+        cu_seqlens, scale,
+    ) = _make_inputs(
+        batch_size, num_tokens, num_k_heads, num_v_heads,
+        varlen, cu_seqlens_list, False, state_v_first,
+        head_dim_k=64, head_dim_v=head_dim_v,
+    )
+
+    (
+        g_ref, o_ref, A_ref, h_ref, s_ref,
+        g_qla, A_qla, o_qla, h_qla, s_qla,
+    ) = _run_fwd(q, k, v, g, beta, scale, h0_ref, h0_qla, cu_seqlens,
+                 state_v_first, auto_cp=True)
+
+    h_qla_cmp = h_qla.transpose(-1, -2) if state_v_first else h_qla
+    _assert_relative(o_qla, o_ref, "o_qla")
+    _assert_relative(h_qla_cmp, h_ref, "h_qla")
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "bad_dk", [16, 32, 96, 160],
+    ids=["dk16_raise", "dk32_vk_silentwrong", "dk96_silentwrong", "dk160_silentwrong"],
+)
+def test_fwd_head_dim_k_unsupported_raises(bad_dk):
+    """Unsupported head_dim_k must be rejected up front with ValueError.
+
+    Includes 96/160 (run + silently miscompute) and 32 (correct for kv but silently
+    wrong for the vk state layout). The guard is a ValueError (not assert) so it
+    survives ``python -O``.
+    """
+    (
+        q, k, v, g, beta, do,
+        h0_ref, dht_ref, h0_qla, dht_qla,
+        cu_seqlens, scale,
+    ) = _make_inputs(1, 512, 4, 4, False, None, False, False, head_dim_k=bad_dk, head_dim_v=128)
+    with pytest.raises(ValueError):
+        chunk_gated_delta_rule_fwd_qla(q, k, v, g, beta, scale=scale)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("bad_dv", [100, 320], ids=["dv100_nonmul16", "dv320_out_of_range"])
+def test_fwd_head_dim_v_unsupported_raises(bad_dv):
+    """Unsupported head_dim_v (non-multiple-of-16, or outside the validated range)
+    must be rejected with ValueError."""
+    (
+        q, k, v, g, beta, do,
+        h0_ref, dht_ref, h0_qla, dht_qla,
+        cu_seqlens, scale,
+    ) = _make_inputs(1, 512, 4, 4, False, None, False, False, head_dim_k=64, head_dim_v=bad_dv)
+    with pytest.raises(ValueError):
+        chunk_gated_delta_rule_fwd_qla(q, k, v, g, beta, scale=scale)
 
 
 @pytest.mark.gpu

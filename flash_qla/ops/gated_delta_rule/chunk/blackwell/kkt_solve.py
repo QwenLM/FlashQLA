@@ -288,7 +288,8 @@ def kkt_solve(
 ):
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H = b.shape
-    assert K == 128
+    from ..head_dim import BLACKWELL_FWD_HEAD_DIM_K
+    assert K in BLACKWELL_FWD_HEAD_DIM_K, f"unsupported head_dim_k={K}"
     assert chunk_size == 64
 
     if cu_seqlens is None:

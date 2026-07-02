@@ -7,16 +7,19 @@ import tilelang
 from flash_qla.utils import l2norm_fwd, l2norm_bwd, prepare_chunk_offsets
 from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 
-if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
+_COMPUTE_VERSION = tilelang.contrib.nvcc.get_target_compute_version()
+if _COMPUTE_VERSION == "9.0":
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     from .hopper.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
-elif tilelang.contrib.nvcc.get_target_compute_version() == "10.0":
+elif _COMPUTE_VERSION == "10.0":
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
 else:
     raise ValueError("FlashQLA now support sm90 and sm100 only.")
+
+from .head_dim import validate_blackwell_forward_head_dims
 from .cp_context import intra_card_cp_preprocess, intra_card_cp_preprocess_bwd, _calc_cp_seqs, _create_cu_seqlens
 
 from flash_qla.utils import input_guard
@@ -37,6 +40,12 @@ def chunk_gated_delta_rule_fwd(
     state_v_first: bool = False,
     enable_fwd_cp_cache: bool = False,
 ):
+    # Blackwell forward supports head_dim_k in {32,64,128} and a flexible head_dim_v
+    # (see head_dim.py). Reject unsupported dims up front with a clear error --
+    # crucially some head_dim_k values (96/160/192) otherwise run but silently
+    # miscompute. Hopper retains head_dim == 128 via the per-kernel guards.
+    if _COMPUTE_VERSION == "10.0":
+        validate_blackwell_forward_head_dims(q.shape[-1], v.shape[-1])
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     A = kkt_solve(
         k=k,
