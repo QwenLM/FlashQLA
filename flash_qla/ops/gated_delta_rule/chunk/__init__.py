@@ -102,8 +102,7 @@ def chunk_gated_delta_rule_bwd(
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     state_v_first: bool = False,
-    auto_cp: bool = False,
-    force_cp: int = 0,
+    auto_cp: bool = True,
     cp_cache: tuple | None = None,
 ):
     batch_size, num_tokens, num_k_heads, _ = k.shape
@@ -117,7 +116,6 @@ def chunk_gated_delta_rule_bwd(
                 q=q, do=do, dht=dht, scale=scale,
                 raw_cu_seqlens=cu_seqlens,
                 state_v_first=state_v_first,
-                force_cp=force_cp,
                 cp_cache=cp_cache,
             )
         )
@@ -174,9 +172,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
         state_v_first: bool = False,
-        auto_cp: bool = False,
+        auto_cp: bool = True,
         use_qk_l2norm_in_kernel: bool = False,
-        enable_fwd_cp_cache: bool = False,
+        enable_fwd_cp_cache: bool = True,
     ):
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
@@ -279,12 +277,12 @@ def chunk_gated_delta_rule(
     cu_seqlens: torch.LongTensor | None = None,
     head_first: bool = False,
     state_v_first: bool = False,
-    auto_cp: bool = False,
-    enable_fwd_cp_cache: bool = False,
+    auto_cp: bool = True,
+    enable_fwd_cp_cache: bool = True,
 ):
     assert q.dtype == k.dtype == v.dtype
-    assert q.dtype != torch.float32, (
-        "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16 or float16."
+    assert q.dtype == torch.bfloat16 or q.dtype == torch.float16, (
+        "FlashQLA only supports bfloat16 and float16."
     )
     assert not head_first, "head_first=True is not supported."
     assert v.shape[2] % k.shape[2] == 0, (
