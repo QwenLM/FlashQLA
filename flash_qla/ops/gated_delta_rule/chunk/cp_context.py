@@ -45,8 +45,7 @@ def _calc_cp_seqs(
     raw_cu_seqlens: torch.LongTensor,
     chunk_size: int,
     num_v_heads: int,
-    force_cp: int = 0,
-    is_bwd: int = 0,
+    is_bwd: bool = False,
 ):
     device = raw_cu_seqlens.device
     seqlen_dtype = raw_cu_seqlens.dtype
@@ -102,9 +101,8 @@ def _calc_cp_seqs(
 
     Be = sum(num_chunks) / max(num_chunks)
 
-    if force_cp == 1:
-        use_cp = True
-    elif ARCH == "SM90" or ARCH == "SM120":
+
+    if ARCH == "SM90" or ARCH == "SM120":
         use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
     elif ARCH == "SM100":
         # SM100 uses separate thresholds for fwd and bwd:
@@ -253,7 +251,6 @@ def intra_card_cp_preprocess_bwd(
     scale: float,
     raw_cu_seqlens: torch.Tensor,
     state_v_first: bool = False,
-    force_cp: int = 0,
     cp_cache: tuple | None = None,
 ):
     batch_size, num_tokens, num_k_heads, _ = k.shape
@@ -274,7 +271,7 @@ def intra_card_cp_preprocess_bwd(
         raw_cu_seqlens = _create_cu_seqlens(batch_size, num_tokens, device.index)
 
     use_cp, cp_cu_seqlens, seq_map_r2c, _, ht_mask, ht_mask_bwd = _calc_cp_seqs(
-        raw_cu_seqlens, chunk_size, H, force_cp=force_cp, is_bwd=1,
+        raw_cu_seqlens, chunk_size, H, is_bwd=True,
     )
 
     if not use_cp:
