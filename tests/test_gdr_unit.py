@@ -410,6 +410,49 @@ def test_fwd_head_dim_v(
 @pytest.mark.gpu
 @pytest.mark.blackwell
 @pytest.mark.parametrize(
+    "head_dim_k, head_dim_v",
+    [(128, 32), (128, 64), (128, 96), (128, 160), (128, 256)],
+    ids=["dk128_dv32", "dk128_dv64", "dk128_dv96", "dk128_dv160", "dk128_dv256"],
+)
+@pytest.mark.parametrize(
+    "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list",
+    CORE_CONFIGS[:3],
+)
+@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
+def test_fwd_head_dim_kv_cross(
+    head_dim_k, head_dim_v, batch_size, num_tokens, num_k_heads, num_v_heads,
+    varlen, cu_seqlens_list, state_v_first,
+):
+    """Forward parity for (head_dim_k, head_dim_v) combinations the two single-axis
+    sweeps don't reach: head_dim_k=128 paired with a non-128 head_dim_v. The guard
+    admits any (K in {64,128}) x (V mul-16 in [32,256]); test_fwd_head_dim_k fixes
+    V=128 and test_fwd_head_dim_v fixes K=64, so the K=128 x V!=128 corner is only
+    covered here. Includes V=96/160 -- widths that are silently WRONG as head_dim_k
+    but must be fine as the free head_dim_v."""
+    (
+        q, k, v, g, beta, do,
+        h0_ref, dht_ref, h0_qla, dht_qla,
+        cu_seqlens, scale,
+    ) = _make_inputs(
+        batch_size, num_tokens, num_k_heads, num_v_heads,
+        varlen, cu_seqlens_list, False, state_v_first,
+        head_dim_k=head_dim_k, head_dim_v=head_dim_v,
+    )
+
+    (
+        g_ref, o_ref, A_ref, h_ref, s_ref,
+        g_qla, A_qla, o_qla, h_qla, s_qla,
+    ) = _run_fwd(q, k, v, g, beta, scale, h0_ref, h0_qla, cu_seqlens,
+                 state_v_first, auto_cp=True)
+
+    h_qla_cmp = h_qla.transpose(-1, -2) if state_v_first else h_qla
+    _assert_relative(o_qla, o_ref, "o_qla")
+    _assert_relative(h_qla_cmp, h_ref, "h_qla")
+
+
+@pytest.mark.gpu
+@pytest.mark.blackwell
+@pytest.mark.parametrize(
     "bad_dk", [16, 32, 96, 160],
     ids=["dk16_raise", "dk32_layout_unsafe", "dk96_silentwrong", "dk160_silentwrong"],
 )
