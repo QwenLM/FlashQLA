@@ -9,7 +9,7 @@ import tilelang.language as T
 
 from flash_qla.utils import prepare_chunk_indices
 
-from ..head_dim import BLACKWELL_FWD_HEAD_DIM_K
+from flash_qla.ops.gated_delta_rule.chunk.head_dim import BLACKWELL_FWD_HEAD_DIM_K
 
 
 @tilelang.jit(

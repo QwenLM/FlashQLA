@@ -7,7 +7,10 @@ import tilelang.language as T
 
 from flash_qla.utils import prepare_chunk_offsets
 
-from ..head_dim import BLACKWELL_FWD_HEAD_DIM_K, blackwell_fwd_head_dim_v_supported
+from flash_qla.ops.gated_delta_rule.chunk.head_dim import (
+    BLACKWELL_FWD_HEAD_DIM_K,
+    blackwell_fwd_head_dim_v_supported,
+)
 
 
 MULTI_PROCESSOR_COUNT = torch.cuda.get_device_properties().multi_processor_count
