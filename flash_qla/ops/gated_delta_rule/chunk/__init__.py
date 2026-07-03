@@ -15,12 +15,25 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "10.0":
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
+elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
+    from .blackwell_sm120 import fused_gdr_fwd, fused_gdr_h, kkt_solve
+    from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
+    fused_gdr_bwd = None
+    fused_gdr_dh = None
 else:
     raise ValueError("FlashQLA now support sm90 and sm100 only.")
 from .cp_context import intra_card_cp_preprocess, intra_card_cp_preprocess_bwd, _calc_cp_seqs, _create_cu_seqlens
 
 from flash_qla.utils import input_guard
 
+def _get_default_chunk_size() -> int:
+    """Return the optimal default chunk_size based on the detected GPU compute capability."""
+    version = tilelang.contrib.nvcc.get_target_compute_version()
+    # SM90 (9.0) and SM100 (10.0) use 64; SM120 (12.0) uses 32
+    if version == "12.0":
+        return 32
+    # Default for SM90, SM100, and any fallback
+    return 64
 
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
@@ -37,7 +50,8 @@ def chunk_gated_delta_rule_fwd(
     state_v_first: bool = False,
     enable_fwd_cp_cache: bool = False,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    chunk_size = _get_default_chunk_size()
+    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
     A = kkt_solve(
         k=k,
         b=beta,
@@ -105,6 +119,12 @@ def chunk_gated_delta_rule_bwd(
     auto_cp: bool = True,
     cp_cache: tuple | None = None,
 ):
+    if fused_gdr_bwd is None:
+        raise NotImplementedError(
+            "Backward pass is not implemented for SM120 (Blackwell)."
+            "Only forward pass is supported on this architecture."
+        )
+
     batch_size, num_tokens, num_k_heads, _ = k.shape
     _, _, H, _ = v.shape
     chunk_size = A.shape[-1]

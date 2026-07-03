@@ -4,6 +4,7 @@ import torch
 requires_gpu = pytest.mark.gpu
 requires_hopper = pytest.mark.hopper
 requires_blackwell = pytest.mark.blackwell
+requires_sm120 = pytest.mark.sm120
 
 GPU_AVAILABLE = torch.cuda.is_available()
 
@@ -16,6 +17,8 @@ if GPU_AVAILABLE:
             ARCH = "SM90"
         elif _cv == "10.0":
             ARCH = "SM100"
+        elif _cv == "12.0":
+            ARCH = "SM120"
     except Exception:
         pass
 
@@ -28,3 +31,5 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="Hopper (SM90) GPU required"))
         if "blackwell" in item.keywords and ARCH != "SM100":
             item.add_marker(pytest.mark.skip(reason="Blackwell (SM100) GPU required"))
+        if "sm120" in item.keywords and ARCH != "SM120":
+            item.add_marker(pytest.mark.skip(reason="Blackwell SM120 GPU required"))

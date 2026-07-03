@@ -17,6 +17,10 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "10.0":
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     ARCH = "SM100"
+elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
+    from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
+    fused_gdr_dh = None
+    ARCH = "SM120"
 else:
     raise ValueError("FlashQLA now support sm90 and sm100 only.")
 
@@ -97,7 +101,8 @@ def _calc_cp_seqs(
 
     Be = sum(num_chunks) / max(num_chunks)
 
-    if ARCH == "SM90":
+
+    if ARCH == "SM90" or ARCH == "SM120":
         use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
     elif ARCH == "SM100":
         # SM100 uses separate thresholds for fwd and bwd:
@@ -252,6 +257,12 @@ def intra_card_cp_preprocess_bwd(
     _, _, H, _ = v.shape
     chunk_size = a.shape[-1]
     device = k.device
+
+    if fused_gdr_dh is None:
+        raise NotImplementedError(
+            "Backward pass (CP) is not implemented for SM120 (Blackwell). "
+            "Only forward pass is supported on this architecture."
+        )
 
     if batch_size > 1:
         return raw_h0, raw_cu_seqlens, dht, raw_cu_seqlens, None, False
