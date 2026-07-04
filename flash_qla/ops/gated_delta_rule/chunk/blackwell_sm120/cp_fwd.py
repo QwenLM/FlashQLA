@@ -5,11 +5,6 @@ import torch
 import tilelang
 import tilelang.language as T
 
-from flash_qla.ops.gated_delta_rule.chunk.head_dim import (
-    BLACKWELL_FWD_HEAD_DIM_K,
-    blackwell_fwd_head_dim_v_supported,
-)
-
 
 @tilelang.jit()
 def tilelang_get_warmup_chunks(
@@ -87,7 +82,7 @@ def get_warmup_chunks(
     g: torch.Tensor,  # [1, num_total_tokens, num_v_heads]
     cu_seqlens: torch.Tensor,  # [cp_real_batch_size + 1]
     ht_mask: torch.Tensor,  # [cp_real_batch_size]
-    chunk_size: int = 64,
+    chunk_size: int = 32,
     threshold: float = -10.0,
     reverse: bool = False,
 ):
@@ -95,7 +90,7 @@ def get_warmup_chunks(
     real_batch_size = ht_mask.shape[0]
     assert cu_seqlens.shape[0] == real_batch_size + 1
     assert batch_size == 1
-    assert chunk_size == 64
+    assert chunk_size == 32
 
     tilelang_get_warmup_chunks_kernel = tilelang_get_warmup_chunks(
         num_heads=num_heads,
@@ -231,14 +226,14 @@ def get_warmup_chunks_bidi(
     cu_seqlens: torch.Tensor,
     ht_mask_fwd: torch.Tensor,
     ht_mask_bwd: torch.Tensor,
-    chunk_size: int = 64,
+    chunk_size: int = 32,
     threshold: float = -10.0,
 ):
     batch_size, num_tokens, num_heads = g.shape
     real_batch_size = ht_mask_fwd.shape[0]
     assert cu_seqlens.shape[0] == real_batch_size + 1
     assert batch_size == 1
-    assert chunk_size == 64
+    assert chunk_size == 32
 
     tilelang_kernel = tilelang_get_warmup_chunks_bidi(
         num_heads=num_heads,
@@ -499,7 +494,7 @@ def correct_initial_states(
         v_head_dim, k_head_dim = dim_2, dim_3
     else:
         k_head_dim, v_head_dim = dim_2, dim_3
-    assert k_head_dim in BLACKWELL_FWD_HEAD_DIM_K and blackwell_fwd_head_dim_v_supported(v_head_dim), f"unsupported head dims K={k_head_dim} V={v_head_dim}"
+    assert k_head_dim == v_head_dim == 128
 
     if raw_h0 is None:
         res_dtype = torch.float32
@@ -563,7 +558,7 @@ def correct_terminal_states(
         v_head_dim, k_head_dim = dim_2, dim_3
     else:
         k_head_dim, v_head_dim = dim_2, dim_3
-    assert k_head_dim in BLACKWELL_FWD_HEAD_DIM_K and blackwell_fwd_head_dim_v_supported(v_head_dim), f"unsupported head dims K={k_head_dim} V={v_head_dim}"
+    assert k_head_dim == v_head_dim == 128
 
     if raw_dht is None:
         res_dtype = torch.float32

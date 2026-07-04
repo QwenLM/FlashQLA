@@ -167,7 +167,7 @@ def torch_w_u_fwd(
     v_beta = pad_and_reshape(
         v * beta.unsqueeze(-1), dim=1, chunk_size=chunk_size
     )  # [B, N, C, Hv, V]
-    A = pad_and_reshape(A, dim=1)
+    A = pad_and_reshape(A, dim=1,chunk_size=chunk_size)
 
     w = torch.einsum("bnchd, bndhk -> bnchk", A, k_beta).reshape(
         (batch_size, -1, num_v_heads, head_dim_k)

@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flash_qla import chunk_gated_delta_rule_fwd as chunk_gated_delta_rule_fwd_qla
 from flash_qla import chunk_gated_delta_rule_bwd as chunk_gated_delta_rule_bwd_qla
 from flash_qla.utils import l2norm, pack
-
+import tilelang
 from ref_gdr import chunk_gated_delta_rule_fwd as chunk_gated_delta_rule_fwd_ref
 from ref_gdr import chunk_gated_delta_rule_bwd as chunk_gated_delta_rule_bwd_ref
 
@@ -24,7 +24,7 @@ RTOL = 0.02
 DETERMINISM_ITERS = 1000
 HEAD_DIM_K = 128
 HEAD_DIM_V = 128
-CHUNK_SIZE = 64
+CHUNK_SIZE = 32 if tilelang.contrib.nvcc.get_target_compute_version() == "12.0" else 64
 SWA_RATIO = 0.75
 REF_DTYPE = torch.float64
 DATA_DTYPE = torch.bfloat16
@@ -216,6 +216,7 @@ def _run_fwd(q, k, v, g, beta, scale, h0_ref, h0_qla, cu_seqlens,
         scale=scale,
         initial_state=h0_ref,
         cu_seqlens=cu_seqlens,
+        chunk_size=CHUNK_SIZE,
     )
 
     # QLA forward
@@ -252,6 +253,7 @@ def _run_bwd(q, k, v, g_ref, g_qla, beta, A_ref, A_qla, do,
         do.to(REF_DTYPE, copy=True),
         dht_ref,
         cu_seqlens,
+        chunk_size=CHUNK_SIZE,
     )
 
     # QLA backward
@@ -744,6 +746,7 @@ def test_fwd_auto_cp(
         scale=scale,
         initial_state=h0_ref,
         cu_seqlens=cu_seqlens,
+        chunk_size=CHUNK_SIZE,
     )
     s_ref_cmp = s_ref
     s_cp_cmp = s_cp.transpose(-1, -2) if state_v_first else s_cp
@@ -790,6 +793,7 @@ def test_bwd_auto_cp(
         scale=scale,
         initial_state=h0_ref,
         cu_seqlens=cu_seqlens,
+        chunk_size=CHUNK_SIZE,
     )
 
     g_qla_cp, A_qla_cp, _, _, _, _ = chunk_gated_delta_rule_fwd_qla(
@@ -812,6 +816,7 @@ def test_bwd_auto_cp(
         scale, h0_ref,
         do.to(REF_DTYPE, copy=True),
         dht_ref, cu_seqlens,
+        chunk_size=CHUNK_SIZE,
     )
 
     # QLA bwd with cp
@@ -978,6 +983,7 @@ def test_mixed_cp_control(state_v_first, fwd_cp, bwd_cp):
         scale=scale,
         initial_state=h0_ref,
         cu_seqlens=cu_seqlens,
+        chunk_size=CHUNK_SIZE,
     )
     dq_ref, dk_ref, dv_ref, db_ref, dg_ref, dh0_ref = chunk_gated_delta_rule_bwd_ref(
         q.to(REF_DTYPE, copy=True),
@@ -989,6 +995,7 @@ def test_mixed_cp_control(state_v_first, fwd_cp, bwd_cp):
         scale, h0_ref,
         do.to(REF_DTYPE, copy=True),
         dht_ref, cu_seqlens,
+        chunk_size=CHUNK_SIZE,
     )
 
     # Case 1: fwd auto_cp=True, bwd auto_cp=False

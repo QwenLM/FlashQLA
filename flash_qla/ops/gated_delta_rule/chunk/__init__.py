@@ -12,10 +12,18 @@ if _COMPUTE_VERSION == "9.0":
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     from .hopper.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
+    CHUNK_SIZE = 64
 elif _COMPUTE_VERSION == "10.0":
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
+    CHUNK_SIZE = 64
+elif _COMPUTE_VERSION == "12.0":
+    from .blackwell_sm120 import fused_gdr_fwd, fused_gdr_h, kkt_solve
+    from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
+    fused_gdr_bwd = None
+    fused_gdr_dh = None
+    CHUNK_SIZE = 32
 else:
     raise ValueError("FlashQLA now support sm90 and sm100 only.")
 
@@ -40,41 +48,32 @@ def chunk_gated_delta_rule_fwd(
     state_v_first: bool = False,
     enable_fwd_cp_cache: bool = False,
 ):
-    # Blackwell forward supports head_dim_k in {64, 128} and a flexible head_dim_v
-    # (see head_dim.py). Reject unsupported dims up front with a clear error --
-    # crucially some head_dim_k values (96/160/192) otherwise run but silently
-    # miscompute. Hopper retains head_dim == 128 via the per-kernel guards.
+    # Blackwell (SM100) forward supports head_dim_k in {64, 128} and a flexible
+    # head_dim_v (see head_dim.py). Reject unsupported dims up front with a clear
+    # error -- crucially some head_dim_k values (96/160/192) otherwise run but
+    # silently miscompute. Hopper retains head_dim == 128 via the per-kernel guards.
     if _COMPUTE_VERSION == "10.0":
         validate_blackwell_forward_head_dims(q.shape[-1], v.shape[-1])
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    g = chunk_local_cumsum(
+        g=g,
+        cu_seqlens=cu_seqlens,
+        chunk_size=CHUNK_SIZE,
+    )
     A = kkt_solve(
         k=k,
         b=beta,
         cu_seqlens=cu_seqlens,
+        chunk_size=CHUNK_SIZE,
     )
     cp_cache = None
     if auto_cp:
-        if enable_fwd_cp_cache:
-            initial_state, cu_seqlens, cp_seq_map, raw_cu_seqlens, cached_mt, cached_fallback_bwd, cached_num_warmup_bwd = (
-                intra_card_cp_preprocess(
-                    k=k, v=v, a=A, g=g, b=beta,
-                    raw_h0=initial_state,
-                    raw_cu_seqlens=cu_seqlens,
-                    state_v_first=state_v_first,
-                    enable_fwd_cp_cache=True,
-                )
-            )
-            if cached_mt is not None:
-                cp_cache = (initial_state, cached_mt, cached_fallback_bwd, cached_num_warmup_bwd)
-        else:
-            initial_state, cu_seqlens, cp_seq_map, raw_cu_seqlens = (
-                intra_card_cp_preprocess(
-                    k=k, v=v, a=A, g=g, b=beta,
-                    raw_h0=initial_state,
-                    raw_cu_seqlens=cu_seqlens,
-                    state_v_first=state_v_first,
-                )
-            )
+        initial_state, cu_seqlens, cp_seq_map, raw_cu_seqlens, cp_cache = intra_card_cp_preprocess(
+            k=k, v=v, a=A, g=g, b=beta,
+            raw_h0=initial_state,
+            raw_cu_seqlens=cu_seqlens,
+            state_v_first=state_v_first,
+            enable_fwd_cp_cache=enable_fwd_cp_cache,
+        )
     else:
         cp_seq_map = None
         raw_cu_seqlens = None
@@ -114,40 +113,44 @@ def chunk_gated_delta_rule_bwd(
     auto_cp: bool = True,
     cp_cache: tuple | None = None,
 ):
+    if fused_gdr_bwd is None:
+        raise NotImplementedError(
+            "Backward pass is not implemented for SM120 (Blackwell)."
+            "Only forward pass is supported on this architecture."
+        )
+
     batch_size, num_tokens, num_k_heads, _ = k.shape
     _, _, H, _ = v.shape
     chunk_size = A.shape[-1]
 
     if auto_cp and fused_gdr_dh is not None:
-        h_initial_state, h_cu_seqlens, bwd_dht, bwd_cu_seqlens, seq_map_r2c, use_cp = (
-            intra_card_cp_preprocess_bwd(
-                k=k, v=v, a=A, g=g, b=beta, raw_h0=initial_state,
-                q=q, do=do, dht=dht, scale=scale,
-                raw_cu_seqlens=cu_seqlens,
-                state_v_first=state_v_first,
-                cp_cache=cp_cache,
-            )
+        h0, cu_seqlens_fwd, dht, cu_seqlens_bwd, seq_map_r2c, use_cp = intra_card_cp_preprocess_bwd(
+            k=k, v=v, a=A, g=g, b=beta, raw_h0=initial_state,
+            q=q, do=do, dht=dht, scale=scale,
+            raw_cu_seqlens=cu_seqlens,
+            state_v_first=state_v_first,
+            cp_cache=cp_cache,
         )
     else:
-        h_initial_state = initial_state
-        h_cu_seqlens = cu_seqlens
-        bwd_dht = dht
-        bwd_cu_seqlens = cu_seqlens
+        h0 = initial_state
+        cu_seqlens_fwd = cu_seqlens
+        dht = dht
+        cu_seqlens_bwd = cu_seqlens
         seq_map_r2c = None
         use_cp = False
 
     h, _, _ = fused_gdr_h(
         k=k, v=v, a=A, g=g, b=beta,
-        initial_state=h_initial_state,
+        initial_state=h0,
         output_final_state=False,
         output_h=True,
-        cu_seqlens=h_cu_seqlens,
+        cu_seqlens=cu_seqlens_fwd,
         state_v_first=state_v_first,
     )
     dq, dk, dv, dg, db, dh0 = fused_gdr_bwd(
         q=q, k=k, v=v, a=A, g=g, b=beta,
-        do=do, dht=bwd_dht, h=h, scale=scale,
-        cu_seqlens=bwd_cu_seqlens,
+        do=do, dht=dht, h=h, scale=scale,
+        cu_seqlens=cu_seqlens_bwd,
         state_v_first=state_v_first,
     )
 
@@ -161,7 +164,7 @@ def chunk_gated_delta_rule_bwd(
         dq = group_reduce_vector(dq, Hg)
         dk = group_reduce_vector(dk, Hg)
     assert dg.dtype == torch.float32, "dg should be fp32"
-    dg = chunk_local_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens)
+    dg = chunk_local_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens)
     return dq, dk, dv, db, dg, dh0
 
 

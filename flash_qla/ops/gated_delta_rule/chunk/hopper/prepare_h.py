@@ -566,13 +566,13 @@ def fused_gdr_h(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = True,
     output_h: bool = True,
-    chunk_size: int = 64,
     cu_seqlens: torch.LongTensor | None = None,
     num_warmup_chunks: torch.LongTensor | None = None,
     state_v_first: bool = False,
 ):
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H, V = v.shape
+    chunk_size = a.shape[-1]
     assert K == V == 128
     assert chunk_size == 64
     output_final_state = output_final_state or False
