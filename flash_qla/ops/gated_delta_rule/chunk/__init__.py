@@ -48,10 +48,7 @@ def chunk_gated_delta_rule_fwd(
     state_v_first: bool = False,
     enable_fwd_cp_cache: bool = False,
 ):
-    # Blackwell (SM100) forward supports head_dim_k in {64, 128} and a flexible
-    # head_dim_v (see head_dim.py). Reject unsupported dims up front with a clear
-    # error -- crucially some head_dim_k values (96/160/192) otherwise run but
-    # silently miscompute. Hopper retains head_dim == 128 via the per-kernel guards.
+    # Reject unsupported Blackwell (SM100) head dims up front (see head_dim.py).
     if _COMPUTE_VERSION == "10.0":
         validate_blackwell_forward_head_dims(q.shape[-1], v.shape[-1])
     g = chunk_local_cumsum(

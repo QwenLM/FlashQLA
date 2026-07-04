@@ -307,27 +307,6 @@ def test_fwd(
         _assert_relative(s_qla_cmp, s_ref, "s_qla")
 
 
-# ---------------------------------------------------------------------------
-# Generalized head-dim FORWARD coverage.
-#
-# The chunk kernels are parameterized on DK/DV, but the tcgen05 MMA atoms only
-# support a discrete set of *contraction* (K) widths. Empirically (forward parity
-# vs the fp64 reference on B200, full config matrix, head_dim_v=128):
-#   head_dim_k: 64/128 -> correct (all configs);  16/48/80/256 -> raise;
-#               96/160/192 -> run but SILENTLY WRONG (rel-err ~0.4);
-#               32 -> correct only for state_v_first=False, SILENTLY WRONG for vk.
-# So head_dim_k is guarded to the explicit set {64, 128} (a *range* guard would
-# admit the silently-wrong widths, and even 32 is layout-unsafe). head_dim_v is
-# the free/output dim and
-# is more flexible: every multiple of 16 in [32, 256] validated (no silent-wrong).
-# The guard lives in flash_qla.ops...chunk.head_dim (ValueError, not assert, so it
-# survives `python -O`); the checks below cover both the accepted and rejected dims.
-#
-# Scope: Blackwell (SM100) only -- Hopper (SM90) uses different MMA atoms and was
-# not swept, so it stays at head_dim == 128. Forward only: the backward kernels
-# retain `K == V == 128` because non-128 backward produces incorrect gradients
-# (all such bwd parity checks fail vs the fp64 reference). Follow-up.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.gpu
 @pytest.mark.blackwell
@@ -342,10 +321,6 @@ def test_fwd_head_dim_k(
     head_dim_k, batch_size, num_tokens, num_k_heads, num_v_heads,
     varlen, cu_seqlens_list, state_v_first, use_h0,
 ):
-    """Forward parity for head_dim_k in {64, 128} (head_dim_v=128), across the full
-    CORE_CONFIGS matrix (GQA, varlen, h0, both state layouts). head_dim_k=32 is
-    excluded: it is correct for state_v_first=False but silently wrong for
-    state_v_first=True (see test_fwd_head_dim_k_unsupported_raises)."""
     (
         q, k, v, g, beta, do,
         h0_ref, dht_ref, h0_qla, dht_qla,
@@ -385,9 +360,6 @@ def test_fwd_head_dim_v(
     head_dim_v, batch_size, num_tokens, num_k_heads, num_v_heads,
     varlen, cu_seqlens_list, state_v_first,
 ):
-    """Forward parity for head_dim_v (free dim) across a multiple-of-16 range
-    {32,48,64,96,128,160,192,256} at head_dim_k=64 -- V is flexible, never silently
-    wrong (unlike K)."""
     (
         q, k, v, g, beta, do,
         h0_ref, dht_ref, h0_qla, dht_qla,
@@ -425,12 +397,6 @@ def test_fwd_head_dim_kv_cross(
     head_dim_k, head_dim_v, batch_size, num_tokens, num_k_heads, num_v_heads,
     varlen, cu_seqlens_list, state_v_first,
 ):
-    """Forward parity for (head_dim_k, head_dim_v) combinations the two single-axis
-    sweeps don't reach: head_dim_k=128 paired with a non-128 head_dim_v. The guard
-    admits any (K in {64,128}) x (V mul-16 in [32,256]); test_fwd_head_dim_k fixes
-    V=128 and test_fwd_head_dim_v fixes K=64, so the K=128 x V!=128 corner is only
-    covered here. Includes V=96/160 -- widths that are silently WRONG as head_dim_k
-    but must be fine as the free head_dim_v."""
     (
         q, k, v, g, beta, do,
         h0_ref, dht_ref, h0_qla, dht_qla,
@@ -459,12 +425,6 @@ def test_fwd_head_dim_kv_cross(
     ids=["dk16_raise", "dk32_layout_unsafe", "dk96_silentwrong", "dk160_silentwrong"],
 )
 def test_fwd_head_dim_k_unsupported_raises(bad_dk):
-    """Unsupported head_dim_k must be rejected up front with ValueError.
-
-    Includes 96/160 (run + silently miscompute) and 32 (correct for kv but silently
-    wrong for the vk state layout). The guard is a ValueError (not assert) so it
-    survives ``python -O``.
-    """
     (
         q, k, v, g, beta, do,
         h0_ref, dht_ref, h0_qla, dht_qla,
@@ -478,8 +438,6 @@ def test_fwd_head_dim_k_unsupported_raises(bad_dk):
 @pytest.mark.blackwell
 @pytest.mark.parametrize("bad_dv", [100, 320], ids=["dv100_nonmul16", "dv320_out_of_range"])
 def test_fwd_head_dim_v_unsupported_raises(bad_dv):
-    """Unsupported head_dim_v (non-multiple-of-16, or outside the validated range)
-    must be rejected with ValueError."""
     (
         q, k, v, g, beta, do,
         h0_ref, dht_ref, h0_qla, dht_qla,

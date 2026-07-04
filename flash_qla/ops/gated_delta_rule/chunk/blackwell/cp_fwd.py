@@ -5,10 +5,7 @@ import torch
 import tilelang
 import tilelang.language as T
 
-from flash_qla.ops.gated_delta_rule.chunk.head_dim import (
-    BLACKWELL_FWD_HEAD_DIM_K,
-    blackwell_fwd_head_dim_v_supported,
-)
+from flash_qla.ops.gated_delta_rule.chunk.head_dim import BLACKWELL_FWD_HEAD_DIM_K, blackwell_fwd_head_dim_v_supported
 
 
 @tilelang.jit()
