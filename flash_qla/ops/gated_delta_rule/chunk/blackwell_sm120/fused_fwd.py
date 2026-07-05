@@ -194,7 +194,7 @@ def tilelang_fused_chunk_gdr_fwd(
 
             if tx < 128:
                 T.set_max_nreg(CONSUMER_S_NREG, 1)
-
+                # BUG FIX
                 # Initialize S
                 if use_initial_state:
                     if state_v_first:
@@ -653,7 +653,7 @@ def fused_gdr_fwd(
     chunk_size = a.shape[-1]
     scale = scale or K ** (-0.5)
     assert K == V == 128
-    assert chunk_size == 64
+    assert chunk_size == 32
     output_final_state = output_final_state or False
     output_h = output_h or False
     output_o = output_o if output_o is not None else True
@@ -683,9 +683,10 @@ def fused_gdr_fwd(
     else:
         is_cp = True
 
-    use_initial_state = initial_state is not None
+    # Always use T.copy path to avoid T.clear bug for large fragments
+    use_initial_state = True
     if initial_state is None:
-        initial_state = torch.empty(
+        initial_state = torch.zeros(
             (real_batch_size, H, V, K)
             if state_v_first
             else (real_batch_size, H, K, V),
@@ -720,14 +721,9 @@ def fused_gdr_fwd(
         )
     o = torch.empty_like(v)
 
-    grid_size = real_batch_size * H
-    if grid_size >= TARGET_NUM_CTAS:
-        block_DV = 128
-    elif grid_size * 2 >= TARGET_NUM_CTAS:
-        block_DV = 64
-    else:
-        block_DV = 32
 
+    block_DV = 64
+    
     tilelang_fused_chunk_gdr_fwd_kernel = tilelang_fused_chunk_gdr_fwd(
         H,
         Hg,

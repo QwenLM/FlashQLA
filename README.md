@@ -20,13 +20,21 @@ Key features:
 
 3.**TileLang fused warp-specialized kernels**. Rather than following the step-by-step decomposition into independent kernels, nor fusing the entire computation flow into a single kernel, we take CP and backward requirements into account, use TileLang to build several key fused kernels, and manually implement warpgroup specialization to overlap data movement, Tensor Core computation, and CUDA Core computation.
 
-## Requirements
+## Installation
+
+Requirements:
 
 - SM90 or SM100
 - CUDA 12.8 or above
 - PyTorch 2.8 or above
 
-## Installation
+To install:
+
+```bash
+pip install flash-qla
+```
+
+Alternatively you can build from source:
 
 ```bash
 git clone https://github.com/QwenLM/FlashQLA.git

@@ -444,8 +444,8 @@ def tilelang_fused_chunk_gdr_fwd(
                     # O = s * g * O
                     T.copy(o_tmem, o_fragment)
                     T.sync_threads(102, 128)
-                    for j_s, j_k in T.Parallel(block_S, DK):
-                        o_fragment[j_s, j_k] *= scale * g_exp_shared[j_s]
+                    for j_s, j_v in T.Parallel(block_S, block_DV):
+                        o_fragment[j_s, j_v] *= scale * g_exp_shared[j_s]
                     T.sync_threads(102, 128)
                     T.copy(o_fragment, o_tmem)
                     T.barrier_arrive(bar_4)
@@ -780,11 +780,11 @@ def fused_gdr_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     cp_seq_map: torch.LongTensor | None = None,
     raw_cu_seqlens: torch.LongTensor | None = None,
-    chunk_size: int = 64,
     state_v_first: bool = False,
 ):
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H, V = v.shape
+    chunk_size = a.shape[-1]
     scale = scale or K ** (-0.5)
     assert K == V == 128
     assert chunk_size == 64

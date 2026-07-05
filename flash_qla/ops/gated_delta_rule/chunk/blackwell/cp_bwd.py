@@ -592,13 +592,13 @@ def fused_gdr_dh_ws(
     output_dh0: bool = True,
     output_dh: bool = True,
     scale: float | None = None,
-    chunk_size: int = 64,
     cu_seqlens: torch.LongTensor | None = None,
     num_warmup_chunks: torch.LongTensor | None = None,
     state_v_first: bool = False,
 ):
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H, V = do.shape
+    chunk_size = a.shape[-1]
     scale = scale or K ** (-0.5)
     assert K == V == 128
     assert chunk_size == 64
