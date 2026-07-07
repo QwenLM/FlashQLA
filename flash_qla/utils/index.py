@@ -2,7 +2,6 @@
 
 import functools
 from typing import Any
-from collections import OrderedDict
 from collections.abc import Callable
 
 import torch
@@ -26,22 +25,25 @@ def tensor_cache(
         Callable[..., torch.Tensor]:
             A wrapped version of the input function with single-entry caching.
     """
-    last_args: tuple | None = None
-    last_kwargs: dict | None = None
-    last_result: Any = None
+    cache = []
+    cache_size = 4
+
+    def _equal(a: Any, b: Any) -> bool:
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+            return a is b
+        return a == b
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        nonlocal last_args, last_kwargs, last_result
-
-        if last_args is not None and last_kwargs is not None:
-            if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
-                if all(a is b for a, b in zip(args, last_args, strict=False)) and \
-                        all(k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()):
-                    return last_result
-
+        nonlocal cache, cache_size
+        for (cached_args, cached_kwargs, cached_result) in cache:
+            if all(_equal(a, b) for a, b in zip(args, cached_args, strict=False)) and \
+                    all(k in cached_kwargs and _equal(v, cached_kwargs[k]) for k, v in kwargs.items()):
+                return cached_result
         result = fn(*args, **kwargs)
-        last_args, last_kwargs, last_result = args, kwargs, result
+        cache.insert(0, (args, kwargs, result))
+        if len(cache) > cache_size:
+            cache = cache[:cache_size]
         return result
 
     return wrapper
