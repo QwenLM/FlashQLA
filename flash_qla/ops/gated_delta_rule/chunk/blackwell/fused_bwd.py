@@ -154,7 +154,6 @@ def tilelang_fused_chunk_gdr_bwd(
             # CONSUMER_K
             dk_fragment = T.alloc_fragment((block_S, DK), dtype=accum_dtype)
             dv_fragment = T.alloc_fragment((block_S, DK), dtype=accum_dtype)
-            odot_fragment_1 = T.alloc_fragment((block_S, DK), dtype=accum_dtype)
             dg_fragment_1 = T.alloc_fragment((block_S), dtype=accum_dtype)
             dg_last_local_1 = T.alloc_fragment((1), dtype=accum_dtype)
 
@@ -506,7 +505,7 @@ def tilelang_fused_chunk_gdr_bwd(
 
                     # 04
                     T.barrier_wait(bar_04, (i_s + 0) % 2)
-                    T.copy(u_tmem, odot_fragment_1)
+                    T.copy(u_tmem, dk_fragment)
                     T.barrier_wait(tcbar_04, (i_s + 0) % 2)
                     T.barrier_arrive(bar_05)
 
@@ -520,27 +519,31 @@ def tilelang_fused_chunk_gdr_bwd(
                         dv_fragment[j_s, j_v] *= -g_exp_shared[j_s]
                     # dg += sum(dVg * U)
                     for j_s, j_v in T.Parallel(block_S, DV):
-                        odot_fragment_1[j_s, j_v] *= dv_fragment[j_s, j_v]
+                        dk_fragment[j_s, j_v] *= dv_fragment[j_s, j_v]
                     T.barrier_arrive(bar_06)
 
                     # 06
                     T.barrier_wait(bar_06, (i_s + 0) % 2)
-                    T.reduce_sum(odot_fragment_1, dg_fragment_1, dim=1, clear=True)
+                    T.copy(dv_fragment, u_tmem)
+                    T.reduce_sum(dk_fragment, dg_fragment_1, dim=1, clear=True)
                     T.copy(dg_fragment_1, dg_shared)
                     # S2[2] K
-                    T.copy(k_shared, odot_fragment_1)
-                    T.copy(odot_fragment_1, tmp_shared_2_2)
+                    T.copy(k_shared, dv_fragment)
+                    T.copy(dv_fragment, tmp_shared_2_2)
+                    T.copy(dv_fragment, dv_tmem)
                     T.barrier_arrive(bar_07)
 
                     # 07
                     T.barrier_wait(bar_07, (i_s + 0) % 2)
                     # S2[3] dVg
+                    T.copy(u_tmem, dv_fragment)
                     T.copy(dv_fragment, tmp_shared_2_3)
                     T.barrier_wait(tcbar_07, (i_s + 0) % 2)
                     T.barrier_arrive(bar_08)
 
                     # 08
                     T.barrier_wait(bar_08, (i_s + 0) % 2)
+                    T.copy(dv_tmem, dv_fragment)
                     # dK = g_last/g * dK
                     T.copy(dk_tmem, dk_fragment)
                     for j_s, j_k in T.Parallel(block_S, DK):
@@ -548,8 +551,8 @@ def tilelang_fused_chunk_gdr_bwd(
                     T.copy(dk_fragment, dk_tmem)
                     # dg -= sum(K * dK)
                     for j_s, j_k in T.Parallel(block_S, DK):
-                        odot_fragment_1[j_s, j_k] *= -dk_fragment[j_s, j_k]
-                    T.reduce_sum(odot_fragment_1, dg_fragment_1, dim=1, clear=True)
+                        dv_fragment[j_s, j_k] *= -dk_fragment[j_s, j_k]
+                    T.reduce_sum(dv_fragment, dg_fragment_1, dim=1, clear=True)
                     # dg_last += sum(K * dK)
                     T.reduce_sum(dg_fragment_1, dg_last_local_1, dim=0, clear=True)
                     T.barrier_arrive(bar_09)

@@ -59,3 +59,15 @@
   `profile/sm100-fused-gdn-bwd-tmem-mask-spill-varlen-b2x8192-h64-20260707/REPORT.md`;
   raw and intermediate evidence remains under that run's `analysis/` and
   `reports/` directories.
+
+### Verified follow-up: Consumer-K dk-fragment reuse
+
+- Candidate source SHA-256: `5a3b56f28bd14ec480f62033d96d46e4b54b2ede20a8f8ccbafc073f11b8cd54`.
+- The workable TileLang design reuses full-width `dk_fragment` for U and U*dVg
+  in stages 04--06; half-fragment mixing failed layout inference and is rejected.
+- Generated CUDA retains ten balanced TMEM allocations (480 columns); static
+  LDL/STL is 112/40 -> 89/25 and ptxas stack is 144 B -> 96 B at 128 registers.
+- Full+Source/import-source/clock-none NCU measured local LD/ST 3,188,224/
+  2,062,720 -> 1,680,896/1,079,680 and local spill requests 5,228,672 -> 2,738,304.
+- Four selected FP64-reference tests and three exact BF16 varlen runs passed.
+- Paired GB200 CUDA-event ratios were 0.939390, 0.924556, 0.944366; median

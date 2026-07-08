@@ -14,6 +14,38 @@ SASS contains 112 LDL and 40 STL instructions. The strongest remaining source
 cluster is Consumer-K: `dv_fragment` and `odot_fragment_1` each represent a
 `[64,128]` FP32 logical tile and are simultaneously live around stages 04--08.
 
+## Implemented design (authoritative)
+
+TileLang 0.1.9 rejects the explored `[64,64]` half fragment when it is mixed
+with the full `[64,128]` fragment in this Consumer-K `T.Parallel` scope. The
+implemented source therefore reuses the otherwise-dead full-width
+`dk_fragment`; it has no `odot_fragment_1` or `u_half_fragment` allocation.
+
+- Stage 04 loads `U` from `u_tmem` into `dk_fragment`.
+- Stage 05 loads final `dV` into `dv_fragment`, forms dVg there, and forms
+  `U * dVg` in `dk_fragment`.
+- Stage 06 reduces that product, stages dVg in `u_tmem`, and stages `K` in
+  `dv_tmem` after their prior logical contents are dead.
+- Stage 07 restores dVg from `u_tmem` for the existing shared-memory path.
+- Stage 08 restores `K` from `dv_tmem`; only then does it overwrite
+  `dk_fragment` with `dK` from `dk_tmem` and execute the existing `K * dK`
+  reduction.
+
+No new TMEM allocation or barrier is introduced. The `dk_fragment` value from
+stage 05 is fully consumed by the stage-06 reduction before its original
+stage-08 dK use, and the stage-08 load overwrites it after `bar_08`.
+
+### Implemented lifetime contract
+
+`u_tmem` contains staged dVg only from Consumer-K's `bar_06` wait through its
+stage-07 reload, before the `bar_08` arrival that enables the producer dQ
+write. `dv_tmem` contains staged K after the final stage-05 dV read and until
+the stage-08 K reload. Generated CUDA retains ten balanced TMEM allocations
+totalling 480 columns (`5*64 + 5*32`).
+
+The following half-fragment proposal is retained solely as rejected design
+history; it is not the implementation or acceptance contract.
+
 ## Non-goals
 
 - Do not increase the physical TMEM allocation above 480 columns.
@@ -22,7 +54,7 @@ cluster is Consumer-K: `dv_fragment` and `odot_fragment_1` each represent a
 - Do not tune `set_max_nreg` in this experiment; register budgeting is a
   separate measured follow-up.
 
-## Selected design
+## Rejected half-fragment proposal (historical)
 
 Use already allocated TMEM buffers only during windows in which their logical
 values are dead. The implementation introduces no new `T.alloc_tmem` call.
@@ -35,10 +67,12 @@ values are dead. The implementation introduces no new `T.alloc_tmem` call.
 
 ### Stage changes
 
-1. In Consumer-K stage 04, load U in two 64-wide halves. Immediately store
-   the left half to `dp_tmem` and the right half to `da_tmem`. The temporary
-   per-thread fragment is `[64,64]`, so only one 32-element half is live at a
-   time instead of a full `odot_fragment_1[64]`.
+1. In Consumer-K stage 04, load full U into the otherwise-dead
+   `dv_fragment`, without creating a sliced TMEM view. Copy its two 64-wide
+   halves through `u_half_fragment`, immediately storing the left to
+   `dp_tmem` and the right to `da_tmem`. `dv_fragment` is overwritten by
+   the final dV load in stage 05, and only one `[64,64]` temporary is live at
+   a time instead of a full `odot_fragment_1[64]`.
 2. In stage 05, load final dV once, publish unchanged dV to `dqkv_shared`, and
    scale it into dVg. Reload each U half from `dp_tmem` / `da_tmem`, multiply
    it by the matching dVg half, and perform two ordered reductions into the
@@ -53,7 +87,7 @@ values are dead. The implementation introduces no new `T.alloc_tmem` call.
 5. In stage 08, reload K from `dv_tmem`, combine it with dK exactly as before,
    and retain the existing `dg_fragment_1` / `dg_last_local_1` reductions.
 
-## Synchronization contract
+## Historical synchronization contract
 
 `bar_06` is the release point for the U/V' lifetime: Consumer-A reads V' from
 `u_tmem` before it arrives, and Consumer-K reaches the same barrier only after
@@ -69,12 +103,18 @@ stores dAb there in its stage 06. `dv_tmem` is overwritten only after
 Consumer-K's final stage-05 dV load and is not accessed by the producer after
 its stage-04 dV GEMM.
 
+The rejected proposal deliberately avoided sliced TMEM views such as
+`u_tmem[:, :DK // 2]`: TileLang 0.1.9 previously failed layout inference for
+nonzero TMEM slice offsets in this kernel family. Its half split happened only
+between register fragments after the full-width U load, which was intended to
+preserve the same logical staging and lifetime proof without that lowering.
+
 No additional CTA, warpgroup, named, or tcgen05 barrier is introduced. Every
 new TMEM transfer follows the same TileLang `T.copy` lowering path already
 used by this kernel; generated CUDA must show the expected `LDTM`/`STTM`
 operations and no additional TMEM allocation/deallocation.
 
-## Validation and acceptance
+## Historical validation checklist (rejected proposal)
 
 1. Add AST/source structural tests before production edits. They must reject a
    new TMEM allocation, an early `u_tmem` write, a late `u_tmem` read, or

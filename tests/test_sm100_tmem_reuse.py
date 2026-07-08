@@ -683,3 +683,111 @@ def test_shared_q_snapshot_is_read_only_through_stage14():
         "tmp_shared_2_1", snapshot, last_gemm_14
     )
     assert not mutations, "tmp_shared_2_1 is not read-only: {}".format(mutations)
+
+
+def test_consumer_k_reuses_dk_fragment_and_stages_dead_tmem():
+    assignments, alloc_tmem_targets, alloc_fragment_targets = allocation_targets()
+    events = dataflow_events()
+
+    assert len(alloc_tmem_targets) == 10
+    assert "odot_fragment_1" not in alloc_fragment_targets
+    assert "u_half_fragment" not in alloc_fragment_targets
+    assert isinstance(assignments["dq_tmem"], ast.Name)
+    assert assignments["dq_tmem"].id == "u_tmem"
+
+    u_stage = event_lines(events, "copy", ["u_tmem", "dk_fragment"])
+    assert len(u_stage) == 1
+    bar_04_wait = max(
+        line
+        for line in event_lines(
+            events, "barrier_wait", ["bar_04", "(i_s + 0) % 2"]
+        )
+        if line < u_stage[0]
+    )
+    tcbar_04_wait = next(
+        line
+        for line in event_lines(
+            events, "barrier_wait", ["tcbar_04", "(i_s + 0) % 2"]
+        )
+        if line > u_stage[0]
+    )
+    bar_05_arrive = next(
+        line
+        for line in event_lines(events, "barrier_arrive", ["bar_05"])
+        if line > tcbar_04_wait
+    )
+    assert bar_04_wait < u_stage[0] < tcbar_04_wait < bar_05_arrive
+
+    final_dv = next(
+        line
+        for line in event_lines(events, "copy", ["dv_tmem", "dv_fragment"])
+        if line > bar_05_arrive
+    )
+    dvg_scale = parallel_multiply_lines(
+        "dv_fragment[j_s, j_v]",
+        "-g_exp_shared[j_s]",
+        ["block_S", "DV"],
+    )
+    u_dot = parallel_multiply_lines(
+        "dk_fragment[j_s, j_v]",
+        "dv_fragment[j_s, j_v]",
+        ["block_S", "DV"],
+    )
+    assert len(dvg_scale) == len(u_dot) == 1
+    bar_06_arrive = next(
+        line
+        for line in event_lines(events, "barrier_arrive", ["bar_06"])
+        if line > u_dot[0]
+    )
+    assert final_dv < dvg_scale[0] < u_dot[0] < bar_06_arrive
+
+    bar_06_wait = next(
+        line
+        for line in event_lines(
+            events, "barrier_wait", ["bar_06", "(i_s + 0) % 2"]
+        )
+        if line > bar_06_arrive
+    )
+    dvg_stage = event_lines(events, "copy", ["dv_fragment", "u_tmem"])
+    u_reduce = event_lines(
+        events,
+        "reduce_sum",
+        ["dk_fragment", "dg_fragment_1"],
+        {"dim": "1", "clear": "True"},
+    )
+    k_stage = event_lines(events, "copy", ["k_shared", "dv_fragment"])
+    u_to_dv = event_lines(events, "copy", ["u_tmem", "dv_fragment"])
+    assert len(dvg_stage) == len(u_reduce) == len(k_stage) == len(u_to_dv) == 1
+    k_tmem_stage = next(
+        line
+        for line in event_lines(events, "copy", ["dv_fragment", "dv_tmem"])
+        if line > k_stage[0]
+    )
+    bar_08_arrive = next(
+        line
+        for line in event_lines(events, "barrier_arrive", ["bar_08"])
+        if line > u_to_dv[0]
+    )
+    k_restore = next(
+        line
+        for line in event_lines(events, "copy", ["dv_tmem", "dv_fragment"])
+        if line > bar_08_arrive
+    )
+    assert (
+        bar_06_wait
+        < dvg_stage[0]
+        < u_reduce[0]
+        < k_stage[0]
+        < k_tmem_stage
+        < u_to_dv[0]
+        < bar_08_arrive
+        < k_restore
+    )
+
+    dk_product = parallel_multiply_lines(
+        "dv_fragment[j_s, j_k]",
+        "-dk_fragment[j_s, j_k]",
+        ["block_S", "DK"],
+    )
+    assert len(dk_product) == 1
+    assert k_restore < dk_product[0]
