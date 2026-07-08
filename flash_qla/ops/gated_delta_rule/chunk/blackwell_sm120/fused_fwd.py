@@ -619,7 +619,7 @@ def tilelang_fused_chunk_gdr_fwd(
 
                     # Store O
                     T.barrier_wait(bar_o, 0)
-                    if store_o:
+                    if store_o and num_iters > 0:
                         for j_s, j_v in T.Parallel(block_S, block_DV):
                             if seq_split_idx + j_s < seq_end_idx:
                                 o[batch_idx, seq_split_idx + j_s, bh, DV_start + j_v] = \
