@@ -1,0 +1,69 @@
+GPU: NVIDIA GB200 (SM100)
+Problem: B=1, T=32768 total, head_dim=128, BF16 Q/K/V, varlen (seed=42)
+Config: 3 alternating pairs, Warmup=10, Repeats=100, Backend=cudagraph
+Library Versions:
+  torch: 2.10.0a0+a36e1d39eb.nv26.01.42222806 | tilelang: 0.1.9
+Commits: 4c1109e6269b16910364767d52947e0ae1006174 vs 67cadab3d1e3ce98bcd6554e8f86986661e01e27
+==============================================================================================================================
+
+>>> BACKWARD COMPARISON (per-commit median time; paired median ratio)
+Model Config   SeqLen       h_qk  h_v #seq    4c1109e [bwd]  67cadab [bwd]  Ratio   Speedup  Time pct
+------------------------------------------------------------------------------------------------------------------------------
+hk16_hv16      32k_1seq      16   16    1       1.436ms         1.358ms   0.946   1.057x   -5.43%
+hk16_hv16      32k_2seq      16   16    2       1.453ms         1.376ms   0.946   1.057x   -5.43%
+hk16_hv16      32k_4seq      16   16    4       1.378ms         1.297ms   0.941   1.062x   -5.88%
+hk16_hv16      32k_5seq      16   16    5       1.377ms         1.291ms   0.938   1.067x   -6.24%
+hk16_hv16      32k_6seq      16   16    6       1.354ms         1.276ms   0.942   1.062x   -5.83%
+hk16_hv16      32k_8seq      16   16    8       1.353ms         1.276ms   0.942   1.061x   -5.76%
+
+hk4_hv16       32k_1seq       4   16    1       1.473ms         1.400ms   0.950   1.052x   -4.96%
+hk4_hv16       32k_2seq       4   16    2       1.485ms         1.411ms   0.950   1.052x   -4.98%
+hk4_hv16       32k_4seq       4   16    4       1.413ms         1.343ms   0.950   1.053x   -5.01%
+hk4_hv16       32k_5seq       4   16    5       1.412ms         1.328ms   0.941   1.063x   -5.95%
+hk4_hv16       32k_6seq       4   16    6       1.391ms         1.315ms   0.945   1.058x   -5.46%
+hk4_hv16       32k_8seq       4   16    8       1.393ms         1.317ms   0.945   1.058x   -5.46%
+
+hk12_hv12      32k_1seq      12   12    1       1.146ms         1.085ms   0.947   1.056x   -5.32%
+hk12_hv12      32k_2seq      12   12    2       1.167ms         1.100ms   0.943   1.061x   -5.74%
+hk12_hv12      32k_4seq      12   12    4       1.084ms         1.017ms   0.939   1.065x   -6.09%
+hk12_hv12      32k_5seq      12   12    5       1.085ms         1.015ms   0.935   1.069x   -6.45%
+hk12_hv12      32k_6seq      12   12    6       1.070ms         1.024ms   0.957   1.045x   -4.30%
+hk12_hv12      32k_8seq      12   12    8       1.083ms         1.031ms   0.951   1.051x   -4.89%
+
+hk4_hv12       32k_1seq       4   12    1       1.180ms         1.117ms   0.947   1.056x   -5.34%
+hk4_hv12       32k_2seq       4   12    2       1.197ms         1.131ms   0.945   1.058x   -5.51%
+hk4_hv12       32k_4seq       4   12    4       1.115ms         1.049ms   0.941   1.063x   -5.92%
+hk4_hv12       32k_5seq       4   12    5       1.116ms         1.049ms   0.940   1.064x   -6.00%
+hk4_hv12       32k_6seq       4   12    6       1.105ms         1.055ms   0.955   1.047x   -4.52%
+hk4_hv12       32k_8seq       4   12    8       1.109ms         1.062ms   0.957   1.045x   -4.32%
+
+hk8_hv8        32k_1seq       8    8    1       0.836ms         0.784ms   0.938   1.066x   -6.24%
+hk8_hv8        32k_2seq       8    8    2       0.854ms         0.799ms   0.935   1.070x   -6.54%
+hk8_hv8        32k_4seq       8    8    4       0.794ms         0.735ms   0.926   1.080x   -7.43%
+hk8_hv8        32k_5seq       8    8    5       0.794ms         0.756ms   0.952   1.050x   -4.79%
+hk8_hv8        32k_6seq       8    8    6       0.787ms         0.756ms   0.961   1.041x   -3.94%
+hk8_hv8        32k_8seq       8    8    8       0.790ms         0.744ms   0.942   1.062x   -5.82%
+
+hk4_hv8        32k_1seq       4    8    1       0.862ms         0.814ms   0.943   1.060x   -5.68%
+hk4_hv8        32k_2seq       4    8    2       0.872ms         0.823ms   0.944   1.060x   -5.62%
+hk4_hv8        32k_4seq       4    8    4       0.807ms         0.757ms   0.938   1.066x   -6.20%
+hk4_hv8        32k_5seq       4    8    5       0.814ms         0.772ms   0.948   1.054x   -5.16%
+hk4_hv8        32k_6seq       4    8    6       0.805ms         0.772ms   0.959   1.043x   -4.10%
+hk4_hv8        32k_8seq       4    8    8       0.810ms         0.768ms   0.948   1.055x   -5.19%
+
+hk4_hv4        32k_1seq       4    4    1       0.657ms         0.638ms   0.970   1.031x   -3.04%
+hk4_hv4        32k_2seq       4    4    2       0.638ms         0.619ms   0.970   1.031x   -2.98%
+hk4_hv4        32k_4seq       4    4    4       0.552ms         0.536ms   0.971   1.030x   -2.90%
+hk4_hv4        32k_5seq       4    4    5       0.558ms         0.546ms   0.980   1.020x   -1.97%
+hk4_hv4        32k_6seq       4    4    6       0.516ms         0.500ms   0.971   1.030x   -2.91%
+hk4_hv4        32k_8seq       4    4    8       0.514ms         0.500ms   0.973   1.028x   -2.72%
+
+SUMMARY
+  42-case geometric-mean ratio (67cadab / 4c1109e): 0.948966
+  42-case geometric-mean speedup: 1.054x
+  Time reduction: 5.10%
+  Per-case paired-median ratio range: 0.925693 to 0.980251
+  Pair GM ratios: 0.949034, 0.948190, 0.949516
+  All 42 cases improve; clocks were not fixed.
+
+Benchmark Finished.
