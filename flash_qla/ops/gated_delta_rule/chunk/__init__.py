@@ -283,6 +283,84 @@ def chunk_gated_delta_rule(
     auto_cp: bool = True,
     enable_fwd_cp_cache: bool = True,
 ):
+    r"""
+    Args:
+        q (torch.Tensor):
+            queries of shape `[B, T, H, K]`.
+        k (torch.Tensor):
+            keys of shape `[B, T, H, K]`.
+        v (torch.Tensor):
+            values of shape `[B, T, HV, V]`.
+            GVA (Grouped Value Attention) is applied if `HV > H`, where `HV` must be divisible by `H`.
+        g (torch.Tensor):
+            (forget) gating tensor of shape `[B, T, HV]`.
+            `g` should be in log space (pre-computed decay).
+        beta (torch.Tensor):
+            betas of shape `[B, T, HV]`.
+        scale (Optional[float]):
+            Scale factor for the RetNet attention scores.
+            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
+        initial_state (Optional[torch.Tensor]):
+            Initial state of shape `[N, HV, K, V]` for `N` input sequences.
+            For equal-length input sequences, `N` equals the batch size `B`.
+            Default: `None`.
+        output_final_state (Optional[bool]):
+            Whether to output the final state of shape `[N, HV, K, V]`. Default: `False`.
+        use_qk_l2norm_in_kernel (bool):
+            Whether to apply L2norm to the q/k tensor internally. Default: `False`.
+        cu_seqlens (torch.LongTensor):
+            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
+            consistent with the FlashAttention API.
+        head_first (Optional[bool]):
+            Whether the inputs are in the head-first format. Default: `False`.
+            This argument has been deprecated.
+        state_v_first (Optional[bool]):
+            Store the recurrent state in V-first ``[V, K]`` layout instead of the default ``[K, V]``. Default: ``False``.
+        auto_cp (Optional[bool]):
+            Whether to enable automatic intra-card CP. Default: `True`.
+        enable_fwd_cp_cache (Optional[bool]):
+            Whether to cache CP related variables during the forward pass. Default: `True`.
+
+    Returns:
+        o (torch.Tensor):
+            Outputs of shape `[B, T, HV, V]`.
+        final_state (torch.Tensor):
+            Final state of shape `[N, HV, K, V]` if `output_final_state=True` else `None`.
+
+    Notes:
+        The TVM host code does not accept `strides == nullptr` even for compact
+        tensors. You must explicitly set `strides` to a valid array when constructing
+        the DLTensor. This limitation applies to any manual DLPack construction.
+
+    Examples::
+        >>> import torch
+        >>> import torch.nn.functional as F
+        >>> from einops import rearrange
+        >>> from flash_qla.ops.gated_delta_rule import chunk_gated_delta_rule
+        # inputs with equal lengths
+        >>> B, T, H, HV, K, V = 4, 2048, 4, 8, 512, 512
+        >>> q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda')
+        >>> k = F.normalize(torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda'), p=2, dim=-1)
+        >>> v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device='cuda')
+        >>> beta = torch.rand(B, T, HV, dtype=torch.bfloat16, device='cuda').sigmoid()
+        >>> g = F.logsigmoid(torch.rand(B, T, HV, dtype=torch.bfloat16, device='cuda'))
+        >>> h0 = torch.randn(B, HV, K, V, dtype=torch.bfloat16, device='cuda')
+        >>> o, ht = chunk_gated_delta_rule(
+            q, k, v, g, beta,
+            initial_state=h0,
+            output_final_state=True
+        )
+        # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
+        >>> q, k, v, beta, g = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, beta, g))
+        # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
+        >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
+        >>> o, ht = chunk_gated_delta_rule(
+            q, k, v, g, beta,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens
+        )
+    """
     assert q.dtype == k.dtype == v.dtype
     assert q.dtype == torch.bfloat16 or q.dtype == torch.float16, (
         "FlashQLA only supports bfloat16 and float16."
