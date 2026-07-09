@@ -20,6 +20,7 @@ setup(
     version="0.1.2" + rev,
     description="FlashQLA: Fused TileLang kernels for Linear Attention",
     long_description=open("README.md", encoding="utf8").read(),
+    long_description_content_type="text/markdown",
     packages=find_packages(),
     license="MIT",
     python_requires=">=3.10",
