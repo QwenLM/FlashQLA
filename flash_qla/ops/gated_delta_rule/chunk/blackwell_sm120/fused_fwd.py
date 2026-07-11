@@ -189,7 +189,7 @@ def tilelang_fused_chunk_gdr_fwd(
 
             PRODUCER_NREG = 32
             CONSUMER_V_NREG = 128
-            CONSUMER_S_NREG = 160
+            CONSUMER_S_NREG = 128
             CONSUMER_O_NREG = 128
 
             if tx < 128:
@@ -683,10 +683,10 @@ def fused_gdr_fwd(
     else:
         is_cp = True
 
-    # Always use T.copy path to avoid T.clear bug for large fragments
-    use_initial_state = True
+    # use torch.empty() 
+    use_initial_state = initial_state is not None
     if initial_state is None:
-        initial_state = torch.zeros(
+        initial_state = torch.empty(
             (real_batch_size, H, V, K)
             if state_v_first
             else (real_batch_size, H, K, V),

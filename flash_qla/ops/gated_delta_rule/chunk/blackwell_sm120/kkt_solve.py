@@ -9,13 +9,6 @@ import tilelang.language as T
 
 from flash_qla.utils import prepare_chunk_indices
 
-from typing import Optional
-
-import torch
-import tilelang
-import tilelang.language as T
-
-from flash_qla.utils import prepare_chunk_indices
 
 
 
@@ -89,137 +82,115 @@ def tilelang_kkt_solve(
             }
         )
 
-        k_is_ready = T.alloc_barrier(arrive_count=32)
-        a_is_ready = T.alloc_barrier(arrive_count=128)
-
-        tx = T.get_thread_binding()
-
-        PRODUCER_NREG = 24
-        CONSUMER_NREG = 64
-
-        if tx < 128:
-            T.set_max_nreg(CONSUMER_NREG, 1)
-
-            # Load b
-            if right <= seq_end_idx:
-                for j_s in T.Parallel(block_S):
+        # Load K (async)
+        if right <= seq_end_idx:
+            T.async_copy(k[bb, left:right, bhg, 0:DK], k_shared)
+        else:
+            for j_s, j_k in T.Parallel(block_S, DK):
+                if left + j_s < seq_end_idx:
+                    k_shared[j_s, j_k] = k[bb, left + j_s, bhg, j_k]
+                else:
+                    k_shared[j_s, j_k] = 0
+        # Load b (overlaps with K async copy)
+        if right <= seq_end_idx:
+            for j_s in T.Parallel(block_S):
+                b_shared[j_s] = b[bb, left + j_s, bh]
+        else:
+            for j_s in T.Parallel(block_S):
+                if left + j_s < seq_end_idx:
                     b_shared[j_s] = b[bb, left + j_s, bh]
-            else:
-                for j_s in T.Parallel(block_S):
-                    if left + j_s < seq_end_idx:
-                        b_shared[j_s] = b[bb, left + j_s, bh]
-                    else:
-                        b_shared[j_s] = 0
+                else:
+                    b_shared[j_s] = 0
+        # A = K @ K^T 
+        if right <= seq_end_idx:
+            T.ptx_wait_group(0)
+        T.gemm(k_shared,k_shared,a32_fragment,transpose_B=True,clear_accum=True)
 
-            T.barrier_wait(k_is_ready, 0)
-
-            # A = K @ K^T  (32x32)
-            T.gemm(
-                k_shared, k_shared, a32_fragment, transpose_B=True, clear_accum=True
-            )
-
-            # A = b * A
-            for j_s, j_t in T.Parallel(block_S, block_S):
-                a32_fragment[j_s, j_t] *= b_shared[j_s]
+        # A = b * A
+        for j_s, j_t in T.Parallel(block_S, block_S):
+            a32_fragment[j_s, j_t] *= b_shared[j_s]
 
             # A = I + StrictLower(A)
-            for j_s, j_t in T.Parallel(block_S, block_S):
-                if j_s < j_t:
-                    a32_fragment[j_s, j_t] = 0
-                elif j_s == j_t:
-                    a32_fragment[j_s, j_t] = 1
+        for j_s, j_t in T.Parallel(block_S, block_S):
+            if j_s < j_t:
+                a32_fragment[j_s, j_t] = 0
+            elif j_s == j_t:
+                a32_fragment[j_s, j_t] = 1
 
-            # Prepare inversion input: extract diagonal and sub-diagonal 16x16 blocks
-            for j_s, j_t in T.Parallel(block_S, block_S):
-                if (j_s // 16) == (j_t // 16) + 1:
+        # Prepare inversion input: extract diagonal and sub-diagonal 16x16 blocks
+        for j_s, j_t in T.Parallel(block_S, block_S):
+            if (j_s // 16) == (j_t // 16) + 1:
                     # Sub-diagonal block: L10
-                    a16o_shared[j_s // 32, j_s % 16, j_t % 16] = -a32_fragment[
+                a16o_shared[j_s // 32, j_s % 16, j_t % 16] = -a32_fragment[
                         j_s, j_t
                     ]
-                elif (j_s // 16) == (j_t // 16):
+            elif (j_s // 16) == (j_t // 16):
                     # Diagonal blocks: L00, L11
-                    a16i_shared[j_s // 16, j_s % 16, j_t % 16] = a32_fragment[
+                a16i_shared[j_s // 16, j_s % 16, j_t % 16] = a32_fragment[
                         j_s, j_t
                     ]
 
-            # Invert diagonal 16x16 blocks (2 blocks in parallel)
-            # Forward substitution for lower triangular L with unit diagonal
-            for k_s in T.unroll(1, 16):
+        # Invert diagonal 16x16 blocks (2 blocks in parallel)
+        # Forward substitution for lower triangular L with unit diagonal
+        for k_s in T.unroll(1, 16):
+            for j_s, k_t in T.Parallel(2, 16):
+                if k_t < k_s:
+                    a16i_row[j_s, k_t] = a16i_shared[j_s, k_s, k_t]
+            T.clear(a16i_sum)
+            for k_r in T.unroll(k_s):
                 for j_s, k_t in T.Parallel(2, 16):
-                    if k_t < k_s:
-                        a16i_row[j_s, k_t] = a16i_shared[j_s, k_s, k_t]
-                T.clear(a16i_sum)
-                for k_r in T.unroll(k_s):
-                    for j_s, k_t in T.Parallel(2, 16):
-                        a16i_sum[j_s, k_t] -= (
+                    a16i_sum[j_s, k_t] -= (
                             a16i_shared[j_s, k_r, k_t] * a16i_row[j_s, k_r]
                         )
-                for j_s, k_t in T.Parallel(2, 16):
-                    if k_t < k_s:
-                        a16i_shared[j_s, k_s, k_t] = a16i_sum[j_s, k_t]
+            for j_s, k_t in T.Parallel(2, 16):
+                if k_t < k_s:
+                    a16i_shared[j_s, k_s, k_t] = a16i_sum[j_s, k_t]
 
             # Compute coupling between blocks 0 and 1 (single pair)
             # Step 1: temp = L11^{-1} @ (-L10)  [16x16]
-            T.clear(a16o_fragment)
-            for k_r in T.unroll(16):
-                for j_s, k_s, k_t in T.Parallel(1, 16, 16):
+        T.clear(a16o_fragment)
+        for k_r in T.unroll(16):
+            for j_s, k_s, k_t in T.Parallel(1, 16, 16):
                     a16o_fragment[j_s, k_s, k_t] += (
                         a16i_shared[j_s * 2 + 1, k_s, k_r]
                         * a16o_shared[j_s, k_r, k_t]
                     )
             # Transpose for the second multiply
-            for j_s, k_s, k_t in T.Parallel(1, 16, 16):
-                a16o_shared[j_s, k_t, k_s] = a16o_fragment[j_s, k_s, k_t]
+        for j_s, k_s, k_t in T.Parallel(1, 16, 16):
+            a16o_shared[j_s, k_t, k_s] = a16o_fragment[j_s, k_s, k_t]
             # Step 2: result = temp @ L00^{-1}  [16x16]
-            T.clear(a16o_fragment)
-            for k_r in T.unroll(16):
-                for j_s, k_s, k_t in T.Parallel(1, 16, 16):
+        T.clear(a16o_fragment)
+        for k_r in T.unroll(16):
+            for j_s, k_s, k_t in T.Parallel(1, 16, 16):
                     a16o_fragment[j_s, k_s, k_t] += (
                         a16o_shared[j_s, k_r, k_s]
                         * a16i_shared[j_s * 2, k_r, k_t]
                     )
-            T.copy(a16o_fragment, a16o_shared[:, 0:16, 0:16])
+        T.copy(a16o_fragment, a16o_shared[:, 0:16, 0:16])
 
             # Assemble 32x32 result
             # Top-left: L00^{-1}
-            for k_s, k_t in T.Parallel(16, 16):
-                a32_shared[k_s, k_t] = a16i_shared[0, k_s, k_t]
+        for k_s, k_t in T.Parallel(16, 16):
+            a32_shared[k_s, k_t] = a16i_shared[0, k_s, k_t]
             # Top-right: 0
-            for k_s, k_t in T.Parallel(16, 16):
-                a32_shared[k_s, 16 + k_t] = 0
+        for k_s, k_t in T.Parallel(16, 16):
+            a32_shared[k_s, 16 + k_t] = 0
             # Bottom-left: coupling (-L11^{-1} @ L10 @ L00^{-1})
-            for k_s, k_t in T.Parallel(16, 16):
-                a32_shared[16 + k_s, k_t] = a16o_fragment[0, k_s, k_t]
+        for k_s, k_t in T.Parallel(16, 16):
+            a32_shared[16 + k_s, k_t] = a16o_fragment[0, k_s, k_t]
             # Bottom-right: L11^{-1}
-            for k_s, k_t in T.Parallel(16, 16):
-                a32_shared[16 + k_s, 16 + k_t] = a16i_shared[1, k_s, k_t]
+        for k_s, k_t in T.Parallel(16, 16):
+            a32_shared[16 + k_s, 16 + k_t] = a16i_shared[1, k_s, k_t]
 
-            T.barrier_arrive(a_is_ready)
+            
 
+        # Save A (unmasked)
+        if right <= seq_end_idx:
+            T.copy(a32_shared, a[bb, left:right, bh, 0:block_S])
         else:
-            T.set_max_nreg(PRODUCER_NREG, 0)
-
-            if tx < 128 + 32:
-                # Load K
-                T.copy(k[bb, left:right, bhg, 0:DK], k_shared)
-
-                T.barrier_arrive(k_is_ready)
-
-            elif tx < 128 + 64:
-                T.barrier_wait(a_is_ready, 0)
-
-                # Save A (unmasked)
-                if right <= seq_end_idx:
-                    T.copy(a32_shared, a[bb, left:right, bh, 0:block_S])
-
-            else:
-                T.barrier_wait(a_is_ready, 0)
-
-                # Save A (masked)
-                if right > seq_end_idx:
-                    for j_s, j_t in T.Parallel(block_S, block_S):
-                        if left + j_s < seq_end_idx:
-                            a[bb, left + j_s, bh, j_t] = a32_shared[j_s, j_t]
+            for j_s, j_t in T.Parallel(block_S, block_S):
+                if left + j_s < seq_end_idx:
+                    a[bb, left + j_s, bh, j_t] = a32_shared[j_s, j_t]
 
    
 
@@ -233,7 +204,7 @@ def tilelang_kkt_solve(
             chunk_indices: T.Tensor([num_chunks, 2], dtype=seqlen_dtype),
             a: T.Tensor(a_shape, dtype=qkva_dtype),
         ):
-            with T.Kernel(num_chunks * H, threads=256) as (bch,):
+            with T.Kernel(num_chunks * H, threads=128) as (bch,):
                 bc, bh = bch // H, bch % H
                 bhg = bh // (H // Hg)
 
@@ -272,7 +243,7 @@ def tilelang_kkt_solve(
             a: T.Tensor(a_shape, dtype=qkva_dtype),
             num_chunks: T.int32,
         ):
-            with T.Kernel(num_chunks * H, threads=256) as (bch,):
+            with T.Kernel(num_chunks * H, threads=128) as (bch,):
                 bc, bh = bch // H, bch % H
                 bhg = bh // (H // Hg)
 
