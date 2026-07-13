@@ -71,3 +71,66 @@
   2,062,720 -> 1,680,896/1,079,680 and local spill requests 5,228,672 -> 2,738,304.
 - Four selected FP64-reference tests and three exact BF16 varlen runs passed.
 - Paired GB200 CUDA-event ratios were 0.939390, 0.924556, 0.944366; median
+  0.939390 passed the <=1.01 gate.
+
+### Rejected candidate: Consumer-A dQ TMEM half slices
+
+- Candidate source SHA-256: `e5f3bf1b538215518a2ec679302d4b3a99817312f6bf3ae57937b9b1a8acc55f`.
+- Structural regression tests passed 11/11 in the GB200 container, but the
+  exact BF16 varlen target JIT failed before any backward launch at
+  `CopyNode::LowerTmemCopy`: `Failed to find a suitable instruction for
+  tcgen05.ld. Check your layout.`
+- Root cause: TileLang only selects tcgen05.ld when the full TMEM-to-fragment
+  physical layout matches a supported instruction; a `dq_tmem[:, half]` view
+  does not. No correctness, NCU, or timing result exists for this candidate.
+- Follow-up must use two separately addressed full 64x64 TMEM buffers and
+  independent mbarriers, not nonzero or partial views of a 64x128 buffer.
+
+### Verified benchmark: Consumer-K versus pre-reuse commit
+
+- On GB200/SM100, the BWD matrix from `benchmark_results_GB200.txt` was run
+  for exact snapshots `4c1109e6269b16910364767d52947e0ae1006174` and
+  `67cadab3d1e3ce98bcd6554e8f86986661e01e27`: seven head configurations by
+  six 32k varlen sequence partitions, 42 cases total.
+- Three alternating CUDAGraph pairs used warmup=10 and repeats=100 per case;
+  all six logs completed 42/42 cases with no benchmark errors. The geometric
+  mean of the 42 per-case median `67cadab / 4c1109e` ratios was 0.948966
+  (5.10% lower time; 1.054x faster). Pair-level GM ratios were 0.949034,
+  0.948190, and 0.949516.
+- The detailed report and raw logs are under
+  `profile/sm100-fused-gdn-bwd-producer-split-dq-varlen-b2x8192-h64-20260708/analysis/`.
+
+### Verified clean reproduction: uploaded benchmark commit
+
+- A clean GB200/SM100 worktree at `5db6772` reran the 42-case BWD matrix
+  (`B=1`, total `T=32768`, BF16 Q/K/V, varlen seed 42) with CUDAGraph,
+  warmup=10, and repeats=100 per case. Both fresh runs completed 42/42.
+- The two-run geometric-mean times were 0.935931954 ms and 0.937575107 ms;
+  their ratio was 1.001755632. Against the uploaded three-run median, the
+  fresh two-run median ratio was 0.994035720 (0.596% lower time).
+- This is a small node/clock variation, not a kernel regression: neither
+  experiment fixed clocks, and the clean reproduction used a different GB200
+  node. Evidence is in
+  `profile/gb200-bwd-matrix-repro-20260709/analysis/REPORT.md`.
+
+### Verified follow-up: full dQ TMEM and full B operand
+
+- A full `dq_tmem = u_tmem` (64x128) layout compiles when every TMEM load is
+  full-width. The producer can use the full `h_shared` B operand and one
+  mbarrier each for stages 08 and 10; no B half-slice scratch copy or its
+  added wait is required.
+- TileLang still rejects a 64x64 view of that 64x128 TMEM allocation at
+  `CopyNode::LowerTmemCopy`. The valid consumer path stages the complete dQ
+  buffer through the dead full-width `u_fragment`, aliases it as
+  `dq_fragment`, and performs the scalar/dot work there before restaging it.
+  This does not allocate another full fragment.
+- Structural checks passed 17/17. On GB200/SM100, the exact BF16 packed
+  varlen target (`B=2`, total T=16384, H=64, D=128,
+  `cu_seqlens=[0,8192,16384]`, chunk 64) JIT-compiled and launched with RC 0;
+  the FP64-reference case `test_bwd[h0-kv-B3-T4096-H4-varlen]` passed.
+- This validates compilation and correctness, not performance. Re-profile
+  before making a performance claim.
+- The post-redesign diagnostic NCU run is
+  `profile/sm100-fused-gdn-bwd-full-dq-full-b-varlen-b2x8192-h64-full-source-import-clock-none-20260710-213343/`.
+  Its single Full+SourceCounters+PM-sampling, source-import, clock-none report
+  has SHA-256 `89c0676b51485e35072b507ff0bae0c0c4ccc80c95dfe4db1e71260ba26ff338`.

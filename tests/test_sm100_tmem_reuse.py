@@ -96,6 +96,150 @@ def dataflow_events(source=None):
     return sorted(events, key=lambda event: event["line"])
 
 
+def _is_t_call(node, names):
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "T"
+        and node.func.attr in names
+    )
+
+
+def _t_call_event(call):
+    return {
+        "line": call.lineno,
+        "name": call.func.attr,
+        "args": tuple(_unparse(arg) for arg in call.args),
+        "arg_nodes": tuple(call.args),
+        "keywords": {
+            keyword.arg: _unparse(keyword.value) for keyword in call.keywords
+        },
+        "keyword_nodes": {
+            keyword.arg: keyword.value for keyword in call.keywords
+        },
+    }
+
+
+def _t_call_events(statements, names):
+    events = []
+    for statement in statements:
+        for node in ast.walk(statement):
+            if _is_t_call(node, names):
+                events.append(_t_call_event(node))
+    return sorted(events, key=lambda event: event["line"])
+
+
+def _event_arg_name(event, index=0):
+    if len(event["arg_nodes"]) <= index:
+        return None
+    arg = event["arg_nodes"][index]
+    return arg.id if isinstance(arg, ast.Name) else None
+
+
+def _event_mbar_name(event):
+    mbar = event["keyword_nodes"].get("mbar")
+    return mbar.id if isinstance(mbar, ast.Name) else None
+
+
+def _is_serial_num_iters_loop(node):
+    return (
+        isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Call)
+        and isinstance(node.iter.func, ast.Attribute)
+        and isinstance(node.iter.func.value, ast.Name)
+        and node.iter.func.value.id == "T"
+        and node.iter.func.attr == "serial"
+        and len(node.iter.args) == 1
+        and not node.iter.keywords
+        and isinstance(node.iter.args[0], ast.Name)
+        and node.iter.args[0].id == "num_iters"
+    )
+
+
+def producer_iteration_events(source=None):
+    candidates = []
+    for node in ast.walk(_tree(source)):
+        if not _is_serial_num_iters_loop(node):
+            continue
+        events = _t_call_events(
+            node.body, {"barrier_arrive", "barrier_wait", "tcgen05_gemm"}
+        )
+        wait_names = {
+            _event_arg_name(event)
+            for event in events
+            if event["name"] == "barrier_wait"
+        }
+        if (
+            {"bar_08", "bar_09", "bar_10", "bar_11"} <= wait_names
+            and any(event["name"] == "tcgen05_gemm" for event in events)
+        ):
+            candidates.append(events)
+
+    assert len(candidates) == 1, (
+        "expected one producer serial(num_iters) loop, found {}".format(
+            len(candidates)
+        )
+    )
+    return candidates[0]
+
+
+def _producer_wait_line(events, barrier):
+    lines = [
+        event["line"]
+        for event in events
+        if event["name"] == "barrier_wait"
+        and _event_arg_name(event) == barrier
+    ]
+    assert len(lines) == 1, "expected one producer wait on {}".format(barrier)
+    return lines[0]
+
+
+def _mbar_events(events, name):
+    return [
+        event
+        for event in events
+        if event["name"] == "tcgen05_gemm"
+        and _event_mbar_name(event) == name
+    ]
+
+
+def producer_stage08_state_v_first_gemm_branches(source=None):
+    producer_lines = {
+        event["line"] for event in producer_iteration_events(source)
+    }
+    candidates = []
+    for node in ast.walk(_tree(source)):
+        if not (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "state_v_first"
+        ):
+            continue
+
+        branches = [
+            _t_call_events(statements, {"tcgen05_gemm"})
+            for statements in (node.body, node.orelse)
+        ]
+        stage08_events = [
+            event
+            for branch in branches
+            for event in _mbar_events(branch, "tcbar_08_L")
+            + _mbar_events(branch, "tcbar_08_R")
+        ]
+        if stage08_events and all(
+            event["line"] in producer_lines for event in stage08_events
+        ):
+            candidates.append(tuple(branches))
+
+    assert len(candidates) == 1, (
+        "expected one state_v_first producer stage-08 branch, found {}".format(
+            len(candidates)
+        )
+    )
+    return candidates[0]
+
+
 def event_lines(events, name, args, keywords=None, required=True):
     expected_args = tuple(_expression(arg) for arg in args)
     expected_keywords = {
@@ -232,11 +376,94 @@ def buffer_mutations_between(buffer_name, start_line, end_line, source=None):
 
 
 def test_dq_tmem_reuses_u_tmem_allocation():
-    assignments, _, _ = allocation_targets()
+    assignments, _, alloc_fragment_targets = allocation_targets()
 
     dq_assignment = assignments["dq_tmem"]
+    dq_fragment_assignment = assignments["dq_fragment"]
     assert isinstance(dq_assignment, ast.Name), ast.dump(dq_assignment)
+    assert isinstance(dq_fragment_assignment, ast.Name), ast.dump(
+        dq_fragment_assignment
+    )
     assert dq_assignment.id == "u_tmem"
+    assert dq_fragment_assignment.id == "u_fragment"
+    assert "dq_fragment" not in alloc_fragment_targets
+
+
+def _assert_single_arrival_tmem_barrier(assignments, name):
+    assert name in assignments
+    allocation = assignments[name]
+    assert isinstance(allocation, ast.Call), ast.dump(allocation)
+    assert (
+        isinstance(allocation.func, ast.Attribute)
+        and isinstance(allocation.func.value, ast.Name)
+        and allocation.func.value.id == "T"
+        and allocation.func.attr == "alloc_barrier"
+    ), ast.dump(allocation)
+    assert not allocation.args
+    assert [
+        (keyword.arg, _unparse(keyword.value)) for keyword in allocation.keywords
+    ] == [("arrive_count", "1")]
+
+
+def test_full_dq_barriers_have_one_arrival_each():
+    assignments, _, _ = allocation_targets()
+
+    for name in ("tcbar_08", "tcbar_10"):
+        _assert_single_arrival_tmem_barrier(assignments, name)
+    assert not {
+        name
+        for name in ("tcbar_08_L", "tcbar_08_R", "tcbar_10_L", "tcbar_10_R")
+        if name in assignments
+    }
+
+
+def test_producer_stage08_uses_full_h_shared_and_dq_tmem():
+    events = producer_iteration_events()
+    lines = event_lines(
+        events,
+        "tcgen05_gemm",
+        ["do_shared", "h_shared", "dq_tmem"],
+        {
+            "transpose_B": "not state_v_first",
+            "clear_accum": "True",
+            "mbar": "tcbar_08",
+            "use_2cta": "False",
+        },
+    )
+    assert len(lines) == 1
+    signals = _mbar_events(events, "tcbar_08")
+    assert len(signals) == 1
+    assert signals[0]["line"] == lines[0]
+
+
+def test_producer_stage10_uses_full_tmp_shared_2_2_without_clearing():
+    events = producer_iteration_events()
+    assert len(
+        event_lines(
+            events,
+            "tcgen05_gemm",
+            ["tmp_shared_1_1", "tmp_shared_2_2", "dq_tmem"],
+            {
+                "clear_accum": "False",
+                "mbar": "tcbar_10",
+                "use_2cta": "False",
+            },
+        )
+    ) == 1
+
+
+def test_producer_full_dq_gemms_have_single_mbars_and_stage_bounds():
+    events = producer_iteration_events()
+    wait_08 = _producer_wait_line(events, "bar_08")
+    wait_09 = _producer_wait_line(events, "bar_09")
+    wait_10 = _producer_wait_line(events, "bar_10")
+    wait_11 = _producer_wait_line(events, "bar_11")
+
+    stage08 = _mbar_events(events, "tcbar_08")
+    stage10 = _mbar_events(events, "tcbar_10")
+    assert len(stage08) == len(stage10) == 1
+    assert wait_08 < stage08[0]["line"] < wait_09
+    assert wait_10 < stage10[0]["line"] < wait_11
 
 
 def test_mask_tmem_has_explicit_tcgen05_layout_e():
@@ -344,10 +571,10 @@ def test_consumer_a_spill_fragments_move_to_mask_tmem():
         "dp_fragment",
         "da_fragment",
         "u_fragment",
-        "dq_fragment",
         "db_fragment",
         "dg_fragment_2",
     ]
+    assert "dq_fragment" not in alloc_fragment_targets
     consumer_a_start = alloc_fragment_targets.index("dg_last_local_1") + 1
     consumer_a_end = consumer_a_start + len(expected_consumer_a)
     assert alloc_fragment_targets[consumer_a_start:consumer_a_end] == expected_consumer_a
@@ -414,67 +641,154 @@ def test_stage08_q_snapshot_uses_only_shared_storage():
     assert q_left < q_left_shared < q_right < q_right_shared < bar_09
 
 
-def test_stage09_shared_q_dot_replaces_half_adapters():
-    events = dataflow_events()
-
-    dq_store = event_lines(events, "copy", ["dq_fragment", "dq_tmem"])[0]
-    dot_lines = parallel_multiply_lines(
-        "dq_fragment[j_s, j_k]",
-        "tmp_shared_2_1[j_s, j_k]",
-        ["block_S", "DK"],
-    )
-    assert len(dot_lines) == 1, "missing full 64x128 shared-Q dot multiply"
-    dot = dot_lines[0]
-    dq_reduce = event_lines(
+def _consumer_a_dq_stage_bounds(events):
+    snapshot = event_lines(
         events,
-        "reduce_sum",
-        ["dq_fragment", "dg_fragment_2"],
-        {"dim": "1", "clear": "False"},
+        "copy",
+        ["p_fragment", "tmp_shared_2_1[:, DK // 2:]"],
     )[0]
-    bar_10 = next(
+    tcbar_08_wait = next(
+        line
+        for line in event_lines(
+            events, "barrier_wait", ["tcbar_08", "(i_s + 0) % 2"]
+        )
+        if line > snapshot
+    )
+    bar_09_arrive = next(
+        line
+        for line in event_lines(events, "barrier_arrive", ["bar_09"])
+        if line > tcbar_08_wait
+    )
+    wait_09 = next(
+        line
+        for line in event_lines(
+            events, "barrier_wait", ["bar_09", "(i_s + 0) % 2"]
+        )
+        if line > bar_09_arrive
+    )
+    bar_10_arrive = next(
         line
         for line in event_lines(events, "barrier_arrive", ["bar_10"])
-        if line > dq_reduce
+        if line > wait_09
+    )
+    wait_10 = next(
+        line
+        for line in event_lines(
+            events, "barrier_wait", ["bar_10", "(i_s + 0) % 2"]
+        )
+        if line > bar_10_arrive
+    )
+    tcbar_10_wait = next(
+        line
+        for line in event_lines(
+            events, "barrier_wait", ["tcbar_10", "(i_s + 0) % 2"]
+        )
+        if line > wait_10
+    )
+    bar_11_arrive = next(
+        line
+        for line in event_lines(events, "barrier_arrive", ["bar_11"])
+        if line > tcbar_10_wait
+    )
+    assert snapshot < tcbar_08_wait < bar_09_arrive < wait_09 < bar_10_arrive
+    assert wait_10 < tcbar_10_wait < bar_11_arrive
+    return wait_09, bar_10_arrive, tcbar_10_wait, bar_11_arrive
+
+
+def test_consumer_a_waits_once_for_full_dq_tmem_barriers():
+    events = dataflow_events()
+    snapshot = event_lines(
+        events,
+        "copy",
+        ["p_fragment", "tmp_shared_2_1[:, DK // 2:]"],
+    )[0]
+    tcbar_08_waits = [
+        line
+        for line in event_lines(
+            events, "barrier_wait", ["tcbar_08", "(i_s + 0) % 2"]
+        )
+        if line > snapshot
+    ]
+    _, _, tcbar_10_wait, _ = _consumer_a_dq_stage_bounds(events)
+    assert len(tcbar_08_waits) == 1
+    assert tcbar_10_wait > tcbar_08_waits[0]
+
+
+def test_stage09_full_dq_streams_through_reused_u_fragment():
+    events = dataflow_events()
+    wait_09, bar_10, _, _ = _consumer_a_dq_stage_bounds(events)
+
+    def in_stage09(lines):
+        return [line for line in lines if wait_09 < line < bar_10]
+
+    full_load = in_stage09(
+        event_lines(events, "copy", ["dq_tmem", "dq_fragment"])
+    )
+    full_store = in_stage09(
+        event_lines(events, "copy", ["dq_fragment", "dq_tmem"])
+    )
+    g_scales = in_stage09(
+        parallel_multiply_lines(
+            "dq_fragment[j_s, j_k]",
+            "g_exp_shared[j_s]",
+            ["block_S", "DK"],
+        )
+    )
+    dot = in_stage09(
+        parallel_multiply_lines(
+            "dq_fragment[j_s, j_k]",
+            "tmp_shared_2_1[j_s, j_k]",
+            ["block_S", "DK"],
+        )
+    )
+    reductions = in_stage09(
+        event_lines(
+            events,
+            "reduce_sum",
+            ["dq_fragment", "dg_fragment_2"],
+            {"dim": "1", "clear": "False"},
+        )
     )
 
-    assert not event_lines(
-        events,
-        "copy",
-        ["dq_fragment[:, :DK // 2]", "dp_fragment"],
-        required=False,
+    assert all(
+        len(lines) == 1
+        for lines in (full_load, full_store, g_scales, dot, reductions)
     )
-    assert not event_lines(
-        events,
-        "copy",
-        ["dq_fragment[:, DK // 2:]", "dp_fragment"],
-        required=False,
+    assert (
+        full_load[0]
+        < g_scales[0]
+        < full_store[0]
+        < dot[0]
+        < reductions[0]
+        < bar_10
     )
-    a_reduces = event_lines(
-        events,
-        "reduce_sum",
-        ["a_fragment", "dg_fragment_2"],
-        {"dim": "1", "clear": "False"},
-        required=False,
+
+
+def test_stage10_publishes_full_dq_after_tcbar10():
+    events = dataflow_events()
+    _, _, tcbar_10_wait, bar_11 = _consumer_a_dq_stage_bounds(events)
+
+    def in_stage10(lines):
+        return [line for line in lines if tcbar_10_wait < line < bar_11]
+
+    full_load = in_stage10(
+        event_lines(events, "copy", ["dq_tmem", "dq_fragment"])
     )
-    p_reduces = event_lines(
-        events,
-        "reduce_sum",
-        ["p_fragment", "dg_fragment_2"],
-        {"dim": "1", "clear": "False"},
-        required=False,
+    full_store = in_stage10(
+        event_lines(events, "copy", ["dq_fragment", "dqkv_shared"])
     )
-    assert not [line for line in a_reduces if dq_store < line < bar_10]
-    assert not [line for line in p_reduces if dq_store < line < bar_10]
-    assert dq_store < dot < dq_reduce < bar_10
-    assert subscript_accesses_between(
-        "tmp_shared_2_1", dq_store, dq_reduce
-    ) == [
-        {
-            "line": dot,
-            "expression": _expression("tmp_shared_2_1[j_s, j_k]"),
-            "context": "Load",
-        }
+
+    assert len(full_load) == len(full_store) == 1
+    assert tcbar_10_wait < full_load[0] < full_store[0] < bar_11
+
+
+def test_full_dq_is_never_sliced_as_a_tmem_operand():
+    partial_views = [
+        _unparse(node)
+        for node in ast.walk(_tree())
+        if isinstance(node, ast.Subscript) and _root_buffer_name(node) == "dq_tmem"
     ]
+    assert not partial_views, partial_views
 
 
 def test_shared_q_snapshot_keeps_stage12_and_stage14_gemm_signatures():
@@ -562,11 +876,13 @@ def test_shared_q_snapshot_is_read_only_through_stage14():
         "copy",
         ["p_fragment", "tmp_shared_2_1[:, DK // 2:]"],
     )[0]
-    dot = parallel_multiply_lines(
+    dot_lines = parallel_multiply_lines(
         "dq_fragment[j_s, j_k]",
         "tmp_shared_2_1[j_s, j_k]",
         ["block_S", "DK"],
-    )[0]
+    )
+    assert len(dot_lines) == 1, "missing full-width shared-Q dot"
+    dot = dot_lines[0]
     gemm_12 = event_lines(
         events,
         "tcgen05_gemm",
@@ -686,14 +1002,12 @@ def test_shared_q_snapshot_is_read_only_through_stage14():
 
 
 def test_consumer_k_reuses_dk_fragment_and_stages_dead_tmem():
-    assignments, alloc_tmem_targets, alloc_fragment_targets = allocation_targets()
+    _, alloc_tmem_targets, alloc_fragment_targets = allocation_targets()
     events = dataflow_events()
 
     assert len(alloc_tmem_targets) == 10
     assert "odot_fragment_1" not in alloc_fragment_targets
     assert "u_half_fragment" not in alloc_fragment_targets
-    assert isinstance(assignments["dq_tmem"], ast.Name)
-    assert assignments["dq_tmem"].id == "u_tmem"
 
     u_stage = event_lines(events, "copy", ["u_tmem", "dk_fragment"])
     assert len(u_stage) == 1
