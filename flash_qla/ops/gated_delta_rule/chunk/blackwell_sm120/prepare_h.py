@@ -184,7 +184,8 @@ def tilelang_prepare_h(
                 if use_initial_state:
                     # assert DK==DV
                     T.copy(h0[bb, bh, 0:DV, 0:DK], h_fragment)
-
+                else:
+                    T.clear(h_fragment)
                 # Main Loop
                 for i_s in T.serial(num_iters):
                     # [STAGE = i_s % num_stages]
@@ -605,9 +606,9 @@ def fused_gdr_h(
             is_cp = True
 
     # Always use T.copy path to avoid T.clear bug for large fragments
-    use_initial_state = True
+    use_initial_state = initial_state is not None
     if initial_state is None:
-        initial_state = torch.zeros(
+        initial_state = torch.empty(
             (real_batch_size, H, V, K)
             if state_v_first
             else (real_batch_size, H, K, V),
