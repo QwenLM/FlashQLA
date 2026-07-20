@@ -376,6 +376,10 @@ def test_bwd(
     _assert_relative(dv_qla, dv_ref, "dv_qla")
     _assert_relative(db_qla, db_ref, "db_qla")
     _assert_relative(dg_qla, dg_ref, "dg_qla")
+    if cu_seqlens is not None:
+        num_valid_tokens = int(cu_seqlens[-1].item())
+        for grad in (dq_qla, dk_qla, dv_qla, db_qla, dg_qla):
+            assert torch.count_nonzero(grad[:, num_valid_tokens:]).item() == 0
     if dht_ref is not None:
         dh0_qla_cmp = (
             dh0_qla.transpose(-1, -2)
@@ -577,18 +581,19 @@ def test_fwd_auto_cp(
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
-    "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list",
+    "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list, use_h0",
     [
-        pytest.param(1, 16384, 4, 4, False, None, id="long-fixed"),
+        pytest.param(1, 16384, 4, 4, False, None, True, id="long-fixed"),
         pytest.param(1, 16384, 4, 4, True,
-                     [0, 4096, 8192, 12288, 16384],
+                     [0, 4096, 8192, 12288, 16384], True,
                      id="long-varlen"),
+        pytest.param(1, 16384, 4, 4, False, None, False, id="long-no-h0"),
     ],
 )
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 def test_bwd_auto_cp(
     batch_size, num_tokens, num_k_heads, num_v_heads,
-    varlen, cu_seqlens_list, state_v_first,
+    varlen, cu_seqlens_list, state_v_first, use_h0,
 ):
     """Backward: auto_cp=True and auto_cp=False should match reference."""
     (
@@ -597,7 +602,7 @@ def test_bwd_auto_cp(
         cu_seqlens, scale,
     ) = _make_inputs(
         batch_size, num_tokens, num_k_heads, num_v_heads,
-        varlen, cu_seqlens_list, use_h0=True, state_v_first=state_v_first,
+        varlen, cu_seqlens_list, use_h0=use_h0, state_v_first=state_v_first,
     )
 
     # Run fwd for both cp modes
@@ -659,6 +664,16 @@ def test_bwd_auto_cp(
         if dht_ref is not None:
             dh0_cmp = dh0.transpose(-1, -2) if state_v_first else dh0
             _assert_relative(dh0_cmp, dh0_ref, f"dh0_{prefix}")
+        else:
+            assert dh0 is None
+
+        if h0_ref is None:
+            starts = (
+                cu_seqlens[:-1]
+                if cu_seqlens is not None
+                else torch.tensor([0], device=dg.device)
+            )
+            assert torch.count_nonzero(dg[0, starts]).item() == 0
 
 
 # ---------------------------------------------------------------------------

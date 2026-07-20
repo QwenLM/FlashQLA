@@ -26,6 +26,8 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.8",
+        "flash-linear-attention @ "
+        "git+https://github.com/fla-org/flash-linear-attention.git@ebf3a0cff2be3e6f2b2f99820b8fe4e28855ced0",
         "tilelang==0.1.9",
         "apache-tvm-ffi==0.1.9",
     ],
