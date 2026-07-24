@@ -12,7 +12,7 @@ if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
     from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     from .hopper.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 64
-elif tilelang.contrib.nvcc.get_target_compute_version() == "10.0":
+elif tilelang.contrib.nvcc.get_target_compute_version() in ["10.0", "10.3"]:
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
@@ -24,7 +24,7 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
     fused_gdr_dh = None
     CHUNK_SIZE = 32
 else:
-    raise ValueError("FlashQLA now support sm90 and sm100 only.")
+    raise ValueError(f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 from .cp_context import intra_card_cp_preprocess, intra_card_cp_preprocess_bwd, _calc_cp_seqs, _create_cu_seqlens
 
 from flash_qla.utils import input_guard
