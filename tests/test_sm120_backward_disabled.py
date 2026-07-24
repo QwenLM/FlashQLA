@@ -220,7 +220,7 @@ def test_cp_preprocess_bwd_raises_not_implemented():
 def test_bwd_works_on_non_sm120(state_v_first):
     """Sanity check: backward must *not* raise on supported architectures."""
     if tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
-        pytest.skip("Backward is disabled on SM120 — this test only runs on SM90/SM100")
+        pytest.skip("Backward is disabled on SM120 — this test only runs on SM90/SM100/SM103")
     q, k, v, g, beta, do, h0, dht, scale = _make_inputs(
         use_h0=True, state_v_first=state_v_first,
     )

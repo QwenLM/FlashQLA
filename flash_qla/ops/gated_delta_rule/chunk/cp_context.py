@@ -17,12 +17,16 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "10.0":
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     ARCH = "SM100"
+elif tilelang.contrib.nvcc.get_target_compute_version() == "10.3":
+    from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
+    from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
+    ARCH = "SM103"
 elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
     from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
     fused_gdr_dh = None
     ARCH = "SM120"
 else:
-    raise ValueError("FlashQLA now support sm90 and sm100 only.")
+    raise ValueError(f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 
 
 MULTI_PROCESSOR_COUNT = torch.cuda.get_device_properties().multi_processor_count
@@ -103,7 +107,7 @@ def _calc_cp_seqs(
 
     if ARCH == "SM90" or ARCH == "SM120":
         use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
-    elif ARCH == "SM100":
+    elif ARCH in ["SM100", "SM103"]:
         # SM100 uses separate thresholds for fwd and bwd:
         # - bwd kernel does more work per chunk (higher arithmetic intensity), so GPU
         #   under-utilization appears at fewer chunks (>=64 vs >=256 for fwd). It also
@@ -119,7 +123,7 @@ def _calc_cp_seqs(
                 Be * H <= 32 and max(num_chunks) >= 192
             )
     else:
-        raise ValueError("FlashQLA now support sm90 and sm100 only.")
+        raise ValueError(f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 
     if use_cp:
         cp_cu_seqlens = torch.tensor(
