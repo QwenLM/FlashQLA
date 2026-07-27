@@ -624,9 +624,10 @@ def tilelang_fused_chunk_gdr_fwd(
                             if seq_split_idx + j_s < seq_end_idx:
                                 o[batch_idx, seq_split_idx + j_s, bh, DV_start + j_v] = \
                                     o_shared[j_s, j_v]
-                            elif bb == batch_size - 1 and seq_split_idx + j_s < num_tokens:
-                                # For sglang padding
-                                o[batch_idx, seq_split_idx + j_s, bh, DV_start + j_v] = 0
+                        if bb == batch_size - 1:
+                            for j_s, j_v in T.Parallel(block_S, block_DV):
+                                if seq_end_idx + j_s < num_tokens:
+                                    o[batch_idx, seq_end_idx + j_s, bh, DV_start + j_v] = 0
 
     return tilelang_fused_chunk_gdr_fwd_kernel
 

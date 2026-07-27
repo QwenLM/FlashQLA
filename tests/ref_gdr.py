@@ -95,6 +95,7 @@ def torch_kkt_fwd(
     k = pad_and_reshape(k, dim=1, chunk_size=chunk_size)  # [B, N, C, H, K]
     g = pad_and_reshape(g, dim=1, chunk_size=chunk_size)  # [B, N, C, H]
     beta = pad_and_reshape(beta, dim=1, chunk_size=chunk_size)  # [B, N, C, H]
+    g = fill_last_chunk_of_g(g, num_tokens, cu_seqlens, chunk_size=chunk_size)
 
     mask = torch.triu(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=k.device)
@@ -275,6 +276,7 @@ def torch_chunk_o_fwd(
     k = pad_and_reshape(k, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv, K]
     v = pad_and_reshape(v, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv, K]
     g = pad_and_reshape(g, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv]
+    g = fill_last_chunk_of_g(g, num_tokens, cu_seqlens, chunk_size=chunk_size)
 
     q = q * scale
 
@@ -325,6 +327,7 @@ def torch_chunk_dv_bwd(
     k = pad_and_reshape(k, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv, K]
     g = pad_and_reshape(g, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv]
     do = pad_and_reshape(do, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv, V]
+    g = fill_last_chunk_of_g(g, num_tokens, cu_seqlens, chunk_size=chunk_size)
 
     q = q * scale
 
@@ -549,6 +552,7 @@ def torch_chunk_wy_bwd(
     du = pad_and_reshape(du, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv, V]
     dk1 = pad_and_reshape(dk1, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv, K]
     dg1 = pad_and_reshape(dg1, dim=1, chunk_size=chunk_size)  # [B, N, C, Hv]
+    g = fill_last_chunk_of_g(g, num_tokens, cu_seqlens, chunk_size=chunk_size)
 
     dA = torch.einsum("bnchk, bndhk -> bnchd", dw, k * (beta * g.exp()).unsqueeze(-1))
     dk_beta_g = torch.einsum("bnchd, bnchk -> bndhk", A, dw)

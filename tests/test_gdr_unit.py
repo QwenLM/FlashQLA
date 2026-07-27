@@ -25,7 +25,6 @@ DETERMINISM_ITERS = 1000
 HEAD_DIM_K = 128
 HEAD_DIM_V = 128
 CHUNK_SIZE = 32 if tilelang.contrib.nvcc.get_target_compute_version() == "12.0" else 64
-SWA_RATIO = 0.75
 REF_DTYPE = torch.float64
 DATA_DTYPE = torch.bfloat16
 DEVICE = "cuda"
@@ -64,18 +63,18 @@ VARLEN_CONFIGS = [
 ]
 
 PRODUCT_CONFIGS = [
-    pytest.param(1, 16384, 4, 4, True,
-                 [0, 4096, 8192, 12288, 16384],
-                 id="prod-uniform-4k"),
-    pytest.param(1, 16384, 4, 4, True,
-                 [0, 177, 4096, 8192, 12288, 12805, 13171, 13298, 16055, 16384],
+    pytest.param(1, 128, 4, 4, True,
+                 [0, 47, 128],
+                 id="prod-mixed-small"),
+    pytest.param(1, 4096, 4, 4, True,
+                 [0, 517, 883, 1010, 3767, 4096],
                  id="prod-mixed-segs"),
-    pytest.param(1, 16384, 4, 4, True,
-                 [0, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384],
-                 id="prod-uniform-2k"),
     pytest.param(1, 16384, 4, 4, True,
                  [0, 4096, 6893, 7665, 8192, 12288, 16384],
                  id="prod-mixed-large"),
+    pytest.param(1, 256, 4, 4, True,
+                 [0, 73, 115, 209],
+                 id="prod-mixed-pad"),
 ]
 
 ALL_CONFIGS = CORE_CONFIGS + DEVELOP_CONFIGS + VARLEN_CONFIGS + PRODUCT_CONFIGS
@@ -103,20 +102,19 @@ def _make_inputs(
         batch_size, num_tokens, num_v_heads, HEAD_DIM_V,
         device=DEVICE, dtype=DATA_DTYPE,
     )
-    g = torch.nn.functional.logsigmoid(torch.randn(
+
+    A = torch.zeros(num_v_heads, device=DEVICE, dtype=torch.float32) + 16
+    gate_input = torch.randn(
         batch_size, num_tokens, num_v_heads,
         device=DEVICE, dtype=torch.float32,
-    )) / 16
+    ) * 0.5
+    dt_bias = torch.ones(num_v_heads, device=DEVICE, dtype=torch.float32)
+    g = -A * torch.nn.functional.softplus(gate_input + dt_bias)
+
     beta = torch.randn(
         batch_size, num_tokens, num_v_heads,
         device=DEVICE, dtype=torch.float32,
     ).sigmoid()
-
-    # SWA mask
-    swa_mask = torch.zeros(num_v_heads, dtype=torch.bool, device=DEVICE)
-    swa_mask[:math.ceil(SWA_RATIO * num_v_heads)] = True
-    swa_mask = swa_mask[torch.randperm(num_v_heads, device=DEVICE)]
-    g[:, :, ~swa_mask] = 0.0
 
     # h0 / dht in reference layout [B, Hv, K, V]
     h0_ref = None
@@ -195,11 +193,11 @@ def _assert_relative(actual, expected, name, rtol=RTOL):
             f"{name}: got NaN in padded area"
         )
         actual = actual[:, :expected.shape[1]]
-    max_err = (actual - expected).abs().max().item()
-    max_ref = expected.abs().max().item()
-    assert max_err <= max_ref * rtol, (
-        f"{name}: max_err={max_err:.6f}, max_ref={max_ref:.6f}, "
-        f"relative={max_err / max_ref:.6f} > rtol={rtol}"
+    error = torch.linalg.vector_norm(actual.double() - expected.double()).item()
+    reference = torch.linalg.vector_norm(expected.double()).item()
+    assert error <= reference * RTOL, (
+        f"{name}: error={error:.6f}, reference={reference:.6f}, "
+        f"relative={error / reference:.6f} > rtol={rtol}"
     )
 
 

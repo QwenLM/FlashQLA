@@ -117,7 +117,7 @@ def _calc_cp_seqs(
         #   (>=256 chunks) to justify CP overhead; very low head count (Be*H<=32) allows
         #   slightly shorter sequences (>=192 chunks).
         if is_bwd:
-            use_cp = Be * H <= 56 and max(num_chunks) >= 64
+            use_cp = Be * H <= 56 and max(num_chunks) >= 16
         else:
             use_cp = (Be * H <= 56 and max(num_chunks) >= 256) or (
                 Be * H <= 32 and max(num_chunks) >= 192

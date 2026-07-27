@@ -103,21 +103,20 @@ FWD_SEQLEN_CONFIGS = [
     SeqLenConfig("1024x8", [1024] * 8),
 ]
 BWD_MODEL_CONFIGS = [
-    ModelConfig("hk16_hv16", h_qk=16, h_v=16),
-    ModelConfig("hk4_hv16", h_qk=4, h_v=16),
-    ModelConfig("hk12_hv12", h_qk=12, h_v=12),
-    ModelConfig("hk4_hv12", h_qk=4, h_v=12),
-    ModelConfig("hk8_hv8",  h_qk=8, h_v=8),
+    ModelConfig("hk16_hv32", h_qk=16, h_v=32),
+    ModelConfig("hk8_hv16", h_qk=8, h_v=16),
     ModelConfig("hk4_hv8",  h_qk=4, h_v=8),
-    ModelConfig("hk4_hv4",  h_qk=4, h_v=4),
+    ModelConfig("hk2_hv4",  h_qk=2, h_v=4),
 ]
 
 BWD_SEQLEN_CONFIGS = [
+    SeqLenConfig("8k_1seq", generate_rand_seqlens(1, 8192, seed=42)),
+    SeqLenConfig("8k_2seq", generate_rand_seqlens(2, 8192, seed=42)),
+    SeqLenConfig("8k_4seq", generate_rand_seqlens(4, 8192, seed=42)),
+    SeqLenConfig("8k_8seq", generate_rand_seqlens(8, 8192, seed=42)),
     SeqLenConfig("32k_1seq", generate_rand_seqlens(1, 32768, seed=42)),
     SeqLenConfig("32k_2seq", generate_rand_seqlens(2, 32768, seed=42)),
     SeqLenConfig("32k_4seq", generate_rand_seqlens(4, 32768, seed=42)),
-    SeqLenConfig("32k_5seq", generate_rand_seqlens(5, 32768, seed=42)),
-    SeqLenConfig("32k_6seq", generate_rand_seqlens(6, 32768, seed=42)),
     SeqLenConfig("32k_8seq", generate_rand_seqlens(8, 32768, seed=42)),
 ]
 
@@ -443,7 +442,7 @@ def bench_bwd(
 
     if HAS_FLA:
         def call_fla_bwd():
-            return fla_bwd(q, k, v, g_cumsum, beta, A, scale, h0, do, dht, cu_seqlens)
+            return fla_bwd(q, k, v, g_cumsum, beta, A, scale, h0, do, dht, cu_seqlens=cu_seqlens)
 
         try:
             mean = tilelang.profiler.do_bench(call_fla_bwd, warmup=warmup, rep=repeats, backend=backend)
