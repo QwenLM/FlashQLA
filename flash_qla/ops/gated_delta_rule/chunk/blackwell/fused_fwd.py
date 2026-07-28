@@ -899,12 +899,6 @@ def fused_gdr_fwd(
         final_state,
     )
 
-    # if o.isnan().any().item():
-    #     last = cu_seqlens[-1].item()
-    #     print(f'last = {last} / N = {o.shape[1]}')
-    #     print(f'o-: {o[0, :last].isnan().any().item()}')
-    #     print(f'o+: {o[0, last:].isnan().any().item()}')
-    #     # import ipdb; ipdb.set_trace()
     if not output_final_state:
         final_state = None
     if not output_h:

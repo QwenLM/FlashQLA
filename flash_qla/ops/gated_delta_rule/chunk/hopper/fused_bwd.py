@@ -742,10 +742,6 @@ def tilelang_fused_chunk_gdr_bwd(
                     T.copy(tmp_shared_1_1, p_fragment)
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         p_fragment[j_s, j_t] *= dp_fragment[j_s, j_t]
-                    # T.copy(p_fragment, tmp_shared_1_1)
-                    # for j_s, j_t in T.Parallel(block_S, block_S):
-                    #     p_fragment[j_s, j_t] -= tmp_shared_1_1[j_t, j_s]
-                    # T.reduce_sum(p_fragment, dg_fragment_2, dim=1, clear=True)
                     # dP = s * G * dPg
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         dp_fragment[j_s, j_t] *= mask_fragment[j_s, j_t]
@@ -812,9 +808,6 @@ def tilelang_fused_chunk_gdr_bwd(
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         a_fragment[j_s, j_t] *= b_shared[j_t]
                     # dg += sum((dAb * Ab) - (dAb * Ab)^T)
-                    # T.copy(a_fragment, tmp_shared_1_2)
-                    # for j_s, j_t in T.Parallel(block_S, block_S):
-                    #     a_fragment[j_s, j_t] -= tmp_shared_1_2[j_t, j_s]
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         a_fragment[j_s, j_t] += p_fragment[j_s, j_t]
                     for j_s, j_t in T.Parallel(block_S, block_S):
