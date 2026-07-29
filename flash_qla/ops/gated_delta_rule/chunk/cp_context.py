@@ -21,12 +21,12 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "10.3":
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     ARCH = "SM103"
-elif tilelang.contrib.nvcc.get_target_compute_version() == "12.0":
+elif tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"]:
     from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
     fused_gdr_dh = None
     ARCH = "SM120"
 else:
-    raise ValueError(f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
+    raise ValueError(f"FlashQLA now support sm90, sm100, sm103, sm120 and sm121 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 
 
 MULTI_PROCESSOR_COUNT = torch.cuda.get_device_properties().multi_processor_count
@@ -123,7 +123,7 @@ def _calc_cp_seqs(
                 Be * H <= 32 and max(num_chunks) >= 192
             )
     else:
-        raise ValueError(f"FlashQLA now support sm90, sm100 and sm103 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
+        raise ValueError(f"FlashQLA now support sm90, sm100, sm103, sm120 and sm121 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 
     if use_cp:
         cp_cu_seqlens = torch.tensor(

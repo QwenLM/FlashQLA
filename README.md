@@ -25,7 +25,7 @@ Key features:
 
 Requirements:
 
-- SM90, SM100, SM103 or SM120
+- SM90, SM100, SM103, SM120 or SM121
 - CUDA 12.8 or above
 - PyTorch 2.8 or above
 

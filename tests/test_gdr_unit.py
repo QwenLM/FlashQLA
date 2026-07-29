@@ -24,7 +24,7 @@ RTOL = 0.02
 DETERMINISM_ITERS = 1000
 HEAD_DIM_K = 128
 HEAD_DIM_V = 128
-CHUNK_SIZE = 32 if tilelang.contrib.nvcc.get_target_compute_version() == "12.0" else 64
+CHUNK_SIZE = 32 if tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"] else 64
 REF_DTYPE = torch.float64
 DATA_DTYPE = torch.bfloat16
 DEVICE = "cuda"
@@ -781,6 +781,8 @@ def test_bwd_cp_cache(
 @pytest.mark.parametrize("bwd_cp", [False, True], ids=["bwd_no_cp", "bwd_cp"])
 def test_mixed_cp_control(state_v_first, fwd_cp, bwd_cp):
     """Mixing auto_cp=True/False between fwd and bwd should still match reference."""
+    if tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"]:
+        pytest.skip("Backward is disabled on SM120/SM121")
     B, T, Hk, Hv = 1, 32768, 4, 4
     (
         q, k, v, g, beta, do,
