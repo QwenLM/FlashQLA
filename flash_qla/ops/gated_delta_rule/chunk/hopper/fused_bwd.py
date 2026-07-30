@@ -1073,15 +1073,12 @@ def tilelang_fused_chunk_gdr_bwd(
 
                 else:
                     if bb == batch_size - 1:
-                        for j_s, j_v in T.Parallel(block_S, DV):
+                        for j_s in T.Parallel(block_S):
                             if seq_end_idx + j_s < num_tokens:
-                                dv[batch_idx, seq_end_idx + j_s, bh, j_v] = 0
-                        for j_s, j_k in T.Parallel(block_S, DK):
+                                dg[batch_idx, seq_end_idx + j_s, bh] = 0
+                        for j_s in T.Parallel(block_S):
                             if seq_end_idx + j_s < num_tokens:
-                                dq[batch_idx, seq_end_idx + j_s, bh, j_k] = 0
-                        for j_s, j_k in T.Parallel(block_S, DK):
-                            if seq_end_idx + j_s < num_tokens:
-                                dk[batch_idx, seq_end_idx + j_s, bh, j_k] = 0
+                                db[batch_idx, seq_end_idx + j_s, bh] = 0
 
                     for i_s in T.serial(num_iters):
                         left = seq_start_idx + (num_iters - i_s - 1) * block_S
