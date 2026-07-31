@@ -462,13 +462,12 @@ def tilelang_fused_chunk_gdr_bwd(
                         for j_k, j_v in T.Parallel(DK, DV // 2):
                             tmp_shared_4_1[j_k, j_v + DV // 2] = dh_fragment_R[j_k, j_v]
 
-                if use_dht:
-                    if state_v_first:
-                        T.copy(dh_fragment_L, dh0[bb, bh, 0:DV, :DK // 2])
-                        T.copy(dh_fragment_R, dh0[bb, bh, 0:DV, DK // 2:])
-                    else:
-                        T.copy(dh_fragment_L, dh0[bb, bh, 0:DK, :DV // 2])
-                        T.copy(dh_fragment_R, dh0[bb, bh, 0:DK, DV // 2:])
+                if state_v_first:
+                    T.copy(dh_fragment_L, dh0[bb, bh, 0:DV, :DK // 2])
+                    T.copy(dh_fragment_R, dh0[bb, bh, 0:DV, DK // 2:])
+                else:
+                    T.copy(dh_fragment_L, dh0[bb, bh, 0:DK, :DV // 2])
+                    T.copy(dh_fragment_R, dh0[bb, bh, 0:DK, DV // 2:])
 
             elif tx < 256:
                 T.set_max_nreg(CONSUMER_K_NREG, 1)
