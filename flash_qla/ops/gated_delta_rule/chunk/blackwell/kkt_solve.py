@@ -89,6 +89,7 @@ def tilelang_kkt_solve(
                     k_shared[j_s, j_k] = k[bb, left + j_s, bhg, j_k]
                 else:
                     k_shared[j_s, j_k] = 0
+            T.fence_proxy_async()
 
         # Load b
         if right <= seq_end_idx:

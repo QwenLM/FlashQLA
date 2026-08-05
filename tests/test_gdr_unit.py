@@ -103,7 +103,9 @@ def _make_inputs(
         device=DEVICE, dtype=DATA_DTYPE,
     )
 
-    A = torch.zeros(num_v_heads, device=DEVICE, dtype=torch.float32) + 16
+    A = torch.rand(num_v_heads, device=DEVICE, dtype=torch.float32) * 16
+    A[0] = 0
+    A[-1] = 16
     gate_input = torch.randn(
         batch_size, num_tokens, num_v_heads,
         device=DEVICE, dtype=torch.float32,

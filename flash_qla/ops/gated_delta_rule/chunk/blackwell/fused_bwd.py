@@ -331,6 +331,7 @@ def tilelang_fused_chunk_gdr_bwd(
                     b_shared[j_s] = b[batch_idx, seq_start_idx + (num_iters - 1) * block_S + j_s, bh]
                 else:
                     b_shared[j_s] = 0
+            T.fence_proxy_async()
 
             if tx < 128:
                 T.set_max_nreg(CONSUMER_S_NREG, 1)
@@ -355,6 +356,7 @@ def tilelang_fused_chunk_gdr_bwd(
                         tmp_shared_4_1[j_k, j_v] = dh_fragment_L[j_k, j_v]
                     for j_k, j_v in T.Parallel(DK, DV // 2):
                         tmp_shared_4_1[j_k, j_v + DV // 2] = dh_fragment_R[j_k, j_v]
+                T.fence_proxy_async()
 
                 for i_s in T.serial(num_iters):
                     T.barrier_arrive(bar_00)
@@ -438,6 +440,7 @@ def tilelang_fused_chunk_gdr_bwd(
                         tmp_shared_2_3[j_s, j_v] = (
                             scale * do_shared[j_s, j_v] * g_exp_shared[j_s]
                         )
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_14)
 
                     # 14
@@ -461,6 +464,7 @@ def tilelang_fused_chunk_gdr_bwd(
                             tmp_shared_4_1[j_k, j_v] = dh_fragment_L[j_k, j_v]
                         for j_k, j_v in T.Parallel(DK, DV // 2):
                             tmp_shared_4_1[j_k, j_v + DV // 2] = dh_fragment_R[j_k, j_v]
+                    T.fence_proxy_async()
 
                 if state_v_first:
                     T.copy(dh_fragment_L, dh0[bb, bh, 0:DV, :DK // 2])
@@ -502,6 +506,7 @@ def tilelang_fused_chunk_gdr_bwd(
                     T.barrier_wait(bar_03, (i_s + 0) % 2)
                     # S2[1] dV'
                     T.copy(dv_fragment, tmp_shared_2_1)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_04)
 
                     # 04
@@ -531,6 +536,7 @@ def tilelang_fused_chunk_gdr_bwd(
                     # S2[2] K
                     T.copy(k_shared, dv_fragment)
                     T.copy(dv_fragment, tmp_shared_2_2)
+                    T.fence_proxy_async()
                     T.copy(dv_fragment, dv_tmem)
                     T.barrier_arrive(bar_07)
 
@@ -539,6 +545,7 @@ def tilelang_fused_chunk_gdr_bwd(
                     # S2[3] dVg
                     T.copy(u_tmem, dv_fragment)
                     T.copy(dv_fragment, tmp_shared_2_3)
+                    T.fence_proxy_async()
                     T.barrier_wait(tcbar_07, (i_s + 0) % 2)
                     T.barrier_arrive(bar_08)
 
@@ -617,6 +624,7 @@ def tilelang_fused_chunk_gdr_bwd(
                             p_fragment[j_s, j_t * 2 + j_t_vec] *= scale
                     # S1[1] Pg
                     T.copy(p_fragment, tmp_shared_1_1)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_02)
 
                     # 02
@@ -638,6 +646,7 @@ def tilelang_fused_chunk_gdr_bwd(
                     T.barrier_wait(bar_03, (i_s + 0) % 2)
                     # S1[2] Ag
                     T.copy(a_fragment, tmp_shared_1_2)
+                    T.fence_proxy_async()
                     T.barrier_wait(tcbar_03, (i_s + 0) % 2)
                     T.barrier_arrive(bar_04)
 
@@ -652,6 +661,7 @@ def tilelang_fused_chunk_gdr_bwd(
                         u_fragment[j_s, j_v] += v_shared[j_s, j_v]
                     # S2[2] W
                     T.copy(u_fragment, tmp_shared_2_2)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_05)
 
                     # 05
@@ -661,6 +671,7 @@ def tilelang_fused_chunk_gdr_bwd(
                     # S2[1] V'
                     T.copy(u_tmem, u_fragment)
                     T.copy(u_fragment, tmp_shared_2_1)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_06)
 
                     # 06
@@ -700,6 +711,7 @@ def tilelang_fused_chunk_gdr_bwd(
                         dp_fragment[j_s, j_t] *= scale
                     # S1[1] dP
                     T.copy(dp_fragment, tmp_shared_1_1)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_08)
 
                     # 08
@@ -710,6 +722,7 @@ def tilelang_fused_chunk_gdr_bwd(
                     T.copy(a_fragment, tmp_shared_2_1[:, : DK // 2])
                     T.copy(q_shared[:, DK // 2 :], p_fragment)
                     T.copy(p_fragment, tmp_shared_2_1[:, DK // 2 :])
+                    T.fence_proxy_async()
                     T.barrier_wait(tcbar_08, (i_s + 0) % 2)
                     T.barrier_arrive(bar_09)
 
@@ -807,6 +820,7 @@ def tilelang_fused_chunk_gdr_bwd(
                         da_fragment[j_s, j_t] *= b_shared[j_t]
                     # S1[2] dAr
                     T.copy(da_fragment, tmp_shared_1_2)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_13)
 
                     # 13
@@ -814,6 +828,7 @@ def tilelang_fused_chunk_gdr_bwd(
                     T.barrier_wait(tcbar_13a, (i_s + 0) % 2)
                     T.copy(da_tmem, da_fragment)
                     T.copy(da_fragment, tmp_shared_1_2)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_13a)
                     T.barrier_wait(tcbar_13b, (i_s + 0) % 2)
                     T.copy(da_tmem, da_fragment)
@@ -842,6 +857,7 @@ def tilelang_fused_chunk_gdr_bwd(
                         da_fragment[j_s, j_t] += tmp_shared_1_2[j_t, j_s]
                     # S1[1] dAs
                     T.copy(da_fragment, tmp_shared_1_2)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_15)
                     T.barrier_wait(bar_15, (i_s + 0) % 2)
 
