@@ -19,7 +19,7 @@ if GPU_AVAILABLE:
             ARCH = "SM100"
         elif _cv == "10.3":
             ARCH = "SM103"
-        elif _cv == "12.0":
+        elif _cv in ["12.0", "12.1"]:
             ARCH = "SM120"
     except Exception:
         pass
