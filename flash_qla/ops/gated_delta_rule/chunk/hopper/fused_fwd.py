@@ -220,6 +220,7 @@ def tilelang_fused_chunk_gdr_fwd(
                     T.barrier_wait(bar_0, i_s % 2)
                     # S4[S] S
                     T.copy(h_fragment, h_shared)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_1)
 
                     # [STAGE 0] 2, 3, 4
@@ -325,6 +326,7 @@ def tilelang_fused_chunk_gdr_fwd(
                     # S2[V] W
                     for j_s, j_v in T.Parallel(block_S, block_DV):
                         v_shared[i_s % 2, j_s, j_v] = u_fragment[j_s, j_v]
+                    T.fence_proxy_async()
 
                     # [STAGE 0] 3
                     T.barrier_wait(bar_3, i_s % 2)
@@ -337,6 +339,7 @@ def tilelang_fused_chunk_gdr_fwd(
                     )
                     # S2[2] Vd
                     T.copy(v_fragment, vd_shared)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_4)
 
                     # [STAGE 0] 4
@@ -345,6 +348,7 @@ def tilelang_fused_chunk_gdr_fwd(
                         v_fragment[j_s, j_v] *= g_rev_exp_shared[j_s]
                     # S2[1] V'
                     T.copy(v_fragment, vn_shared)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_5)
 
                     T.barrier_wait(bar_5, i_s % 2)
@@ -419,6 +423,7 @@ def tilelang_fused_chunk_gdr_fwd(
                         p_fragment[j_s, j_t] *= scale * g_fragment[j_s, j_t]
                     # S1[1] Pg
                     T.copy(p_fragment, p_shared)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_3)
                     # O = s * g * O
                     for j_s, j_v in T.Parallel(block_S, block_DV):
@@ -474,6 +479,7 @@ def tilelang_fused_chunk_gdr_fwd(
                                     k_shared[i_s % 2, j_s, j_k] = k[batch_idx, left + j_s, bhg, j_k]
                                 else:
                                     k_shared[i_s % 2, j_s, j_k] = 0
+                            T.fence_proxy_async()
 
                         T.barrier_arrive(data_is_ready[i_s % 2])
 

@@ -8,42 +8,69 @@ import torch
 import tilelang
 
 
-def tensor_cache(
-    fn: Callable[..., torch.Tensor],
-) -> Callable[..., torch.Tensor]:
+def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
-    A decorator that caches the most recent result of a function with tensor inputs.
-
+    A decorator that caches the most recent results of a function with tensor inputs.
     This decorator will store the output of the decorated function for the most recent set of input tensors.
-    If the function is called again with the same input tensors, it will return the cached result.
-
+    The dynamic cache is limited to a fixed size (default is 4). CUDA graph
+    capture entries are marked static and are not evicted.
     Args:
         fn (Callable[..., torch.Tensor]):
             The function to be decorated. It should take tensor inputs and return tensor outputs.
-
     Returns:
         Callable[..., torch.Tensor]:
             A wrapped version of the input function with single-entry caching.
     """
-    cache = []
-    cache_size = 4
 
-    def _equal(a: Any, b: Any) -> bool:
-        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-            return a is b
-        return a == b
+    cache_entries = []
+    cache_size = 4
+    dynamic_cache_size = 0
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        nonlocal cache, cache_size
-        for (cached_args, cached_kwargs, cached_result) in cache:
-            if all(_equal(a, b) for a, b in zip(args, cached_args, strict=False)) and \
-                    all(k in cached_kwargs and _equal(v, cached_kwargs[k]) for k, v in kwargs.items()):
-                return cached_result
+        nonlocal cache_entries, dynamic_cache_size
+        assert torch.cuda.is_available()
+        is_capturing = torch.cuda.is_current_stream_capturing()
+
+        for i, entry in enumerate(cache_entries):
+            last_args, last_kwargs, last_result, is_static = entry
+            if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
+                if all(a is b for a, b in zip(args, last_args)) and all(
+                    k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
+                ):
+                    if is_capturing and not is_static:
+                        cache_entries[i] = (
+                            last_args,
+                            last_kwargs,
+                            last_result,
+                            True,
+                        )
+                        dynamic_cache_size -= 1
+                    elif not is_static:
+                        cache_entries = (
+                            cache_entries[:i]
+                            + cache_entries[i + 1 :]
+                            + [entry]
+                        )
+                    return last_result
+
+        assert not is_capturing, (
+            f"FLA tensor_cache miss during CUDA graph capture: {fn.__name__}"
+        )
         result = fn(*args, **kwargs)
-        cache.insert(0, (args, kwargs, result))
-        if len(cache) > cache_size:
-            cache = cache[:cache_size]
+
+        if dynamic_cache_size >= cache_size:
+            while cache_entries:
+                entry = cache_entries[0]
+                cache_entries = cache_entries[1:]
+                if entry[3]:
+                    cache_entries.append(entry)
+                else:
+                    dynamic_cache_size -= 1
+                    break
+
+        cache_entries.append((args, kwargs, result, False))
+        dynamic_cache_size += 1
         return result
 
     return wrapper

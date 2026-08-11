@@ -347,6 +347,7 @@ def tilelang_correct_h0(
             T.copy(mt_buffer[idx, bh, 0:DK, 0:DK], m_shared)
             if fallback_mask[idx, bh]:
                 T.copy(h_fragment, hd_shared)
+                T.fence_proxy_async()
             T.copy(h_shared, h_fragment)
             if fallback_mask[idx, bh]:
                 if state_v_first:

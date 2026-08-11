@@ -200,6 +200,7 @@ def tilelang_prepare_h(
                     T.barrier_wait(bar_0, i_s % 2)
                     # S4[1] S
                     T.copy(h_fragment, h_shared)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_1)
 
                     # [STAGE = i_s % num_stages] 1
@@ -282,6 +283,7 @@ def tilelang_prepare_h(
                         x_fragment[j_s, j_k] *= -b_shared[i_s % num_stages, j_s]
                     # S2[1] X
                     T.copy(x_fragment, x_shared)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_2)
 
                     if calc_mt:
@@ -289,6 +291,7 @@ def tilelang_prepare_h(
                         g_prod_X[0] += g_shared[i_s % num_stages, block_S - 1]
                         # S4[2] M
                         T.copy(m_fragment_R, m_shared_R)
+                        T.fence_proxy_async()
 
                         # [STAGE = i_s % num_stages] 3
                         T.barrier_wait(bar_3, i_s % 2)
@@ -301,6 +304,7 @@ def tilelang_prepare_h(
                         )
                         # S4[2] Z
                         T.copy(z_fragment_R, z_shared_R)
+                        T.fence_proxy_async()
                         # M += X^T @ Z
                         T.gemm(
                             x_shared,
@@ -379,6 +383,7 @@ def tilelang_prepare_h(
                         )
                     # S2[2] Y
                     T.copy(y_fragment, y_shared)
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_2)
 
                     if calc_mt:
@@ -386,6 +391,7 @@ def tilelang_prepare_h(
                         g_prod_Y[0] += g_shared[i_s % num_stages, block_S - 1]
                         # S4[2] M
                         T.copy(m_fragment_L, m_shared_L)
+                        T.fence_proxy_async()
 
                         # [STAGE = i_s % num_stages] 3
                         T.barrier_wait(bar_3, i_s % 2)
@@ -398,6 +404,7 @@ def tilelang_prepare_h(
                         )
                         # S4[2] Z
                         T.copy(z_fragment_L, z_shared_L)
+                        T.fence_proxy_async()
                         # M += X^T @ Z
                         T.gemm(
                             x_shared,
@@ -442,6 +449,7 @@ def tilelang_prepare_h(
                                     k_shared[i_s % num_stages, j_s, j_k] = k[batch_idx, left + j_s, bhg, j_k]
                                 else:
                                     k_shared[i_s % num_stages, j_s, j_k] = 0
+                            T.fence_proxy_async()
 
                         T.barrier_arrive(data_is_ready[i_s % num_stages])
 
@@ -479,6 +487,7 @@ def tilelang_prepare_h(
                                     a_shared[i_s % num_stages, j_s, j_t] = a[batch_idx, left + j_s, bh, j_t]
                                 else:
                                     a_shared[i_s % num_stages, j_s, j_t] = 0
+                            T.fence_proxy_async()
 
                         T.barrier_arrive(data_is_ready[i_s % num_stages])
 
