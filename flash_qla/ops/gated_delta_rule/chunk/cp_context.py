@@ -2,6 +2,7 @@
 # Licensed under The MIT License [see LICENSE for details]
 
 import math
+import os
 
 import torch
 import tilelang
@@ -59,7 +60,25 @@ def _calc_cp_seqs(
     num_chunks = [tilelang.cdiv(x, chunk_size) for x in seqlens]
 
     # autocp
-    H = num_v_heads
+    planning_heads = os.environ.get("FLASH_QLA_AUTO_CP_PLANNING_HEADS")
+    if planning_heads is None:
+        H = num_v_heads
+    else:
+        try:
+            H = int(planning_heads)
+        except ValueError as exc:
+            raise ValueError(
+                "FLASH_QLA_AUTO_CP_PLANNING_HEADS must be an integer"
+            ) from exc
+        if H <= 0:
+            raise ValueError(
+                "FLASH_QLA_AUTO_CP_PLANNING_HEADS must be positive"
+            )
+        if H < num_v_heads or H % num_v_heads != 0:
+            raise ValueError(
+                "FLASH_QLA_AUTO_CP_PLANNING_HEADS must be a multiple of "
+                f"local num_v_heads ({num_v_heads})"
+            )
     # Latency model: T = a·L_cp + b·(B·H·Lc/P) / L_cp + c
     # Minimizing T yields the theoretical optimum: L_cp* ∝ √(B·H·Lc / P), where P = MULTI_PROCESSOR_COUNT, L_cp = max_local_chunks
     # Scaled by empirical factor (3) and aligned to the nearest power of 2 for optimal SM scheduling & memory alignment.
