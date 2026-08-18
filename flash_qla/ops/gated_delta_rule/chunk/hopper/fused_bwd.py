@@ -971,10 +971,6 @@ def tilelang_fused_chunk_gdr_bwd(
                         T.barrier_arrive(bar_00)
 
                 elif tx < 384 + 64:
-                    # Zero dQ/dK/dV over the one chunk past the last sequence.
-                    # Downstream kernels consume that trailing tile with TMA,
-                    # which cannot mask on load; anything beyond it is padding
-                    # that the consumer is expected to mask off itself.
                     if bb == batch_size - 1:
                         for j_s, j_v in T.Parallel(block_S, DV):
                             if seq_end_idx + j_s < num_tokens:
@@ -1092,7 +1088,6 @@ def tilelang_fused_chunk_gdr_bwd(
                         T.barrier_arrive(bar_02)
 
                 else:
-                    # Same one-chunk fill as above, for dG/dB.
                     if bb == batch_size - 1:
                         for j_s in T.Parallel(block_S):
                             if seq_end_idx + j_s < num_tokens:
