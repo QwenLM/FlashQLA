@@ -155,7 +155,10 @@ def chunk_gated_delta_rule_bwd(
         dq = group_reduce_vector(dq, Hg)
         dk = group_reduce_vector(dk, Hg)
     assert dg.dtype == torch.float32, "dg should be fp32"
-    dg = chunk_local_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens)
+    dg = chunk_local_cumsum(
+        dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens,
+        zero_last_chunk=True,
+    )
     return dq, dk, dv, db, dg, dh0
 
 
@@ -328,6 +331,10 @@ def chunk_gated_delta_rule(
             Final state of shape `[N, HV, K, V]` if `output_final_state=True` else `None`.
 
     Notes:
+        With `cu_seqlens`, the token buffer may be longer than `cu_seqlens[-1]`.
+        Outputs and gradients are valid on `[0, cu_seqlens[-1])`; the rest of the
+        buffer is undefined and must be masked by the caller.
+
         The TVM host code does not accept `strides == nullptr` even for compact
         tensors. You must explicitly set `strides` to a valid array when constructing
         the DLTensor. This limitation applies to any manual DLPack construction.

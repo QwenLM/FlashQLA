@@ -19,6 +19,7 @@ def tilelang_chunk_local_cumsum(
     seqlen_dtype,
     is_varlen,
     reverse,
+    zero_last_chunk,
 ):
     data_batch_size = T.dynamic("data_batch_size")
     real_batch_size = T.dynamic("real_batch_size")
@@ -99,11 +100,12 @@ def tilelang_chunk_local_cumsum(
                     g_cumsum,
                 )
 
-                left = seq_start_idx + chunk_idx * block_S
-                if batch_idx == real_batch_size - 1:
-                    for j, i in T.Parallel(block_S, H):
-                        if left + j >= seq_end_idx and left + j < num_tokens:
-                            g_cumsum[bb, left + j, i] = 0
+                if zero_last_chunk:
+                    left = seq_start_idx + chunk_idx * block_S
+                    if batch_idx == real_batch_size - 1 and left + block_S >= seq_end_idx:
+                        for j, i in T.Parallel(block_S, H):
+                            if seq_end_idx + j < num_tokens:
+                                g_cumsum[bb, seq_end_idx + j, i] = 0
 
     else:
 
@@ -139,7 +141,16 @@ def chunk_local_cumsum(
     chunk_size: int = 64,
     cu_seqlens: torch.LongTensor | None = None,
     reverse: bool = False,
+    zero_last_chunk: bool = False,
 ):
+    """Chunk-local cumulative sum of `g`, optionally in reverse.
+
+    Args:
+        zero_last_chunk: zero one chunk past `cu_seqlens[-1]` in the output.
+            TMA cannot mask on load, so a consumer that pulls that trailing
+            tile in with TMA needs real zeros there. Off by default; enable it
+            only for buffers read that way.
+    """
     batch_size, num_tokens, H = g.shape
     assert g.stride(-1) == 1
 
@@ -162,6 +173,7 @@ def chunk_local_cumsum(
         accum_dtype="float32",
         is_varlen=is_varlen,
         reverse=reverse,
+        zero_last_chunk=zero_last_chunk,
     )
     if is_varlen:
         tilelang_chunk_local_cumsum_kernel(g, cu_seqlens, chunk_indices, g_cumsum)
