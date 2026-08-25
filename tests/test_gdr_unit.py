@@ -579,7 +579,7 @@ def test_fwd_auto_cp(
 @pytest.mark.parametrize(
     "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list",
     [
-        pytest.param(1, 16384, 4, 4, False, None, id="long-fixed"),
+        pytest.param(1, 16129, 4, 4, False, None, id="long-fixed-tail1"),
         pytest.param(1, 16384, 4, 4, True,
                      [0, 4096, 8192, 12288, 16384],
                      id="long-varlen"),

@@ -57,19 +57,51 @@ def _calc_cp_seqs(
     raw_batch_size = len(raw_cu_seqlens) - 1
     seqlens = [raw_cu_seqlens[i + 1] - raw_cu_seqlens[i] for i in range(raw_batch_size)]
     num_chunks = [tilelang.cdiv(x, chunk_size) for x in seqlens]
-
-    # autocp
     H = num_v_heads
+
     # Latency model: T = a·L_cp + b·(B·H·Lc/P) / L_cp + c
-    # Minimizing T yields the theoretical optimum: L_cp* ∝ √(B·H·Lc / P), where P = MULTI_PROCESSOR_COUNT, L_cp = max_local_chunks
-    # Scaled by empirical factor (3) and aligned to the nearest power of 2 for optimal SM scheduling & memory alignment.
+    # Its continuous optimum sets the search range for max_local_chunks.
+    continuous_chunks = math.sqrt(H * sum(num_chunks) / MULTI_PROCESSOR_COUNT) * 3
+    max_local_chunks = max(4, 2 ** round(math.log2(continuous_chunks)))
 
-    max_local_chunks = 2 ** round(
-        math.log2(math.sqrt(H * sum(num_chunks) / MULTI_PROCESSOR_COUNT) * 3)
-    )
+    if ARCH in ("SM100", "SM103"):
+        # B200-tuned policy; other architectures keep the power-of-2 split.
+        P = MULTI_PROCESSOR_COUNT
 
-    # Set min to 4 to ensure multi-stage pipelining in fused_gdr;
-    max_local_chunks = max(max_local_chunks, 4)
+        def grid_size(local_chunks):
+            return H * sum(tilelang.cdiv(chunks, local_chunks) for chunks in num_chunks)
+
+        def num_waves(local_chunks):
+            return tilelang.cdiv(grid_size(local_chunks), P)
+
+        # Find the shallowest split that reaches the fewest waves within 2x
+        # the continuous estimate, using the exact per-sequence grid.
+        cap = max(4, int(2 * continuous_chunks))
+        target_waves = num_waves(cap)
+        lo, hi = 4, cap
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if num_waves(mid) > target_waves:
+                lo = mid + 1
+            else:
+                hi = mid
+
+        legacy_waves = num_waves(max_local_chunks)
+        improves_grid = (
+            target_waves < legacy_waves
+            and (
+                target_waves == 1
+                or target_waves * lo < legacy_waves * max_local_chunks
+                or legacy_waves - target_waves >= 2
+            )
+            or target_waves == legacy_waves
+            and grid_size(max_local_chunks) < P
+        )
+        # Integer form of waves * (depth + 2) + 0.2 * depth.
+        legacy_cost = 5 * legacy_waves * (max_local_chunks + 2) + max_local_chunks
+        candidate_cost = 5 * target_waves * (lo + 2) + lo
+        if improves_grid and candidate_cost < legacy_cost:
+            max_local_chunks = lo
 
     use_cp = False
     cp_cu_seqlens = []

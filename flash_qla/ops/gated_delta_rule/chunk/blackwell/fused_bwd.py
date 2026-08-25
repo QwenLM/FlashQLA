@@ -280,10 +280,10 @@ def tilelang_fused_chunk_gdr_bwd(
 
             tx = T.get_thread_binding()
 
-            PRODUCER_NREG = 64
-            CONSUMER_K_NREG = 136
-            CONSUMER_A_NREG = 136
-            CONSUMER_S_NREG = 176
+            PRODUCER_NREG = 72
+            CONSUMER_K_NREG = 144
+            CONSUMER_A_NREG = 144
+            CONSUMER_S_NREG = 152
 
             # Prefetch the last chunk of data
             if state_v_first:
