@@ -40,6 +40,7 @@ def tilelang_fused_chunk_gdr_fwd(
     store_h,
     store_o,
     is_varlen,
+    has_incomplete_tile,
     is_cp,
     state_v_first,
     block_DV=128,
@@ -638,7 +639,10 @@ def tilelang_fused_chunk_gdr_fwd(
 
                         T.barrier_arrive(data_is_ready[i_s % 2])
 
-                    if num_unmasked_iters < num_iters:
+                    # Specialize pure full-tile batches without the larger
+                    # async-tail body. The caller derives this from the chunk
+                    # count that it already synchronizes to the host.
+                    if has_incomplete_tile and num_unmasked_iters < num_iters:
                         T.barrier_wait(data_is_free[num_unmasked_iters % 2], (num_unmasked_iters // 2 + 1) % 2)
                         left = seq_start_idx + num_unmasked_iters * block_S
                         right = left + block_S
@@ -706,7 +710,7 @@ def tilelang_fused_chunk_gdr_fwd(
 
                         T.barrier_arrive(data_is_ready[i_s % 2])
 
-                    if num_unmasked_iters < num_iters:
+                    if has_incomplete_tile and num_unmasked_iters < num_iters:
                         T.barrier_wait(data_is_free[num_unmasked_iters % 2], (num_unmasked_iters // 2 + 1) % 2)
                         left = seq_start_idx + num_unmasked_iters * block_S
                         tail_lane = tx - VA_PRODUCER_BEGIN
@@ -871,9 +875,11 @@ def fused_gdr_fwd(
         )
         seqlen_dtype = torch.int32
         is_varlen = False
+        has_incomplete_tile = num_tokens % chunk_size != 0
     else:
         real_batch_size = len(cu_seqlens) - 1
         chunk_offsets, num_chunks = prepare_chunk_offsets(cu_seqlens, chunk_size)
+        has_incomplete_tile = num_chunks * chunk_size != num_tokens
         chunk_offsets = chunk_offsets.to(cu_seqlens.dtype)
         num_chunks = num_chunks if output_h else 0
         seqlen_dtype = cu_seqlens.dtype
@@ -947,6 +953,7 @@ def fused_gdr_fwd(
         store_h=output_h,
         store_o=output_o,
         is_varlen=is_varlen,
+        has_incomplete_tile=has_incomplete_tile,
         is_cp=is_cp,
         state_v_first=state_v_first,
         block_DV=block_DV,

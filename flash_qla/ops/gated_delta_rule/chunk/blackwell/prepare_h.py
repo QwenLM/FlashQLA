@@ -32,6 +32,7 @@ def tilelang_prepare_h(
     store_final_state,
     store_h,
     is_varlen,
+    has_incomplete_tile,
     is_cp,
     state_v_first,
     num_stages=2,
@@ -577,7 +578,7 @@ def tilelang_prepare_h(
                                 k_shared[i_s % num_stages, :, :],
                                 barrier=data_is_ready[i_s % num_stages],
                             )
-                        else:
+                        elif has_incomplete_tile:
                             # Packed-varlen tails cannot use an unpredicated
                             # TMA tile without reading the next sequence.
                             tail_lane = tx - K_PRODUCER_BEGIN
@@ -606,7 +607,7 @@ def tilelang_prepare_h(
                                 a_shared[i_s % num_stages, :, :],
                                 barrier=data_is_ready[i_s % num_stages],
                             )
-                        else:
+                        elif has_incomplete_tile:
                             T.ptx_wait_group(0)
                             T.fence_proxy_async()
 
@@ -620,7 +621,7 @@ def tilelang_prepare_h(
                         left = seq_start_idx + i_s * block_S
                         right = left + block_S
 
-                        if right > seq_end_idx:
+                        if has_incomplete_tile and right > seq_end_idx:
                             tail_lane = tx - VA_PRODUCER_BEGIN
                             for i_copy in T.serial(block_S * DV // (WARP_SIZE * 8)):
                                 copy_offset = (i_copy * WARP_SIZE + tail_lane) * 8
@@ -678,7 +679,7 @@ def tilelang_prepare_h(
                                     b_shared[i_s % num_stages, j_s] = 0
 
                         # Scalar loads execute while tail V/A copies are in flight.
-                        if right > seq_end_idx:
+                        if has_incomplete_tile and right > seq_end_idx:
                             T.ptx_wait_group(0)
                             T.fence_proxy_async()
 
@@ -736,10 +737,12 @@ def fused_gdr_h(
             (batch_size + 1), dtype=torch.int32, device=k.device
         )
         is_varlen = False
+        has_incomplete_tile = num_tokens % chunk_size != 0
         is_cp = False
     else:
         real_batch_size = len(cu_seqlens) - 1
         chunk_offsets, num_chunks = prepare_chunk_offsets(cu_seqlens, chunk_size)
+        has_incomplete_tile = num_chunks * chunk_size != num_tokens
         chunk_offsets = chunk_offsets.to(cu_seqlens.dtype)
         num_chunks = num_chunks if output_h else 0
         is_varlen = True
@@ -797,6 +800,7 @@ def fused_gdr_h(
         store_final_state=output_final_state,
         store_h=output_h,
         is_varlen=is_varlen,
+        has_incomplete_tile=has_incomplete_tile,
         is_cp=is_cp,
         state_v_first=state_v_first,
     )
