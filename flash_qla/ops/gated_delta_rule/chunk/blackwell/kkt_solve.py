@@ -212,6 +212,7 @@ def tilelang_kkt_solve(
             a: T.Tensor(a_shape, dtype=qkva_dtype),
         ):
             with T.Kernel(num_chunks * H, threads=128) as (bch,):
+                T.annotate_min_blocks_per_sm(8)
                 bc, bh = bch // H, bch % H
                 bhg = bh // (H // Hg)
 
@@ -250,6 +251,7 @@ def tilelang_kkt_solve(
             num_chunks: T.int32,
         ):
             with T.Kernel(num_chunks * H, threads=128) as (bch,):
+                T.annotate_min_blocks_per_sm(8)
                 bc, bh = bch // H, bch % H
                 bhg = bh // (H // Hg)
 
