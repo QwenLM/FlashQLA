@@ -198,6 +198,10 @@ def tilelang_prepare_h(
                     T.barrier_wait(bar_0, i_s % 2)
                     # S4[1] S
                     T.copy(h_fragment, h_shared)
+                    # Publish the fragment scatter before bar_1 advertises that the state is
+                    # ready; otherwise CP creates many concurrent CTAs and
+                    # occasionally observes an incompletely copied state.
+                    T.fence_proxy_async()
                     T.barrier_arrive(bar_1)
 
                     # [STAGE = i_s % num_stages] 1
@@ -615,10 +619,11 @@ def fused_gdr_h(
             dtype=torch.float32,
             device=k.device,
         )
+    h_batch_dim = 1 if is_varlen else batch_size
     h = torch.empty(
-        (batch_size, num_chunks, H, V, K)
+        (h_batch_dim, num_chunks, H, V, K)
         if state_v_first
-        else (batch_size, num_chunks, H, K, V),
+        else (h_batch_dim, num_chunks, H, K, V),
         dtype=k.dtype,
         device=k.device,
     )

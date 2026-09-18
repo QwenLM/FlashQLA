@@ -23,7 +23,7 @@ elif tilelang.contrib.nvcc.get_target_compute_version() == "10.3":
     ARCH = "SM103"
 elif tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"]:
     from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, fused_gdr_h, correct_initial_states, correct_terminal_states
-    fused_gdr_dh = None
+    from .blackwell_sm120.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     ARCH = "SM120"
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100, sm103, sm120 and sm121 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
@@ -249,8 +249,7 @@ def intra_card_cp_preprocess_bwd(
 
     if fused_gdr_dh is None:
         raise NotImplementedError(
-            "Backward pass (CP) is not implemented for SM120 (Blackwell). "
-            "Only forward pass is supported on this architecture."
+            "Backward pass (CP) is not implemented for this architecture."
         )
 
     if batch_size > 1:

@@ -18,10 +18,9 @@ elif tilelang.contrib.nvcc.get_target_compute_version() in ["10.0", "10.3"]:
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 64
 elif tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"]:
-    from .blackwell_sm120 import fused_gdr_fwd, fused_gdr_h, kkt_solve
+    from .blackwell_sm120 import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
-    fused_gdr_bwd = None
-    fused_gdr_dh = None
+    from .blackwell_sm120.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 32
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100, sm103, sm120 and sm121 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
@@ -106,8 +105,7 @@ def chunk_gated_delta_rule_bwd(
 ):
     if fused_gdr_bwd is None:
         raise NotImplementedError(
-            "Backward pass is not implemented for SM120 (Blackwell)."
-            "Only forward pass is supported on this architecture."
+            "Backward pass is not implemented for this architecture."
         )
 
     batch_size, num_tokens, num_k_heads, _ = k.shape
@@ -155,7 +153,13 @@ def chunk_gated_delta_rule_bwd(
         dq = group_reduce_vector(dq, Hg)
         dk = group_reduce_vector(dk, Hg)
     assert dg.dtype == torch.float32, "dg should be fp32"
-    dg = chunk_local_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens)
+    dg = chunk_local_cumsum(
+        dg,
+        chunk_size=chunk_size,
+        reverse=True,
+        cu_seqlens=cu_seqlens,
+        zero_last_chunk=True,
+    )
     return dq, dk, dv, db, dg, dh0
 
 

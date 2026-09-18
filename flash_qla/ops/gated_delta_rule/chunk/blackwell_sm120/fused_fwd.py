@@ -624,10 +624,15 @@ def tilelang_fused_chunk_gdr_fwd(
                             if seq_split_idx + j_s < seq_end_idx:
                                 o[batch_idx, seq_split_idx + j_s, bh, DV_start + j_v] = \
                                     o_shared[j_s, j_v]
-                        if bb == batch_size - 1:
-                            for j_s, j_v in T.Parallel(block_S, block_DV):
-                                if seq_end_idx + j_s < num_tokens:
-                                    o[batch_idx, seq_end_idx + j_s, bh, DV_start + j_v] = 0
+                    if store_o and bb == batch_size - 1:
+                        for i_pad in T.serial(num_tokens - seq_end_idx):
+                            for j_v in T.Parallel(block_DV):
+                                o[
+                                    batch_idx,
+                                    seq_end_idx + i_pad,
+                                    bh,
+                                    DV_start + j_v,
+                                ] = 0
 
     return tilelang_fused_chunk_gdr_fwd_kernel
 
@@ -720,6 +725,9 @@ def fused_gdr_fwd(
             dtype=torch.float32,
             device=k.device,
         )
+    # Valid tokens are fully overwritten by the fused kernel.  In varlen mode
+    # the final sequence CTA also clears only the actual backing-buffer tail,
+    # avoiding a redundant full-output memset on every forward pass.
     o = torch.empty_like(v)
 
 

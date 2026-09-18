@@ -742,7 +742,7 @@ def chunk_gated_delta_rule_bwd(
         B, T, _, K = dq.shape
         dq = torch.sum(dq.reshape(B, T, Hg, -1, K), dim=3)
         dk = torch.sum(dk.reshape(B, T, Hg, -1, K), dim=3)
-    dg = torch_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens)
+    dg = torch_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens)
     return dq, dk, dv, db, dg, dh0
 
 

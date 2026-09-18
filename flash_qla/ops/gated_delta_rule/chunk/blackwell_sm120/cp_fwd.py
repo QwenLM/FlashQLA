@@ -321,7 +321,7 @@ def tilelang_correct_h0(
         DV_start = bv * block_DV
         DV_end = (bv + 1) * block_DV
 
-        for i_s in T.Pipelined(num_iters - 1, num_stages=2):
+        for i_s in T.Pipelined(num_iters - 1, num_stages=1):
             idx = seq_start_idx + num_iters - 1 - i_s if reverse else seq_start_idx + i_s
             if state_v_first:
                 T.copy(
