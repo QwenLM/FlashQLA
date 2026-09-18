@@ -32,6 +32,7 @@ def tilelang_prepare_h(
     store_final_state,
     store_h,
     is_varlen,
+    has_incomplete_tile,
     is_cp,
     state_v_first,
     num_stages=2,
@@ -40,6 +41,16 @@ def tilelang_prepare_h(
     num_tokens = T.dynamic("num_tokens")
     num_chunks = T.dynamic("num_chunks")
     block_S = chunk_size
+
+    # Producer warp layout for the 512-thread CTA.  Threads 0..383 are
+    # consumers; the remaining four warps run tcgen, data staging, and store.
+    WARP_SIZE = 32
+    CONSUMER_WARP_COUNT = 12
+    TCGEN_PRODUCER_END = (CONSUMER_WARP_COUNT + 1) * WARP_SIZE
+    K_PRODUCER_BEGIN = TCGEN_PRODUCER_END
+    K_PRODUCER_END = K_PRODUCER_BEGIN + WARP_SIZE
+    VA_PRODUCER_BEGIN = K_PRODUCER_END
+    VA_PRODUCER_END = VA_PRODUCER_BEGIN + WARP_SIZE
 
     if is_varlen:
         k_shape = (1, num_tokens, Hg, DK)
@@ -462,7 +473,7 @@ def tilelang_prepare_h(
             else:
                 T.set_max_nreg(PRODUCER_NREG, 0)
 
-                if tx < 384 + 32:
+                if tx < TCGEN_PRODUCER_END:
                     for i_s in T.serial(num_iters):
                         T.barrier_arrive(bar_0)
 
@@ -552,7 +563,7 @@ def tilelang_prepare_h(
                         #         use_2cta=False,
                         #     )
 
-                elif tx < 384 + 64:
+                elif tx < K_PRODUCER_END:
                     for i_s in T.serial(num_iters):
                         T.barrier_wait(
                             data_is_free[i_s % num_stages], (i_s // num_stages + 1) % 2
@@ -567,49 +578,74 @@ def tilelang_prepare_h(
                                 k_shared[i_s % num_stages, :, :],
                                 barrier=data_is_ready[i_s % num_stages],
                             )
-                        else:
-                            for j_s, j_k in T.Parallel(block_S, DK):
-                                if left + j_s < seq_end_idx:
-                                    k_shared[i_s % num_stages, j_s, j_k] = k[batch_idx, left + j_s, bhg, j_k]
-                                else:
-                                    k_shared[i_s % num_stages, j_s, j_k] = 0
-                        # Load V
+                        elif has_incomplete_tile:
+                            # Packed-varlen tails cannot use an unpredicated
+                            # TMA tile without reading the next sequence.
+                            tail_lane = tx - K_PRODUCER_BEGIN
+                            for i_copy in T.serial(block_S * DK // (WARP_SIZE * 8)):
+                                copy_offset = (i_copy * WARP_SIZE + tail_lane) * 8
+                                j_s = copy_offset // DK
+                                j_k = copy_offset % DK
+                                T.ptx_cp_async(
+                                    T.access_ptr(k_shared[i_s % num_stages, j_s, j_k], "w", 8),
+                                    T.access_ptr(k[batch_idx, left + j_s, bhg, j_k], "r", 8),
+                                    8,
+                                    left + j_s < seq_end_idx,
+                                )
+                            T.ptx_commit_group()
+
+                        # Complete tiles keep the faster TMA path for V/A.
+                        # The following producer warp owns incomplete tails.
                         if right <= seq_end_idx:
                             T.tma_copy(
                                 v[batch_idx, left:right, bh, 0:DV],
                                 v_shared[i_s % num_stages, :, :],
                                 barrier=data_is_ready[i_s % num_stages],
                             )
-                        else:
-                            for j_s, j_v in T.Parallel(block_S, DV):
-                                if left + j_s < seq_end_idx:
-                                    v_shared[i_s % num_stages, j_s, j_v] = v[batch_idx, left + j_s, bh, j_v]
-                                else:
-                                    v_shared[i_s % num_stages, j_s, j_v] = 0
-                        # Load A
-                        if right <= seq_end_idx:
                             T.tma_copy(
                                 a[batch_idx, left:right, bh, 0:block_S],
                                 a_shared[i_s % num_stages, :, :],
                                 barrier=data_is_ready[i_s % num_stages],
                             )
-                        else:
-                            for j_s, j_t in T.Parallel(block_S, block_S):
-                                if left + j_s < seq_end_idx:
-                                    a_shared[i_s % num_stages, j_s, j_t] = a[batch_idx, left + j_s, bh, j_t]
-                                else:
-                                    a_shared[i_s % num_stages, j_s, j_t] = 0
+                        elif has_incomplete_tile:
+                            T.ptx_wait_group(0)
                             T.fence_proxy_async()
 
                         T.barrier_arrive(data_is_ready[i_s % num_stages])
 
-                elif tx < 384 + 96:
+                elif tx < VA_PRODUCER_END:
                     for i_s in T.serial(num_iters):
                         T.barrier_wait(
                             data_is_free[i_s % num_stages], (i_s // num_stages + 1) % 2
                         )
                         left = seq_start_idx + i_s * block_S
                         right = left + block_S
+
+                        if has_incomplete_tile and right > seq_end_idx:
+                            tail_lane = tx - VA_PRODUCER_BEGIN
+                            for i_copy in T.serial(block_S * DV // (WARP_SIZE * 8)):
+                                copy_offset = (i_copy * WARP_SIZE + tail_lane) * 8
+                                j_s = copy_offset // DV
+                                j_v = copy_offset % DV
+                                T.ptx_cp_async(
+                                    T.access_ptr(v_shared[i_s % num_stages, j_s, j_v], "w", 8),
+                                    T.access_ptr(v[batch_idx, left + j_s, bh, j_v], "r", 8),
+                                    8,
+                                    left + j_s < seq_end_idx,
+                                )
+                            T.ptx_commit_group()
+
+                            for i_copy in T.serial(block_S * block_S // (WARP_SIZE * 8)):
+                                copy_offset = (i_copy * WARP_SIZE + tail_lane) * 8
+                                j_s = copy_offset // block_S
+                                j_t = copy_offset % block_S
+                                T.ptx_cp_async(
+                                    T.access_ptr(a_shared[i_s % num_stages, j_s, j_t], "w", 8),
+                                    T.access_ptr(a[batch_idx, left + j_s, bh, j_t], "r", 8),
+                                    8,
+                                    left + j_s < seq_end_idx,
+                                )
+                            T.ptx_commit_group()
 
                         # Load gamma
                         if right <= seq_end_idx:
@@ -641,6 +677,11 @@ def tilelang_prepare_h(
                                     ]
                                 else:
                                     b_shared[i_s % num_stages, j_s] = 0
+
+                        # Scalar loads execute while tail V/A copies are in flight.
+                        if has_incomplete_tile and right > seq_end_idx:
+                            T.ptx_wait_group(0)
+                            T.fence_proxy_async()
 
                         T.barrier_arrive(data_is_ready[i_s % num_stages])
 
@@ -696,10 +737,12 @@ def fused_gdr_h(
             (batch_size + 1), dtype=torch.int32, device=k.device
         )
         is_varlen = False
+        has_incomplete_tile = num_tokens % chunk_size != 0
         is_cp = False
     else:
         real_batch_size = len(cu_seqlens) - 1
         chunk_offsets, num_chunks = prepare_chunk_offsets(cu_seqlens, chunk_size)
+        has_incomplete_tile = num_chunks * chunk_size != num_tokens
         chunk_offsets = chunk_offsets.to(cu_seqlens.dtype)
         num_chunks = num_chunks if output_h else 0
         is_varlen = True
@@ -757,6 +800,7 @@ def fused_gdr_h(
         store_final_state=output_final_state,
         store_h=output_h,
         is_varlen=is_varlen,
+        has_incomplete_tile=has_incomplete_tile,
         is_cp=is_cp,
         state_v_first=state_v_first,
     )
