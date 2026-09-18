@@ -532,9 +532,9 @@ def test_bwd_deterministic(
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 def test_fwd_auto_cp(
     batch_size, num_tokens, num_k_heads, num_v_heads,
-    varlen, cu_seqlens_list, state_v_first,
+    varlen, cu_seqlens_list, state_v_first, monkeypatch,
 ):
-    """auto_cp=True and auto_cp=False should produce equivalent results."""
+    """auto_cp should match reference; long-fixed also covers calc_mt."""
     (
         q, k, v, g, beta, do,
         h0_ref, dht_ref, h0_qla, dht_qla,
@@ -543,6 +543,26 @@ def test_fwd_auto_cp(
         batch_size, num_tokens, num_k_heads, num_v_heads,
         varlen, cu_seqlens_list, use_h0=True, state_v_first=state_v_first,
     )
+
+    check_calc_mt = not varlen and num_tokens == 16384
+    calc_mt_reached = []
+    if check_calc_mt:
+        from flash_qla.ops.gated_delta_rule.chunk import cp_context
+
+        original_fused_gdr_h = cp_context.fused_gdr_h
+
+        def spy_fused_gdr_h(*args, **kwargs):
+            bounds = kwargs.get("cu_seqlens")
+            warmup = kwargs.get("num_warmup_chunks")
+            if bounds is not None and warmup is not None:
+                bounds, warmup = bounds.tolist(), warmup.cpu()
+                for piece in range(len(bounds) - 1):
+                    needed = math.ceil((bounds[piece + 1] - bounds[piece]) / CHUNK_SIZE)
+                    for head in range(warmup.shape[1]):
+                        calc_mt_reached.append(int(warmup[piece, head]) >= needed)
+            return original_fused_gdr_h(*args, **kwargs)
+
+        monkeypatch.setattr(cp_context, "fused_gdr_h", spy_fused_gdr_h)
 
     _, _, o_cp, _, s_cp, _ = chunk_gated_delta_rule_fwd_qla(
         q, k, v, g, beta, scale, h0_qla, cu_seqlens,
@@ -573,6 +593,10 @@ def test_fwd_auto_cp(
     _assert_relative(o_nocp, o_ref, "o_nocp_vs_ref")
     _assert_relative(s_cp_cmp, s_ref_cmp, "s_cp_vs_ref")
     _assert_relative(s_nocp_cmp, s_ref_cmp, "s_nocp_vs_ref")
+
+    if check_calc_mt:
+        assert calc_mt_reached, "long-fixed auto-CP did not reach prepare_h"
+        assert any(calc_mt_reached), "long-fixed auto-CP did not reach calc_mt"
 
 
 @pytest.mark.gpu
