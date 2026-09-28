@@ -125,6 +125,7 @@ def prepare_varlen_metadata(
 
     Explicit ownership avoids the four-entry global cache eviction at MB8+.
     The CPU offsets must be the original source of the device tensor.
+    Offsets and their aliases must remain read-only until metadata is released.
     """
     if cu_seqlens_cpu.device.type != "cpu":
         raise ValueError("prepare_varlen_metadata requires CPU offsets")
@@ -152,7 +153,7 @@ def prepare_varlen_metadata(
         positions = torch.cat([torch.arange(n) for n in counts]) if counts else torch.empty(0, dtype=torch.long)
         indices = torch.stack((positions.eq(0).cumsum(0) - 1, positions), dim=1)
         entries[size] = (upload(torch.tensor(offsets)), offsets[-1], upload(indices))
-    cu_seqlens._flash_qla_prepared_varlen = (cu_seqlens._version, entries)
+    cu_seqlens._flash_qla_prepared_varlen = entries
     return cu_seqlens
 
 
@@ -162,9 +163,7 @@ def _prepared_varlen_entry(
     prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", None)
     if prepared is None:
         return None
-    if prepared[0] != cu_seqlens._version:
-        raise RuntimeError("prepared FlashQLA offsets were mutated; prepare metadata again")
-    return prepared[1].get(chunk_size)
+    return prepared.get(chunk_size)
 
 
 def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Tensor:
