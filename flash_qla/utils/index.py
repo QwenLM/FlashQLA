@@ -131,10 +131,9 @@ def prepare_varlen_metadata(
         raise ValueError("prepare_varlen_metadata requires CPU offsets")
     if cu_seqlens.ndim != 1 or cu_seqlens_cpu.shape != cu_seqlens.shape:
         raise ValueError("CPU/device offsets must have the same 1D shape")
-    values = tuple(int(v) for v in cu_seqlens_cpu.tolist())
-    if not values or values[0] != 0 or any(b < a for a, b in zip(values, values[1:])):
+    lengths = cu_seqlens_cpu.diff()
+    if not cu_seqlens_cpu.numel() or cu_seqlens_cpu[0] != 0 or (lengths < 0).any():
         raise ValueError("offsets must start at zero and be nondecreasing")
-    lengths = [b - a for a, b in zip(values, values[1:])]
 
     def upload(host: torch.Tensor) -> torch.Tensor:
         if cu_seqlens.is_cuda:
@@ -145,14 +144,12 @@ def prepare_varlen_metadata(
     for size in chunk_sizes:
         if size < 1:
             raise ValueError("chunk size must be positive")
-        counts = [(length + size - 1) // size for length in lengths]
-        offsets = [0]
-        for count in counts:
-            offsets.append(offsets[-1] + count)
+        counts = (lengths + size - 1) // size
+        offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
         # Match the original indices.eq(0).cumsum()-1 semantics, including empty documents.
-        positions = torch.cat([torch.arange(n) for n in counts]) if counts else torch.empty(0, dtype=torch.long)
+        positions = torch.cat([torch.arange(n) for n in counts.tolist()]) if counts.numel() else torch.empty(0, dtype=torch.long)
         indices = torch.stack((positions.eq(0).cumsum(0) - 1, positions), dim=1)
-        entries[size] = (upload(torch.tensor(offsets)), offsets[-1], upload(indices))
+        entries[size] = (upload(offsets), int(offsets[-1]), upload(indices))
     cu_seqlens._flash_qla_prepared_varlen = entries
     return cu_seqlens
 
