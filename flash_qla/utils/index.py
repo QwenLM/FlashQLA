@@ -119,19 +119,10 @@ def _fallback_prepare_chunk_offsets(
 def prepare_varlen_metadata(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
-    chunk_sizes: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
-    """Prepare immutable per-input chunk metadata before pipeline scheduling.
+    """Attach chunk offsets, count, and indices using CPU lengths and the backend chunk size."""
+    from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE
 
-    Explicit ownership avoids the four-entry global cache eviction at MB8+.
-    The CPU offsets must be the original source of the device tensor.
-    Offsets and their aliases must remain read-only until metadata is released.
-    By default, prepare the chunk size selected by the GDN backend for this GPU.
-    """
-    if chunk_sizes is None:
-        from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE
-
-        chunk_sizes = (CHUNK_SIZE,)
     lengths = cu_seqlens_cpu.diff()
 
     def upload(host: torch.Tensor) -> torch.Tensor:
@@ -139,15 +130,14 @@ def prepare_varlen_metadata(
             host = host.pin_memory()
         return host.to(device=cu_seqlens.device, dtype=cu_seqlens.dtype, non_blocking=True)
 
-    entries = {}
-    for size in chunk_sizes:
-        counts = (lengths + size - 1) // size
-        offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
-        # Match the original indices.eq(0).cumsum()-1 semantics, including empty documents.
-        positions = torch.cat([torch.arange(n) for n in counts.tolist()]) if counts.numel() else torch.empty(0, dtype=torch.long)
-        indices = torch.stack((positions.eq(0).cumsum(0) - 1, positions), dim=1)
-        entries[size] = (upload(offsets), int(offsets[-1]), upload(indices))
-    cu_seqlens._flash_qla_prepared_varlen = entries
+    counts = (lengths + CHUNK_SIZE - 1) // CHUNK_SIZE
+    offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
+    # Match the original indices.eq(0).cumsum()-1 semantics, including empty documents.
+    positions = torch.cat([torch.arange(n) for n in counts.tolist()]) if counts.numel() else torch.empty(0, dtype=torch.long)
+    indices = torch.stack((positions.eq(0).cumsum(0) - 1, positions), dim=1)
+    cu_seqlens._flash_qla_prepared_varlen = {
+        CHUNK_SIZE: (upload(offsets), int(offsets[-1]), upload(indices))
+    }
     return cu_seqlens
 
 
