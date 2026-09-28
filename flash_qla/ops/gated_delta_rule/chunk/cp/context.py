@@ -214,13 +214,7 @@ def _calc_inter_cp_seqs(
     local_cu_seqlens_cpu = (
         subset_cu_seqlens.clamp(min=rank_start, max=rank_end) - rank_start
     ).unique_consecutive().to(torch.int32)
-    # Pin the source so nonblocking context preparation does not need to
-    # stage a pageable host buffer before the device copy.
-    local_cu_source = (
-        local_cu_seqlens_cpu.pin_memory()
-        if cu_seqlens.is_cuda else local_cu_seqlens_cpu
-    )
-    local_cu_seqlens_gpu = local_cu_source.to(
+    local_cu_seqlens_gpu = local_cu_seqlens_cpu.to(
         device=cu_seqlens.device, non_blocking=True)
 
     first_seq_global_start = cu_seqlens_cpu[start_seq_idx].item()
