@@ -125,33 +125,31 @@ def prepare_varlen_metadata(
 
     lengths = cu_seqlens_cpu.diff()
 
-    def upload(host: torch.Tensor) -> torch.Tensor:
-        if cu_seqlens.is_cuda:
-            host = host.pin_memory()
-        return host.to(device=cu_seqlens.device, dtype=cu_seqlens.dtype, non_blocking=True)
-
     counts = (lengths + CHUNK_SIZE - 1) // CHUNK_SIZE
     offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
     # Match the original indices.eq(0).cumsum()-1 semantics, including empty documents.
     positions = torch.cat([torch.arange(n) for n in counts.tolist()]) if counts.numel() else torch.empty(0, dtype=torch.long)
     indices = torch.stack((positions.eq(0).cumsum(0) - 1, positions), dim=1)
-    cu_seqlens._flash_qla_prepared_varlen = {
-        CHUNK_SIZE: (upload(offsets), int(offsets[-1]), upload(indices))
-    }
+    cu_seqlens._flash_qla_prepared_varlen = (
+        CHUNK_SIZE,
+        offsets.to(cu_seqlens, non_blocking=True),
+        int(offsets[-1]),
+        indices.to(cu_seqlens, non_blocking=True),
+    )
     return cu_seqlens
 
 
 def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Tensor:
-    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", {}).get(chunk_size)
-    if prepared is not None:
-        return prepared[2]
+    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", None)
+    if prepared is not None and prepared[0] == chunk_size:
+        return prepared[3]
     return _fallback_prepare_chunk_indices(cu_seqlens, chunk_size)
 
 
 def prepare_chunk_offsets(
     cu_seqlens: torch.Tensor, chunk_size: int,
 ) -> tuple[torch.Tensor, int]:
-    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", {}).get(chunk_size)
-    if prepared is not None:
-        return prepared[:2]
+    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", None)
+    if prepared is not None and prepared[0] == chunk_size:
+        return prepared[1:3]
     return _fallback_prepare_chunk_offsets(cu_seqlens, chunk_size)
