@@ -127,13 +127,7 @@ def prepare_varlen_metadata(
     The CPU offsets must be the original source of the device tensor.
     Offsets and their aliases must remain read-only until metadata is released.
     """
-    if cu_seqlens_cpu.device.type != "cpu":
-        raise ValueError("prepare_varlen_metadata requires CPU offsets")
-    if cu_seqlens.ndim != 1 or cu_seqlens_cpu.shape != cu_seqlens.shape:
-        raise ValueError("CPU/device offsets must have the same 1D shape")
     lengths = cu_seqlens_cpu.diff()
-    if not cu_seqlens_cpu.numel() or cu_seqlens_cpu[0] != 0 or (lengths < 0).any():
-        raise ValueError("offsets must start at zero and be nondecreasing")
 
     def upload(host: torch.Tensor) -> torch.Tensor:
         if cu_seqlens.is_cuda:
@@ -142,8 +136,6 @@ def prepare_varlen_metadata(
 
     entries = {}
     for size in chunk_sizes:
-        if size < 1:
-            raise ValueError("chunk size must be positive")
         counts = (lengths + size - 1) // size
         offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
         # Match the original indices.eq(0).cumsum()-1 semantics, including empty documents.
