@@ -91,7 +91,7 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 
 
 @tensor_cache
-def prepare_chunk_indices(
+def _fallback_prepare_chunk_indices(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
 ) -> torch.LongTensor:
@@ -105,7 +105,7 @@ def prepare_chunk_indices(
 
 
 @tensor_cache
-def prepare_chunk_offsets(
+def _fallback_prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
 ) -> torch.LongTensor:
@@ -114,3 +114,70 @@ def prepare_chunk_offsets(
     chunk_offsets = torch.zeros_like(cu_seqlens)
     chunk_offsets[1:] = torch.cumsum(num_chunks_per_seq, dim=0)
     return chunk_offsets, chunk_offsets[-1].item()
+
+
+def prepare_varlen_metadata(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: torch.Tensor,
+    chunk_sizes: tuple[int, ...] = (16, 64),
+) -> torch.Tensor:
+    """Prepare immutable per-input chunk metadata before pipeline scheduling.
+
+    Explicit ownership avoids the four-entry global cache eviction at MB8+.
+    The CPU offsets must be the original source of the device tensor.
+    """
+    if cu_seqlens_cpu.device.type != "cpu":
+        raise ValueError("prepare_varlen_metadata requires CPU offsets")
+    if cu_seqlens.ndim != 1 or cu_seqlens_cpu.shape != cu_seqlens.shape:
+        raise ValueError("CPU/device offsets must have the same 1D shape")
+    values = tuple(int(v) for v in cu_seqlens_cpu.tolist())
+    if not values or values[0] != 0 or any(b < a for a, b in zip(values, values[1:])):
+        raise ValueError("offsets must start at zero and be nondecreasing")
+    lengths = [b - a for a, b in zip(values, values[1:])]
+
+    def upload(host: torch.Tensor) -> torch.Tensor:
+        if cu_seqlens.is_cuda:
+            host = host.pin_memory()
+        return host.to(device=cu_seqlens.device, dtype=cu_seqlens.dtype, non_blocking=True)
+
+    entries = {}
+    for size in chunk_sizes:
+        if size < 1:
+            raise ValueError("chunk size must be positive")
+        counts = [(length + size - 1) // size for length in lengths]
+        offsets = [0]
+        for count in counts:
+            offsets.append(offsets[-1] + count)
+        # Match the original indices.eq(0).cumsum()-1 semantics, including empty documents.
+        positions = torch.cat([torch.arange(n) for n in counts]) if counts else torch.empty(0, dtype=torch.long)
+        indices = torch.stack((positions.eq(0).cumsum(0) - 1, positions), dim=1)
+        entries[size] = (upload(torch.tensor(offsets)), offsets[-1], upload(indices))
+    cu_seqlens._flash_qla_prepared_varlen = (cu_seqlens._version, entries)
+    return cu_seqlens
+
+
+def _prepared_varlen_entry(
+    cu_seqlens: torch.Tensor, chunk_size: int,
+) -> tuple[torch.Tensor, int, torch.Tensor] | None:
+    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", None)
+    if prepared is None:
+        return None
+    if prepared[0] != cu_seqlens._version:
+        raise RuntimeError("prepared FlashQLA offsets were mutated; prepare metadata again")
+    return prepared[1].get(chunk_size)
+
+
+def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    prepared = _prepared_varlen_entry(cu_seqlens, chunk_size)
+    if prepared is not None:
+        return prepared[2]
+    return _fallback_prepare_chunk_indices(cu_seqlens, chunk_size)
+
+
+def prepare_chunk_offsets(
+    cu_seqlens: torch.Tensor, chunk_size: int,
+) -> tuple[torch.Tensor, int]:
+    prepared = _prepared_varlen_entry(cu_seqlens, chunk_size)
+    if prepared is not None:
+        return prepared[:2]
+    return _fallback_prepare_chunk_offsets(cu_seqlens, chunk_size)
