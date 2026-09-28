@@ -119,14 +119,19 @@ def _fallback_prepare_chunk_offsets(
 def prepare_varlen_metadata(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
-    chunk_sizes: tuple[int, ...] = (16, 64),
+    chunk_sizes: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Prepare immutable per-input chunk metadata before pipeline scheduling.
 
     Explicit ownership avoids the four-entry global cache eviction at MB8+.
     The CPU offsets must be the original source of the device tensor.
     Offsets and their aliases must remain read-only until metadata is released.
+    By default, prepare the chunk size selected by the GDN backend for this GPU.
     """
+    if chunk_sizes is None:
+        from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE
+
+        chunk_sizes = (CHUNK_SIZE,)
     lengths = cu_seqlens_cpu.diff()
 
     def upload(host: torch.Tensor) -> torch.Tensor:
