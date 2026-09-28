@@ -146,17 +146,8 @@ def prepare_varlen_metadata(
     return cu_seqlens
 
 
-def _prepared_varlen_entry(
-    cu_seqlens: torch.Tensor, chunk_size: int,
-) -> tuple[torch.Tensor, int, torch.Tensor] | None:
-    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", None)
-    if prepared is None:
-        return None
-    return prepared.get(chunk_size)
-
-
 def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Tensor:
-    prepared = _prepared_varlen_entry(cu_seqlens, chunk_size)
+    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", {}).get(chunk_size)
     if prepared is not None:
         return prepared[2]
     return _fallback_prepare_chunk_indices(cu_seqlens, chunk_size)
@@ -165,7 +156,7 @@ def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Te
 def prepare_chunk_offsets(
     cu_seqlens: torch.Tensor, chunk_size: int,
 ) -> tuple[torch.Tensor, int]:
-    prepared = _prepared_varlen_entry(cu_seqlens, chunk_size)
+    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", {}).get(chunk_size)
     if prepared is not None:
         return prepared[:2]
     return _fallback_prepare_chunk_offsets(cu_seqlens, chunk_size)
