@@ -13,9 +13,12 @@ verify workloads against FlashQLA's chunked-prefill path and the chunk /
 fused_recurrent references (FlashInfer when installed, else FLA). Backends that
 cannot be imported are skipped automatically. Add ``--cuda-graph`` to measure
 GPU latency without Python launch gaps, using 100 ms of graph replays.
+``--bench-state-only --cuda-graph`` compares full verify with S-only state
+reconstruction on the same inputs and preallocated final-state buffers.
 """
 
 import importlib
+import statistics
 import sys
 from typing import Optional, Tuple
 
@@ -249,22 +252,90 @@ def test_gdn_verify_empty_sequences(with_state):
 @pytest.mark.gpu
 @pytest.mark.parametrize("io_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("B", [4, 8])
-def test_gdn_verify_zero_state_repeat(B, io_dtype):
+@pytest.mark.parametrize("state_only", [False, True])
+def test_gdn_verify_zero_state_repeat(B, io_dtype, state_only):
     data = make_inputs(B, [16] * B, *GEOM, io_dtype, "cuda", with_state=False)
     q, k, v, g, beta, cu, _ = data
     out = torch.empty_like(v)
     state = torch.empty(B, GEOM[1], GEOM[2], GEOM[3], device="cuda")
     o_ref, s_ref = gdn_recurrent_ref(q, k, v, g, beta, cu)
-    gdn_verify_fwd(q, k, v, g, beta, cu, out=out, final_state=state)
-    assert rel_err(out, o_ref) < 5e-3
+
+    def run():
+        return gdn_verify_fwd(
+            None if state_only else q, k, v, g, beta, cu,
+            out=out, final_state=state, state_only=state_only,
+        )
+
+    run()
+    if not state_only:
+        assert rel_err(out, o_ref) < 5e-3
     assert rel_err(state, s_ref) < 3e-5
     expected_o, expected_s = out.clone(), state.clone()
     for _ in range(10):
         out.fill_(float("nan"))
         state.fill_(float("nan"))
-        gdn_verify_fwd(q, k, v, g, beta, cu, out=out, final_state=state)
-        assert torch.equal(out, expected_o)
+        o, _ = run()
+        if state_only:
+            assert o is None and torch.isnan(out).all()
+        else:
+            assert torch.equal(out, expected_o)
         assert torch.equal(state, expected_s)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("B,seqlens,io_dtype,with_state,seed", CASES)
+def test_gdn_verify_state_only(B, seqlens, io_dtype, with_state, seed):
+    q, k, v, g, beta, cu, state = make_inputs(
+        B, seqlens, *GEOM, io_dtype, "cuda", seed=seed, with_state=with_state,
+    )
+    _, s_full = gdn_verify_fwd(q, k, v, g, beta, cu, initial_state=state)
+    _, s_ref = gdn_recurrent_ref(q, k, v, g, beta, cu, initial_state=state)
+    o, s = gdn_verify_fwd(
+        None, k, v, g, beta, cu, initial_state=state, state_only=True,
+    )
+    assert o is None
+    assert rel_err(s, s_full) < 1e-5
+    assert rel_err(s, s_ref) < (6e-2 if io_dtype == torch.bfloat16 else 2e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("B", [3, 8])
+@pytest.mark.parametrize("io_dtype", [torch.bfloat16, torch.float16])
+def test_gdn_verify_state_only_inplace(B, io_dtype):
+    # These ragged prefixes model accepted lengths after speculative verify.
+    lengths = [0, 16, 1] if B == 3 else [0, 16, 1, 2, 3, 8, 15, 0]
+    q, k, v, g, beta, cu, state = make_inputs(
+        B, lengths, *GEOM, io_dtype, "cuda", seed=23,
+    )
+    g.zero_()
+    beta.fill_(1)
+    _, s_full = gdn_verify_fwd(q, k, v, g, beta, cu, initial_state=state)
+    original_state = state.clone()
+    untouched_out = torch.full_like(v, 17)
+    q.fill_(float("nan"))
+    for _ in range(3):
+        state.copy_(original_state)
+        o, s = gdn_verify_fwd(
+            q, k, v, g, beta, cu, initial_state=state, final_state=state,
+            out=untouched_out, scale=float("nan"), state_only=True,
+        )
+        assert o is None and s is state
+        assert torch.all(untouched_out == 17)
+        assert rel_err(s, s_full) < 1e-5
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("with_state", [False, True])
+def test_gdn_verify_state_only_empty(with_state):
+    _, k, v, g, beta, cu, state = make_inputs(
+        2, [0, 0], *GEOM, torch.bfloat16, "cuda", with_state=with_state,
+    )
+    o, s = gdn_verify_fwd(
+        None, k, v, g, beta, cu, initial_state=state, state_only=True,
+    )
+    assert o is None
+    torch.testing.assert_close(s, state if with_state else torch.zeros_like(s),
+                               rtol=0, atol=0)
 
 
 def run_correctness():
@@ -303,8 +374,20 @@ def run_correctness():
         print(f"empty sequences, initial_state={with_state}: PASS")
     for B in (4, 8):
         for io_dtype in (torch.bfloat16, torch.float16):
-            test_gdn_verify_zero_state_repeat(B, io_dtype)
-            print(f"zero-state repeat, B={B}, {io_dtype}: PASS")
+            for state_only in (False, True):
+                test_gdn_verify_zero_state_repeat(B, io_dtype, state_only)
+                print(f"zero-state repeat, B={B}, {io_dtype}, "
+                      f"state_only={state_only}: PASS")
+    for case in CASES:
+        test_gdn_verify_state_only(*case)
+        print(f"state-only, B={case[0]}, lengths={case[1]}, {case[2]}: PASS")
+    for B in (3, 8):
+        for io_dtype in (torch.bfloat16, torch.float16):
+            test_gdn_verify_state_only_inplace(B, io_dtype)
+            print(f"state-only in-place, B={B}, {io_dtype}: PASS")
+    for with_state in (False, True):
+        test_gdn_verify_state_only_empty(with_state)
+        print(f"state-only empty, initial_state={with_state}: PASS")
     return ok
 
 
@@ -329,6 +412,14 @@ BENCH_CONFIGS = [
     (128, 16, torch.bfloat16),
 ]
 
+STATE_ONLY_BENCH_CONFIGS = [
+    (1, 1, torch.bfloat16),
+    (1, 8, torch.bfloat16),
+    (1, 16, torch.bfloat16),
+    (4, 16, torch.bfloat16),
+    *BENCH_CONFIGS,
+]
+
 
 def time_call(run, iters, warmup, cuda_graph=False):
     """Return microseconds per call; graph mode excludes Python launch gaps."""
@@ -346,6 +437,57 @@ def time_call(run, iters, warmup, cuda_graph=False):
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) * 1e3 / iters
+
+
+def bench_state_only_one(B, T, io_dtype, iters=200, warmup=20, cuda_graph=False):
+    q, k, v, g, beta, cu, initial = make_inputs(
+        B, [T] * B, *GEOM, io_dtype, "cuda", seed=0,
+    )
+    out = torch.empty_like(v)
+    full_state = torch.empty_like(initial)
+    reconstructed = torch.empty_like(initial)
+
+    def full():
+        return gdn_verify_fwd(
+            q, k, v, g, beta, cu, initial_state=initial,
+            out=out, final_state=full_state,
+        )
+
+    def state_only():
+        return gdn_verify_fwd(
+            None, k, v, g, beta, cu, initial_state=initial,
+            final_state=reconstructed, state_only=True,
+        )
+
+    full()
+    o, _ = state_only()
+    assert o is None
+    es = rel_err(reconstructed, full_state)
+    assert es < 1e-5, f"state-only/full mismatch: {es:.3e}"
+    # Alternate the order to reduce clock/cache bias; keep GPU buffers fixed.
+    full_times, state_times = [], []
+    for repeat in range(3):
+        order = ((full, full_times), (state_only, state_times))
+        for run, times in (order if repeat % 2 == 0 else reversed(order)):
+            times.append(time_call(run, iters, warmup, cuda_graph))
+    return {"full_us": statistics.median(full_times),
+            "state_only_us": statistics.median(state_times), "es": es}
+
+
+def run_state_only_benchmark(configs=STATE_ONLY_BENCH_CONFIGS, iters=200,
+                             warmup=20, cuda_graph=False):
+    print(f"GPU: {torch.cuda.get_device_properties(0).name}")
+    print(f"geom: HQ={GEOM[0]} HV={GEOM[1]} DK={GEOM[2]} DV={GEOM[3]}")
+    print(f"timing: {'CUDA Graph' if cuda_graph else 'CUDA events'}; "
+          "median of 3 paired runs, preallocated outputs")
+    print(f"{'B':>4} {'T':>3} {'dtype':<9} {'S+O (us)':>11} {'S only (us)':>12} "
+          f"{'speedup':>9} {'S relerr':>10}")
+    for B, T, io_dtype in configs:
+        r = bench_state_only_one(B, T, io_dtype, iters, warmup, cuda_graph)
+        print(f"{B:>4} {T:>3} {str(io_dtype).split('.')[-1]:<9} "
+              f"{r['full_us']:>11.3f} {r['state_only_us']:>12.3f} "
+              f"{r['full_us'] / r['state_only_us']:>8.2f}x {r['es']:>10.2e}",
+              flush=True)
 
 
 def build_backends(data, scale, geom, device):
@@ -524,11 +666,11 @@ def test_gdn_verify_bench_smoke():
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if "--bench" in args:
+    if "--bench" in args or "--bench-state-only" in args:
         iters = int(args[args.index("--iters") + 1]) if "--iters" in args else 200
         warmup = int(args[args.index("--warmup") + 1]) if "--warmup" in args else 20
-        run_benchmark(BENCH_CONFIGS, iters=iters, warmup=warmup,
-                      cuda_graph="--cuda-graph" in args)
+        benchmark = run_state_only_benchmark if "--bench-state-only" in args else run_benchmark
+        benchmark(iters=iters, warmup=warmup, cuda_graph="--cuda-graph" in args)
     else:
         ok = run_correctness()
         print("\nALL PASS" if ok else "\nSOME FAILED")

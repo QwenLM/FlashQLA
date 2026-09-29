@@ -14,6 +14,8 @@ Solve (I + M) NV = W by forward substitution in registers, then form
 O = P @ NV + exp(c) * scale * Q @ S0 and the rank-16 final-state update.
 The state update splits its FP32 right operand into two bf16/fp16 pieces;
 accumulating both avoids rounding NV to just one low-precision operand.
+The state-only specialization omits Q loads, Q projections, and O entirely
+for SSM state reconstruction after verify.
 """
 
 from typing import Optional
@@ -47,11 +49,13 @@ def tilelang_gdn_verify_fwd(
     use_initial_state,
     store_final_state,
     block_DV=128,
+    state_only=False,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
     block_S = chunk_size
     group = HV // HQ
+    projection_rows = block_S if state_only else 2 * block_S
 
     @T.prim_func
     def tilelang_gdn_verify_fwd_kernel(
@@ -94,7 +98,7 @@ def tilelang_gdn_verify_fwd(
             nvd_lo_shared = T.alloc_shared((block_S, block_DV), qkva_dtype)
 
             kkqk_fragment = T.alloc_fragment((2 * block_S, block_S), accum_dtype)
-            kqs_fragment = T.alloc_fragment((2 * block_S, block_DV), accum_dtype)
+            kqs_fragment = T.alloc_fragment((projection_rows, block_DV), accum_dtype)
             o_fragment = T.alloc_fragment((block_S, block_DV), accum_dtype)
             sfin_fragment = T.alloc_fragment((DK, block_DV), accum_dtype)
             gate_local = T.alloc_local((1,), accum_dtype)
@@ -103,7 +107,11 @@ def tilelang_gdn_verify_fwd(
             # Zero padding leaves the gate prefix flat and padded updates zero.
             for i, d in T.Parallel(block_S, DK):
                 if bos + i < eos:
-                    qk_shared[block_S + i, d] = q[bos + i, bhg, d]
+                    if state_only:
+                        # Pad KK to 32 rows so its MMA still uses four warps.
+                        qk_shared[block_S + i, d] = 0.0
+                    else:
+                        qk_shared[block_S + i, d] = q[bos + i, bhg, d]
                     qk_shared[i, d] = k[bos + i, bhg, d]
                 else:
                     qk_shared[block_S + i, d] = 0.0
@@ -142,7 +150,7 @@ def tilelang_gdn_verify_fwd(
                         * b_shared[i] * kkqk_fragment[i, j],
                         0.0,
                     )
-                else:
+                elif not state_only:
                     wqk_shared[i - block_S, j] = T.if_then_else(
                         j <= i - block_S,
                         T.exp2((cum_shared[i - block_S] - cum_shared[j]) * LOG2E)
@@ -153,8 +161,11 @@ def tilelang_gdn_verify_fwd(
             if use_initial_state:
                 for d, e in T.Parallel(DK, block_DV):
                     s0_shared[d, e] = h0[bb, bh, d, dv_start + e]
-                T.gemm(qk_shared, s0_shared, kqs_fragment, clear_accum=True)
-                for i, d in T.Parallel(2 * block_S, block_DV):
+                T.gemm(
+                    qk_shared[:projection_rows, :], s0_shared, kqs_fragment,
+                    clear_accum=True,
+                )
+                for i, d in T.Parallel(projection_rows, block_DV):
                     if i < block_S:
                         ks_shared[i, d] = kqs_fragment[i, d]
                     else:
@@ -178,13 +189,14 @@ def tilelang_gdn_verify_fwd(
                 if tx < block_DV:
                     nv_shared[i, tx] = nv_local[i]
 
-            T.gemm(wqk_shared, nv_shared, o_fragment, clear_accum=True)
-            if use_initial_state:
+            if not state_only:
+                T.gemm(wqk_shared, nv_shared, o_fragment, clear_accum=True)
+                if use_initial_state:
+                    for i, d in T.Parallel(block_S, block_DV):
+                        o_fragment[i, d] += cumprod_shared[i] * qs_shared[i, d]
                 for i, d in T.Parallel(block_S, block_DV):
-                    o_fragment[i, d] += cumprod_shared[i] * qs_shared[i, d]
-            for i, d in T.Parallel(block_S, block_DV):
-                if bos + i < eos:
-                    o[bos + i, bh, dv_start + d] = o_fragment[i, d]
+                    if bos + i < eos:
+                        o[bos + i, bh, dv_start + d] = o_fragment[i, d]
 
             if store_final_state:
                 for j, d in T.Parallel(block_S, block_DV):
@@ -212,7 +224,7 @@ def tilelang_gdn_verify_fwd(
 
 
 def gdn_verify_fwd(
-    q: torch.Tensor,
+    q: Optional[torch.Tensor],
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
@@ -223,6 +235,7 @@ def gdn_verify_fwd(
     final_state: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     chunk_size: int = 16,
+    state_only: bool = False,
 ):
     """GDN verify forward; every sequence must contain at most 16 tokens.
 
@@ -234,7 +247,17 @@ def gdn_verify_fwd(
     Returns (out, final_state). Both outputs may be preallocated, and
     final_state may alias initial_state. Without an initial state, start
     from zero and allocate the final state in fp32 by default.
+
+    Set state_only=True for SSM state reconstruction: returns (None,
+    final_state), skips all Q/O work and O allocation, and permits q=None.
+    In this mode q, scale, and out are ignored; a supplied out is unchanged.
     """
+    if state_only:
+        # Unused tensor argument; no Q tensor or O allocation is needed.
+        q = k
+        scale = 1.0
+    elif q is None:
+        raise ValueError("q is required unless state_only=True")
     total, HQ, DK = q.shape
     HV, DV = v.shape[1:]
     batch = cu_seqlens.shape[0] - 1
@@ -248,7 +271,7 @@ def gdn_verify_fwd(
         scale = DK ** -0.5
     use_initial_state = initial_state is not None
     state_dtype = initial_state.dtype if use_initial_state else torch.float32
-    if out is None:
+    if not state_only and out is None:
         out = torch.empty((total, HV, DV), dtype=q.dtype, device=q.device)
     if final_state is None:
         final_state = torch.empty((batch, HV, DK, DV), dtype=state_dtype, device=q.device)
@@ -264,12 +287,14 @@ def gdn_verify_fwd(
         b_dtype=beta.dtype,
         h0_dtype=initial_state.dtype,
         ht_dtype=final_state.dtype,
-        o_dtype=out.dtype,
+        o_dtype=v.dtype if state_only else out.dtype,
         seqlen_dtype=cu_seqlens.dtype,
         use_initial_state=use_initial_state,
         store_final_state=True,
         # Small batches need more CTAs; large batches reuse Q/K across all DV.
         block_DV=64 if batch * HV <= 192 else 128,
+        state_only=state_only,
     )
-    kernel(q, k, v, g, beta, cu_seqlens, initial_state, out, final_state)
-    return out, final_state
+    kernel(q, k, v, g, beta, cu_seqlens, initial_state,
+           v if state_only else out, final_state)
+    return None if state_only else out, final_state
