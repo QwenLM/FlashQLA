@@ -91,7 +91,7 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 
 
 @tensor_cache
-def prepare_chunk_indices(
+def _fallback_prepare_chunk_indices(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
 ) -> torch.LongTensor:
@@ -105,7 +105,7 @@ def prepare_chunk_indices(
 
 
 @tensor_cache
-def prepare_chunk_offsets(
+def _fallback_prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
 ) -> torch.LongTensor:
@@ -114,3 +114,42 @@ def prepare_chunk_offsets(
     chunk_offsets = torch.zeros_like(cu_seqlens)
     chunk_offsets[1:] = torch.cumsum(num_chunks_per_seq, dim=0)
     return chunk_offsets, chunk_offsets[-1].item()
+
+
+def prepare_varlen_metadata(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: torch.Tensor,
+) -> torch.Tensor:
+    """Attach chunk offsets, count, and indices using CPU lengths and the backend chunk size."""
+    from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE
+
+    lengths = cu_seqlens_cpu.diff()
+
+    counts = (lengths + CHUNK_SIZE - 1) // CHUNK_SIZE
+    offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
+    # Match the original indices.eq(0).cumsum()-1 semantics, including empty documents.
+    positions = torch.cat([torch.arange(n) for n in counts.tolist()]) if counts.numel() else torch.empty(0, dtype=torch.long)
+    indices = torch.stack((positions.eq(0).cumsum(0) - 1, positions), dim=1)
+    cu_seqlens._flash_qla_prepared_varlen = (
+        CHUNK_SIZE,
+        offsets.to(cu_seqlens, non_blocking=True),
+        int(offsets[-1]),
+        indices.to(cu_seqlens, non_blocking=True),
+    )
+    return cu_seqlens
+
+
+def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", None)
+    if prepared is not None and prepared[0] == chunk_size:
+        return prepared[3]
+    return _fallback_prepare_chunk_indices(cu_seqlens, chunk_size)
+
+
+def prepare_chunk_offsets(
+    cu_seqlens: torch.Tensor, chunk_size: int,
+) -> tuple[torch.Tensor, int]:
+    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", None)
+    if prepared is not None and prepared[0] == chunk_size:
+        return prepared[1:3]
+    return _fallback_prepare_chunk_offsets(cu_seqlens, chunk_size)
