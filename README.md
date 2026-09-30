@@ -6,6 +6,7 @@
 
 ## News
 
+- [2026-09] 🎉 Release FlashQLA v0.1.3 — adds dual-CP (inter/intra two-level context parallelism), a better auto-CP partitioning strategy, and the SM120 backward path.
 - [2026-07] 🚀 Release FlashQLA v0.1.2 — adds forward pass for SM120 (Blackwell, thanks @minatoyukinaa) and now serves as a backend for [flash-linear-attention](https://github.com/fla-org/flash-linear-attention)'s GDN, providing plug-and-play acceleration through the standard FLA API.
 - [2026-06] ⚡ Release FlashQLA v0.1.1 — adds intra-card sequence parallelism for the backward pass and SM100 support. Also upgrades tilelang to v0.1.9 and aligned entry function signatures to the latest `flash-linear-attention` interface.
 
