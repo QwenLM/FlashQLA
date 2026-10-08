@@ -143,8 +143,9 @@ def test_inter_intra_matches_both_refs(stub_group, world_size):
     for rank in range(world_size):
         group = stub_group(world_size, rank)
         ctx = build_cp_context(
-            cu, enable_inter=True, enable_intra=True, group=group,
-            num_v_heads=4, chunk_size=CHUNK_SIZE, force_intra_cp=True,
+            cu, group=group,
+            enable_inter=True, enable_intra=True,
+            num_v_heads=4, is_train=True, force_intra_cp=True,
         )
         assert ctx.is_inter and ctx.is_intra and ctx.group is group
 

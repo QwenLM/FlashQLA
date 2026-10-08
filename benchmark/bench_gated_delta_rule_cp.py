@@ -285,11 +285,15 @@ def build_context(name: str, cu_g: torch.Tensor, *, num_v_heads: int, is_train: 
     if name == "fla_kcp":
         return build_cp_context_fla(cu_g, group=dist.group.WORLD)
     if name == "qla_inter":
-        return build_cp_context(cu_g, enable_inter=True, group=dist.group.WORLD)
+        return build_cp_context(
+            cu_g, group=dist.group.WORLD,
+            enable_inter=True, enable_intra=False,
+        )
     # naive and fused share one (True, True) context.
     return build_cp_context(
-        cu_g, enable_inter=True, enable_intra=True, group=dist.group.WORLD,
-        num_v_heads=num_v_heads, chunk_size=CHUNK_SIZE, is_train=is_train,
+        cu_g, group=dist.group.WORLD,
+        enable_inter=True, enable_intra=True,
+        num_v_heads=num_v_heads, is_train=is_train,
         force_intra_cp=True,
     )
 

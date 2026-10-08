@@ -36,7 +36,7 @@ from .cp import (
 from flash_qla.utils import input_guard
 
 
-def _auto_intra_cp_context(k, v, cu_seqlens, chunk_size, auto_cp, is_train,
+def _auto_intra_cp_context(k, v, cu_seqlens, auto_cp, is_train,
                            force_intra_cp=False):
     """Interpret the raw input and build an intra-CP context via build_cp_context.
     Intra needs the flattened varlen (batch-1) layout: a dense [B>1, T] input can't
@@ -51,8 +51,8 @@ def _auto_intra_cp_context(k, v, cu_seqlens, chunk_size, auto_cp, is_train,
     if enable_intra and cu is None:
         cu = _create_cu_seqlens(k.shape[0], k.shape[1], k.device.index)
     return build_cp_context(
-        cu, enable_intra=enable_intra, num_v_heads=v.shape[2],
-        chunk_size=chunk_size, is_train=is_train,
+        cu, enable_inter=False, enable_intra=enable_intra,
+        num_v_heads=v.shape[2], is_train=is_train,
         force_intra_cp=force_intra_cp,
     )
 
@@ -79,7 +79,7 @@ def chunk_gated_delta_rule_fwd(
 
     if cp_context is None:
         cp_context = _auto_intra_cp_context(
-            k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train,
+            k, v, cu_seqlens, auto_cp, is_train,
         )
 
     g = chunk_local_cumsum(
@@ -149,7 +149,7 @@ def chunk_gated_delta_rule_bwd(
 
     if cp_context is None:
         cp_context = _auto_intra_cp_context(
-            k, v, cu_seqlens, chunk_size, auto_cp, is_train=True,
+            k, v, cu_seqlens, auto_cp, is_train=True,
         )
 
     h0, dht = cp_preprocess_bwd(
@@ -231,7 +231,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         # No explicit context -> auto intra CP.
         if cp_context is None:
             cp_context = _auto_intra_cp_context(
-                k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train,
+                k, v, cu_seqlens, auto_cp, is_train,
                 force_intra_cp=force_intra_cp,
             )
 

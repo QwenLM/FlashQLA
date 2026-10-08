@@ -72,8 +72,9 @@ _GRAD_LEAF = {"dq": "q", "dk": "k", "dv": "v", "dg": "g", "db": "beta"}
 
 def _make_ctx(cu_g, num_v_heads, group, enable_intra):
     return build_cp_context(
-        cu_g, enable_inter=True, enable_intra=enable_intra, group=group,
-        num_v_heads=num_v_heads, chunk_size=CHUNK_SIZE,
+        cu_g, group=group,
+        enable_inter=True, enable_intra=enable_intra,
+        num_v_heads=num_v_heads,
         is_train=True, force_intra_cp=enable_intra,
     )
 

@@ -19,7 +19,7 @@ from flash_qla import (
     chunk_gated_delta_rule_fwd as qla_fwd,
     chunk_gated_delta_rule_bwd as qla_bwd,
 )
-from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE, build_cp_context
+from flash_qla.ops.gated_delta_rule.chunk import build_cp_context
 from flash_qla.utils import l2norm
 
 try:
@@ -281,8 +281,9 @@ def bench_fwd(
 
     results = {}
     cp_context = build_cp_context(
-        cu_seqlens, enable_intra=auto_cp, num_v_heads=h_v,
-        chunk_size=CHUNK_SIZE, is_train=False,
+        cu_seqlens,
+        enable_inter=False, enable_intra=auto_cp,
+        num_v_heads=h_v, is_train=False,
     )
 
     def call_qla_fwd():
@@ -399,8 +400,9 @@ def bench_bwd(
     cp_cache = None
 
     cp_context = build_cp_context(
-        cu_seqlens, enable_intra=auto_cp, num_v_heads=h_v,
-        chunk_size=CHUNK_SIZE, is_train=True,
+        cu_seqlens,
+        enable_inter=False, enable_intra=auto_cp,
+        num_v_heads=h_v, is_train=True,
     )
     try:
         result = qla_fwd(

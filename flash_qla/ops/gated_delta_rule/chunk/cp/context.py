@@ -12,6 +12,7 @@ import torch.distributed as dist
 import tilelang
 
 from flash_qla.utils import tensor_cache
+from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE
 
 from .autocp import current_arch, is_calibrated
 from .autocp import decide as autocp_decide
@@ -97,17 +98,15 @@ class FlashQLACPContext:
         )
 
 def build_cp_context(
-    cu_seqlens: torch.Tensor | None = None,
-    *,
-    enable_inter: bool = False,
-    enable_intra: bool = False,
+    cu_seqlens: torch.Tensor,
     group: "ProcessGroup | None" = None,
+    enable_inter: bool = True,
+    enable_intra: bool = True,
     num_v_heads: int | None = None,
-    chunk_size: int | None = None,
     conv1d_kernel_size: int | None = None,
     cu_seqlens_cpu: torch.Tensor | None = None,
     g: torch.Tensor | None = None,
-    is_train: bool = False,
+    is_train: bool = True,
     force_intra_cp: bool = False,
 ) -> FlashQLACPContext:
     """Unified CP-context builder over the canonical ``(cu_seqlens, num_v_heads)``.
@@ -115,7 +114,7 @@ def build_cp_context(
     intra | (T,T) inter+intra | (F,F) no CP.
 
     - inter needs ``group``.
-    - intra needs ``cu_seqlens`` (varlen), ``chunk_size`` and ``num_v_heads``.
+    - intra needs ``cu_seqlens`` (varlen) and ``num_v_heads``.
     - ``is_train`` picks the intra decision's cost regime. It keys off the *step*, not
       the pass: a training step's forward and backward must reach the same decision,
       otherwise the two passes disagree on the partitioning.
@@ -128,8 +127,23 @@ def build_cp_context(
     - ``force_intra_cp`` bypasses the intra decision and always splits, for tests and
       profiling that need the intra path on configurations it would skip.
     """
+
+    if enable_inter and group is None:
+        warnings.warn(
+            "inter-card CP is enabled but no group is provided; disabling inter-card CP.",
+            RuntimeWarning, stacklevel=2,
+        )
+        enable_inter = False
+        
+    if enable_intra and num_v_heads is None:
+        warnings.warn(
+            "intra-card CP is enabled but no num_v_heads is provided; disabling intra-card CP, which may lead to suboptimal performance.",
+            RuntimeWarning, stacklevel=2,
+        )
+        enable_intra = False
+
     if enable_inter and enable_intra:
-        assert group is not None and chunk_size is not None and num_v_heads is not None
+        assert group is not None and num_v_heads is not None
         # inter split -> local per-card cu_seqlens + rank topology; then intra split
         # over that local sequence; merge both field groups into one context.
         inter_ctx = _calc_inter_cp_seqs(
@@ -137,9 +151,12 @@ def build_cp_context(
             conv1d_kernel_size=conv1d_kernel_size,
         )
         intra_ctx = _calc_intra_cp_seqs(
-            raw_cu_seqlens=inter_ctx.cu_seqlens, chunk_size=chunk_size,
-            num_v_heads=num_v_heads, g=g if AUTOCP_MODEL else None,
-            is_train=is_train, force_intra_cp=force_intra_cp,
+            raw_cu_seqlens=inter_ctx.cu_seqlens,
+            chunk_size=CHUNK_SIZE,
+            num_v_heads=num_v_heads,
+            g=g if AUTOCP_MODEL else None,
+            is_train=is_train,
+            force_intra_cp=force_intra_cp,
         )
         return FlashQLACPContext(
             is_inter=True,
@@ -168,11 +185,17 @@ def build_cp_context(
         )
 
     if enable_intra:
-        assert cu_seqlens is not None and chunk_size is not None and num_v_heads is not None
+        assert (
+            cu_seqlens is not None
+            and num_v_heads is not None
+        )
         return _calc_intra_cp_seqs(
-            raw_cu_seqlens=cu_seqlens, chunk_size=chunk_size,
-            num_v_heads=num_v_heads, g=g if AUTOCP_MODEL else None,
-            is_train=is_train, force_intra_cp=force_intra_cp,
+            raw_cu_seqlens=cu_seqlens,
+            chunk_size=CHUNK_SIZE,
+            num_v_heads=num_v_heads,
+            g=g if AUTOCP_MODEL else None,
+            is_train=is_train,
+            force_intra_cp=force_intra_cp,
         )
 
     return FlashQLACPContext(cu_seqlens=cu_seqlens)
