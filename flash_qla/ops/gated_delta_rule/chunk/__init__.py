@@ -467,3 +467,6 @@ def chunk_gated_delta_rule(
     )
 
     return o, final_state
+
+
+from .warmup import warmup  # noqa: E402  (deferred: needs the dispatchers above)

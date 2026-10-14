@@ -7,10 +7,12 @@ from flash_qla.ops.gated_delta_rule.chunk import (
     chunk_gated_delta_rule_fwd,
     chunk_gated_delta_rule_bwd,
     chunk_gated_delta_rule,
+    warmup,
 )
 
 __all__ = [
     "chunk_gated_delta_rule_fwd",
     "chunk_gated_delta_rule_bwd",
     "chunk_gated_delta_rule",
+    "warmup",
 ]
