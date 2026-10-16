@@ -18,6 +18,7 @@ Debug one config::
 
     pytest tests/test_cp_e2e.py -k "single-ws2 and inter and kv" -s
 """
+from contextlib import nullcontext
 import os
 import socket
 import sys
@@ -70,11 +71,11 @@ MODES = [
 _GRAD_LEAF = {"dq": "q", "dk": "k", "dv": "v", "dg": "g", "db": "beta"}
 
 
-def _make_ctx(cu_g, num_v_heads, group, enable_intra):
+def _make_ctx(cu_g, num_v_heads, group, enable_intra, *, is_train=True):
     return build_cp_context(
         cu_g, enable_inter=True, enable_intra=enable_intra, group=group,
         num_v_heads=num_v_heads, chunk_size=CHUNK_SIZE,
-        is_train=True, force_intra_cp=enable_intra,
+        is_train=is_train, force_intra_cp=enable_intra,
     )
 
 
@@ -101,7 +102,7 @@ def _free_port() -> str:
     return str(port)
 
 
-def _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht):
+def _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht, *, forward_only=False):
     """Global float64 oracle: whole sequence, no CP, differentiating the same loss the
     CP run uses (do = 1 everywhere; dht = 1 on the final state iff ``use_dht``)."""
     q64, k64, v64 = (t.to(REF_DTYPE, copy=True) for t in (q, k, v))
@@ -112,6 +113,8 @@ def _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht):
         q=q64, k=k64, v=v64, g=g64, beta=beta64, scale=scale,
         initial_state=h0_64, cu_seqlens=cu_g, chunk_size=CHUNK_SIZE,
     )
+    if forward_only:
+        return dict(o=o_r, s=s_r)
     do = torch.ones_like(o_r)
     dht = torch.ones_like(s_r) if use_dht else None
     dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd_ref(
@@ -120,7 +123,8 @@ def _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht):
     return dict(o=o_r, s=s_r, dq=dq, dk=dk, dv=dv, db=db, dg=dg, dh0=dh0)
 
 
-def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group):
+def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group,
+                   *, forward_only=False):
     cu_list, _, Hk, Hv, g_scale, use_h0, use_dht = cfg
     T = cu_list[-1]
 
@@ -130,9 +134,14 @@ def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group):
         use_h0=use_h0, state_v_first=state_v_first,
     )
     g = g * g_scale
-    ref = _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht)
+    ref = _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht,
+                     forward_only=forward_only)
 
-    ctx = _make_ctx(cu_g, Hv, group, enable_intra)
+    ctx = _make_ctx(cu_g, Hv, group, enable_intra, is_train=not forward_only)
+    if forward_only:
+        # Do not silently test pure inter when a Dual-CP test failed to split.
+        assert ctx.is_inter and ctx.is_intra
+        assert ctx.intra_cp_cu_seqlens.numel() > ctx.cu_seqlens.numel()
 
     part = T // world_size
     lo, hi = rank * part, (rank + 1) * part
@@ -140,34 +149,39 @@ def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group):
     n_local = ctx.num_seqs
 
     leaves = {
-        name: t[:, lo:hi].detach().clone().requires_grad_(True)
+        name: t[:, lo:hi].detach().clone().requires_grad_(not forward_only)
         for name, t in dict(q=q, k=k, v=v, g=g, beta=beta).items()
     }
     h0_leaf = None
     if h0_qla is not None:
-        h0_leaf = h0_qla[start_seq: start_seq + n_local].detach().clone().requires_grad_(True)
+        h0_leaf = h0_qla[start_seq: start_seq + n_local].detach().clone().requires_grad_(not forward_only)
 
-    o, final_state = chunk_gated_delta_rule(
-        leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
-        scale=scale, initial_state=h0_leaf, output_final_state=True,
-        cu_seqlens=None, state_v_first=state_v_first, cp_context=ctx,
-    )
-    loss = o.float().sum()
-    if use_dht and final_state is not None:
-        loss = loss + final_state.float().sum()
-    loss.backward()
+    with torch.no_grad() if forward_only else nullcontext():
+        o, final_state = chunk_gated_delta_rule(
+            leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+            scale=scale, initial_state=h0_leaf, output_final_state=True,
+            cu_seqlens=None, state_v_first=state_v_first, cp_context=ctx,
+        )
+    if not forward_only:
+        loss = o.float().sum()
+        if use_dht and final_state is not None:
+            loss = loss + final_state.float().sum()
+        loss.backward()
 
     # All collectives are done; sync so a failed assert on one rank cannot hang peers.
     dist.barrier()
 
     tag = f"[rank{rank}/{world_size} {'inter_intra' if enable_intra else 'inter'}]"
     assert_relative(o, ref["o"][:, lo:hi], f"{tag} o")
-    for gname, lname in _GRAD_LEAF.items():
-        assert_relative(leaves[lname].grad, ref[gname][:, lo:hi], f"{tag} {gname}")
+    if not forward_only:
+        for gname, lname in _GRAD_LEAF.items():
+            assert_relative(leaves[lname].grad, ref[gname][:, lo:hi], f"{tag} {gname}")
 
     def _fix(t):
         return t.transpose(-1, -2) if state_v_first else t
 
+    if forward_only:
+        assert final_state is not None, "output_final_state=True must return states"
     if final_state is not None:
         # A sequence's final state is the true global one only on the card where the
         # sequence ends; elsewhere it is a partial (card-local) state -- skip it.
@@ -213,4 +227,44 @@ def test_cp(cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_
         nprocs=world_size,
         join=True,
         start_method="spawn",
+    )
+
+
+# Forward-only Dual-CP: each case uses two visible devices. This
+# exercises the public API without autograd or the backward reference/kernel.
+# Run on two SM120 GPUs:
+# CUDA_VISIBLE_DEVICES=0,1 python -m pytest tests/test_cp_e2e.py -k dual_cp_forward -v
+_FORWARD_CONFIGS = [
+    pytest.param([0, 4096], 0.0, id="single-full-fallback"),
+    pytest.param([0, 4096], 1 / 16, id="single-decay"),
+    pytest.param([0, 2048, 4096], 1 / 16, id="card-aligned"),
+    pytest.param([0, 1031, 4096], 1 / 16, id="ragged-boundary"),
+    pytest.param([0, 519, 1536, 3079, 4096], 1 / 16, id="multiple-sequences"),
+]
+
+
+def _cp_forward_worker(rank, world_size, cfg, state_v_first, port):
+    try:
+        group = _init_distributed(rank, world_size, port)
+        _run_and_check(rank, world_size, True, cfg, state_v_first, group,
+                       forward_only=True)
+    finally:
+        _cleanup_distributed()
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@pytest.mark.multigpu
+@pytest.mark.cp_inter_intra
+@pytest.mark.parametrize("cu_list, g_scale", _FORWARD_CONFIGS)
+@pytest.mark.parametrize("use_h0", [False, True], ids=["zero-seed", "raw-h0"])
+@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
+def test_dual_cp_forward(cu_list, g_scale, use_h0, state_v_first):
+    # GVA as well as both layouts; compare each rank's output and every sequence
+    # final state owned by that rank against the global float64 reference.
+    cfg = (cu_list, 2, 2, 4, g_scale, use_h0, False)
+    mp.start_processes(
+        _cp_forward_worker,
+        args=(2, cfg, state_v_first, _free_port()),
+        nprocs=2, join=True, start_method="spawn",
     )

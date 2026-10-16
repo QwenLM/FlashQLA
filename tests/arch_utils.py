@@ -12,9 +12,8 @@ run, so tests and profiling stop hard-coding arch names:
 * ``chunk_size``   -- must match ``flash_qla...chunk.CHUNK_SIZE``
 * ``intra``        -- intra-card CP
 * ``inter``        -- inter-card CP
-* ``inter_intra``  -- combined inter+intra CP, which needs ``aggregate_card_state``;
-                      only the SM90/SM100/SM103 kernels provide it so far, and
-                      ``cp_preprocess_fwd/bwd`` raise ``NotImplementedError`` elsewhere.
+* ``inter_intra_fwd`` / ``inter_intra_bwd`` -- independent Dual-CP directions.
+  SM120/SM121 provide forward aggregation only; ordinary backward is separate.
 """
 from __future__ import annotations
 
@@ -47,16 +46,16 @@ def detect_arch() -> str | None:
 ARCH = detect_arch()
 
 ARCH_CAPS: dict[str, dict] = {
-    "SM90": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra=True),
-    "SM100": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra=True),
-    "SM103": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra=True),
-    "SM120": dict(chunk_size=32, bwd=True, intra=True, inter=True, inter_intra=False),
-    "SM121": dict(chunk_size=32, bwd=True, intra=True, inter=True, inter_intra=False),
+    "SM90": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra_fwd=True, inter_intra_bwd=True),
+    "SM100": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra_fwd=True, inter_intra_bwd=True),
+    "SM103": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra_fwd=True, inter_intra_bwd=True),
+    "SM120": dict(chunk_size=32, bwd=True, intra=True, inter=True, inter_intra_fwd=True, inter_intra_bwd=False),
+    "SM121": dict(chunk_size=32, bwd=True, intra=True, inter=True, inter_intra_fwd=True, inter_intra_bwd=False),
 }
 
 # Used when the arch is unknown (no GPU / detection failed). Everything is off, so
 # capability-gated tests skip rather than fail with a confusing kernel error.
-_UNKNOWN_CAPS = dict(chunk_size=None, bwd=False, intra=False, inter=False, inter_intra=False)
+_UNKNOWN_CAPS = dict(chunk_size=None, bwd=False, intra=False, inter=False, inter_intra_fwd=False, inter_intra_bwd=False)
 
 
 def caps(arch: str | None = None) -> dict:

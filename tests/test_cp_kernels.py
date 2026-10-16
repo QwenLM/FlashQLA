@@ -271,7 +271,10 @@ def test_correct_terminal_states(
 @pytest.mark.parametrize("fallback_pattern", FALLBACK_PATTERNS)
 @pytest.mark.parametrize("use_raw_h0", [False, True], ids=["zero-seed", "raw-h0"])
 @pytest.mark.parametrize(
-    "reverse, transpose_m", [(False, False), (True, True)], ids=["fwd", "bwd"],
+    "reverse, transpose_m", [
+        pytest.param(False, False, id="fwd"),
+        pytest.param(True, True, id="bwd", marks=pytest.mark.needs_bwd),
+    ],
 )
 def test_aggregate_card_state(
     segments, state_v_first, fallback_pattern, use_raw_h0, reverse, transpose_m

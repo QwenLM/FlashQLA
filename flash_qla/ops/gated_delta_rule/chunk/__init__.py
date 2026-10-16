@@ -7,10 +7,6 @@ import tilelang
 from flash_qla.utils import l2norm_fwd, l2norm_bwd, prepare_chunk_offsets
 from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 
-# `aggregate_card_state` is only needed by combined inter+intra CP. It relies on the
-# `store_inter_h` / `compute_m` modes of `tilelang_correct_h0`, which exist in the
-# SM90/SM100/SM103 kernels; where it is `None` (e.g. SM120), pure inter and pure intra
-# still work and `cp_preprocess_fwd/bwd` reject inter+intra with an explicit error.
 if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
@@ -28,6 +24,12 @@ elif tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"]:
     CHUNK_SIZE = 32
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100, sm103, sm120 and sm121 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
+# Dual-CP directions are independent: SM120 provides only the forward scan.
+DUAL_CP_FWD_SUPPORTED = aggregate_card_state is not None
+DUAL_CP_BWD_SUPPORTED = tilelang.contrib.nvcc.get_target_compute_version() in (
+    "9.0", "10.0", "10.3",
+)
+
 from .cp import (
     build_cp_context, cp_preprocess_fwd, cp_preprocess_bwd, FlashQLACPContext,
     _create_cu_seqlens,

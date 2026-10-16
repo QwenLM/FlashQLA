@@ -28,9 +28,10 @@ def pytest_collection_modifyitems(config, items):
         if "sm120" in item.keywords and ARCH not in ["SM120", "SM121"]:
             item.add_marker(pytest.mark.skip(reason="Blackwell SM120 GPU required"))
         # Capability-based gating (see arch_utils.ARCH_CAPS).
-        if "cp_inter_intra" in item.keywords and not supports("inter_intra"):
+        dual_direction = "inter_intra_bwd" if "needs_bwd" in item.keywords else "inter_intra_fwd"
+        if "cp_inter_intra" in item.keywords and not supports(dual_direction):
             item.add_marker(pytest.mark.skip(
-                reason=f"combined inter+intra CP is not implemented on {ARCH}"))
+                reason=f"{dual_direction} is not implemented on {ARCH}"))
         if "needs_bwd" in item.keywords and not supports("bwd"):
             item.add_marker(pytest.mark.skip(
                 reason=f"backward kernels are not implemented on {ARCH}"))
