@@ -219,7 +219,10 @@ def cp_preprocess_bwd(
     is_inter, is_intra = cp_context.is_inter, cp_context.is_intra
     if not is_inter and not is_intra:
         return initial_state, dht
-    _assert_inter_intra_supported(is_inter, is_intra, backward=True)
+    # Reject the whole combined request, including ranks that skipped intra CP.
+    _assert_inter_intra_supported(
+        is_inter, is_intra or cp_context.inter_intra_requested, backward=True,
+    )
 
     if fused_gdr_dh is None:
         raise NotImplementedError(

@@ -64,6 +64,7 @@ def test_intra_context_matches_ref(cu_list, max_local_chunks):
     ctx = _build_intra_cp_context(cu, CHUNK_SIZE, num_chunks, max_local_chunks)
     _assert_intra(ctx, ref_intra_context(cu_list, CHUNK_SIZE, max_local_chunks))
     assert ctx.is_intra and not ctx.is_inter
+    assert not ctx.inter_intra_requested
     assert ctx.cu_seqlens.tolist() == cu_list
 
 
@@ -92,6 +93,7 @@ def test_inter_context_matches_ref(cu_list, world_size):
         ctx = _calc_inter_cp_seqs(cu, world_size=world_size, rank=rank, group=None)
         _assert_inter(ctx, ref_inter_context(cu_list, world_size, rank))
         assert ctx.is_inter and not ctx.is_intra
+        assert not ctx.inter_intra_requested
 
 
 @pytest.mark.parametrize("total, world_size", [(1000, 3), (1000, 7), (100, 3)])
@@ -147,6 +149,7 @@ def test_inter_intra_matches_both_refs(stub_group, world_size):
             num_v_heads=4, chunk_size=CHUNK_SIZE, force_intra_cp=True,
         )
         assert ctx.is_inter and ctx.is_intra and ctx.group is group
+        assert ctx.inter_intra_requested
 
         inter_ref = ref_inter_context(cu_list, world_size, rank)
         _assert_inter(ctx, inter_ref)
@@ -161,8 +164,43 @@ def test_inter_intra_matches_both_refs(stub_group, world_size):
 
         copied = ctx.copy_for_backward()
         assert copied.group is group
+        assert copied.inter_intra_requested
         _assert_inter(copied, inter_ref)
         _assert_intra(copied, intra_ref)
+
+
+@pytest.mark.gpu
+def test_mixed_dual_backward_rejected_before_work(stub_group, monkeypatch):
+    from flash_qla.ops.gated_delta_rule import chunk
+    from flash_qla.ops.gated_delta_rule.chunk.cp import context
+    from flash_qla.ops.gated_delta_rule.chunk.cp.preprocess import (
+        _assert_inter_intra_supported, cp_preprocess_bwd,
+    )
+
+    # Fix the local decisions so this regression does not depend on GPU/model tuning.
+    decisions = iter([(False, None), (True, 4)])
+    monkeypatch.setattr(context, "AUTOCP_MODEL", True)
+    monkeypatch.setattr(context, "autocp_decide", lambda **kwargs: next(decisions))
+    monkeypatch.setattr(chunk, "DUAL_CP_BWD_SUPPORTED", False)
+    cu = torch.tensor(list(range(0, 1025, 32)) + [2048], dtype=torch.int32, device=DEV)
+    for rank in range(2):
+        ctx = build_cp_context(
+            cu, enable_inter=True, enable_intra=True, group=stub_group(2, rank),
+            num_v_heads=4, chunk_size=32, is_train=True,
+        )
+        assert ctx.is_inter and ctx.is_intra == bool(rank)
+        for bwd_ctx in (ctx, ctx.copy_for_backward()):
+            # None inputs ensure rejection precedes tensor work and any collective.
+            with pytest.raises(NotImplementedError, match="Dual-CP.*Backward"):
+                cp_preprocess_bwd(
+                    bwd_ctx, q=None, k=None, v=None, a=None, g=None, beta=None,
+                    do=None, dht=None, scale=1.0, initial_state=None,
+                    state_v_first=False, cp_cache=None,
+                )
+
+    # The capability restriction must still allow explicitly requested pure modes.
+    _assert_inter_intra_supported(True, False, backward=True)
+    _assert_inter_intra_supported(False, True, backward=True)
 
 
 # ===========================================================================

@@ -53,10 +53,14 @@ class FlashQLACPContext:
     ht_mask: torch.Tensor | None = None
     ht_mask_bwd: torch.Tensor | None = None
 
+    # Preserve the group-wide request even when this rank skips the intra split.
+    inter_intra_requested: bool = False
+
     def copy_for_backward(self) -> "FlashQLACPContext":
         copied = FlashQLACPContext(
             is_inter=self.is_inter,
             is_intra=self.is_intra,
+            inter_intra_requested=self.inter_intra_requested,
             group=self.group,
             cu_seqlens=self.cu_seqlens.clone() if self.cu_seqlens is not None else None,
             cu_seqlens_cpu=self.cu_seqlens_cpu.clone() if self.cu_seqlens_cpu is not None else None,
@@ -144,6 +148,7 @@ def build_cp_context(
         return FlashQLACPContext(
             is_inter=True,
             is_intra=intra_ctx.is_intra,
+            inter_intra_requested=True,
             cu_seqlens=inter_ctx.cu_seqlens,
             group=inter_ctx.group,
             cu_seqlens_cpu=inter_ctx.cu_seqlens_cpu,
