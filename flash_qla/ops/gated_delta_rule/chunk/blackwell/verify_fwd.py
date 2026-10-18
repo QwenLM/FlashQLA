@@ -54,6 +54,7 @@ def tilelang_gdn_verify_fwd(
     state_only=False,
     store_cache=False,
     use_accepted_lengths=False,
+    state_v_first=False,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
@@ -63,6 +64,11 @@ def tilelang_gdn_verify_fwd(
     cache_dtype = accum_dtype if store_cache else qkva_dtype
     prefix_dtype = accum_dtype if store_cache else g_dtype
     num_lengths = T.dynamic("num_lengths")
+    # Hold every state buffer in the global state's own orientation: the h0/ht
+    # accesses then stay contiguous along the leading state axis and the MMA
+    # absorbs the transpose, instead of paying for a strided global access.
+    state_shape = (batch_size, HV, DV, DK) if state_v_first else (batch_size, HV, DK, DV)
+    state_tile = (block_DV, DK) if state_v_first else (DK, block_DV)
 
     @T.prim_func
     def tilelang_gdn_verify_fwd_kernel(
@@ -72,9 +78,9 @@ def tilelang_gdn_verify_fwd(
         g: T.Tensor((num_tokens, HV), g_dtype),
         b: T.Tensor((num_tokens, HV), b_dtype),
         cu_seqlens: T.Tensor((batch_size + 1,), seqlen_dtype),
-        h0: T.Tensor((batch_size, HV, DK, DV), h0_dtype),
+        h0: T.Tensor(state_shape, h0_dtype),
         o: T.Tensor((num_tokens, HV, DV), o_dtype),
-        ht: T.Tensor((batch_size, HV, DK, DV), ht_dtype),
+        ht: T.Tensor(state_shape, ht_dtype),
         nv_cache: T.Tensor((num_tokens, HV, DV), cache_dtype),
         gate_cache: T.Tensor((num_tokens, HV), prefix_dtype),
         accepted_lengths: T.Tensor((num_lengths,), seqlen_dtype),
@@ -94,7 +100,7 @@ def tilelang_gdn_verify_fwd(
 
             qk_shared = T.alloc_shared((2 * block_S, DK), qkva_dtype)
             v_shared = T.alloc_shared((block_S, block_DV), qkva_dtype)
-            s0_shared = T.alloc_shared((DK, block_DV), qkva_dtype)
+            s0_shared = T.alloc_shared(state_tile, qkva_dtype)
             b_shared = T.alloc_shared((block_S,), accum_dtype, scope="shared")
             cum_shared = T.alloc_shared((block_S,), accum_dtype, scope="shared")
             cumprod_shared = T.alloc_shared((block_S,), accum_dtype, scope="shared")
@@ -110,7 +116,7 @@ def tilelang_gdn_verify_fwd(
             kkqk_fragment = T.alloc_fragment((2 * block_S, block_S), accum_dtype)
             kqs_fragment = T.alloc_fragment((projection_rows, block_DV), accum_dtype)
             o_fragment = T.alloc_fragment((block_S, block_DV), accum_dtype)
-            sfin_fragment = T.alloc_fragment((DK, block_DV), accum_dtype)
+            sfin_fragment = T.alloc_fragment(state_tile, accum_dtype)
             gate_local = T.alloc_local((1,), accum_dtype)
             nv_local = T.alloc_local((block_S,), accum_dtype)
 
@@ -173,11 +179,16 @@ def tilelang_gdn_verify_fwd(
                     )
 
             if use_initial_state:
-                for d, e in T.Parallel(DK, block_DV):
-                    s0_shared[d, e] = h0[bb, bh, d, dv_start + e]
+                if state_v_first:
+                    # DK is the contiguous axis, so let it vary fastest.
+                    for e, d in T.Parallel(block_DV, DK):
+                        s0_shared[e, d] = h0[bb, bh, dv_start + e, d]
+                else:
+                    for d, e in T.Parallel(DK, block_DV):
+                        s0_shared[d, e] = h0[bb, bh, d, dv_start + e]
                 T.gemm(
                     qk_shared[:projection_rows, :], s0_shared, kqs_fragment,
-                    clear_accum=True,
+                    transpose_B=state_v_first, clear_accum=True,
                 )
                 for i, d in T.Parallel(projection_rows, block_DV):
                     if i < block_S:
@@ -225,19 +236,37 @@ def tilelang_gdn_verify_fwd(
                         decay_shared[j] * nv_shared[j, d]
                         - T.cast(nvd_shared[j, d], accum_dtype)
                     )
-                T.gemm(
-                    qk_shared[:block_S, :], nvd_shared, sfin_fragment,
-                    transpose_A=True, clear_accum=True,
-                )
-                T.gemm(
-                    qk_shared[:block_S, :], nvd_lo_shared, sfin_fragment,
-                    transpose_A=True,
-                )
-                cum_last = cumprod_shared[block_S - 1]
-                for d, e in T.Parallel(DK, block_DV):
-                    if use_initial_state:
-                        sfin_fragment[d, e] += cum_last * h0[bb, bh, d, dv_start + e]
-                    ht[bb, bh, d, dv_start + e] = sfin_fragment[d, e]
+                if state_v_first:
+                    # Accumulate the update transposed (NVD^T @ K) so the state
+                    # tile matches the V-major layout; both the h0 read-back and
+                    # the ht store then run contiguous along DK.
+                    T.gemm(
+                        nvd_shared, qk_shared[:block_S, :], sfin_fragment,
+                        transpose_A=True, clear_accum=True,
+                    )
+                    T.gemm(
+                        nvd_lo_shared, qk_shared[:block_S, :], sfin_fragment,
+                        transpose_A=True,
+                    )
+                    cum_last = cumprod_shared[block_S - 1]
+                    for e, d in T.Parallel(block_DV, DK):
+                        if use_initial_state:
+                            sfin_fragment[e, d] += cum_last * h0[bb, bh, dv_start + e, d]
+                        ht[bb, bh, dv_start + e, d] = sfin_fragment[e, d]
+                else:
+                    T.gemm(
+                        qk_shared[:block_S, :], nvd_shared, sfin_fragment,
+                        transpose_A=True, clear_accum=True,
+                    )
+                    T.gemm(
+                        qk_shared[:block_S, :], nvd_lo_shared, sfin_fragment,
+                        transpose_A=True,
+                    )
+                    cum_last = cumprod_shared[block_S - 1]
+                    for d, e in T.Parallel(DK, block_DV):
+                        if use_initial_state:
+                            sfin_fragment[d, e] += cum_last * h0[bb, bh, d, dv_start + e]
+                        ht[bb, bh, d, dv_start + e] = sfin_fragment[d, e]
 
     return tilelang_gdn_verify_fwd_kernel
 
@@ -258,13 +287,15 @@ def gdn_verify_fwd(
     nv_cache: Optional[torch.Tensor] = None,
     gate_cache: Optional[torch.Tensor] = None,
     accepted_lengths: Optional[torch.Tensor] = None,
+    state_v_first: bool = False,
 ):
     """GDN verify forward; every sequence must contain at most 16 tokens.
 
     Inputs q/k are (total, HQ, 128), v is (total, HV, 128), and g/beta
     are (total, HV). q/k/v use bf16 or fp16; g contains raw log gates.
     cu_seqlens is (B + 1,), with HV a multiple of HQ. State tensors use
-    K-major (B, HV, 128, 128) layout. The default scale is 128 ** -0.5.
+    K-major (B, HV, DK, DV) layout, or V-major (B, HV, DV, DK) when
+    state_v_first=True. The default scale is 128 ** -0.5.
 
     Returns (out, final_state). Both outputs may be preallocated, and
     final_state may alias initial_state. Without an initial state, start
@@ -320,8 +351,9 @@ def gdn_verify_fwd(
     state_dtype = initial_state.dtype if use_initial_state else torch.float32
     if not state_only and out is None:
         out = torch.empty((total, HV, DV), dtype=q.dtype, device=q.device)
+    state_shape = (batch, HV, DV, DK) if state_v_first else (batch, HV, DK, DV)
     if final_state is None:
-        final_state = torch.empty((batch, HV, DK, DV), dtype=state_dtype, device=q.device)
+        final_state = torch.empty(state_shape, dtype=state_dtype, device=q.device)
     if initial_state is None:
         # The zero-state specialization never reads this argument.
         initial_state = final_state
@@ -343,6 +375,7 @@ def gdn_verify_fwd(
         state_only=state_only,
         store_cache=store_cache,
         use_accepted_lengths=accepted_lengths is not None,
+        state_v_first=state_v_first,
     )
     # Disabled cache/length specializations ignore the input placeholders.
     kernel(q, k, v, g, beta, cu_seqlens, initial_state,
@@ -364,10 +397,15 @@ def _check_accepted_lengths(lengths, batch, device):
 def tilelang_gdn_reconstruct_state(
     HQ, HV, DK, DV, io_dtype, h0_dtype, ht_dtype, use_initial_state,
     block_DV=128,
+    state_v_first=False,
 ):
     batch = T.dynamic("batch")
     total = T.dynamic("total")
     block_S = 16
+    # See tilelang_gdn_verify_fwd: match the global state's orientation so the
+    # h0/ht accesses stay contiguous and the MMA absorbs the transpose.
+    state_shape = (batch, HV, DV, DK) if state_v_first else (batch, HV, DK, DV)
+    state_tile = (block_DV, DK) if state_v_first else (DK, block_DV)
 
     @T.prim_func
     def tilelang_gdn_reconstruct_state_kernel(
@@ -376,8 +414,8 @@ def tilelang_gdn_reconstruct_state(
         prefix: T.Tensor((total, HV), "float32"),
         cu_seqlens: T.Tensor((batch + 1,), "int32"),
         accepted: T.Tensor((batch,), "int32"),
-        h0: T.Tensor((batch, HV, DK, DV), h0_dtype),
-        ht: T.Tensor((batch, HV, DK, DV), ht_dtype),
+        h0: T.Tensor(state_shape, h0_dtype),
+        ht: T.Tensor(state_shape, ht_dtype),
     ):
         with T.Kernel(batch * HV * (DV // block_DV), threads=128) as block:
             T.annotate_min_blocks_per_sm(4)
@@ -393,7 +431,7 @@ def tilelang_gdn_reconstruct_state(
             hi_shared = T.alloc_shared((block_S, block_DV), io_dtype)
             lo_shared = T.alloc_shared((block_S, block_DV), io_dtype)
             decay_shared = T.alloc_shared((block_S,), "float32", scope="shared")
-            state_fragment = T.alloc_fragment((DK, block_DV), "float32")
+            state_fragment = T.alloc_fragment(state_tile, "float32")
 
             # A prefix of NV depends only on that prefix, never later drafts.
             c_last = T.if_then_else(length > 0, prefix[bos + length - 1, bh], 0.0)
@@ -411,14 +449,26 @@ def tilelang_gdn_reconstruct_state(
                 hi = T.cast(scaled_nv, io_dtype)
                 hi_shared[i, d] = hi
                 lo_shared[i, d] = scaled_nv - T.cast(hi, "float32")
-            T.gemm(k_shared, hi_shared, state_fragment,
-                   transpose_A=True, clear_accum=True)
-            T.gemm(k_shared, lo_shared, state_fragment, transpose_A=True)
             decay = T.exp2(c_last * LOG2E)
-            for d, e in T.Parallel(DK, block_DV):
-                if use_initial_state:
-                    state_fragment[d, e] += decay * h0[bb, bh, d, dv_start + e]
-                ht[bb, bh, d, dv_start + e] = state_fragment[d, e]
+            if state_v_first:
+                # Accumulate the update transposed (NV^T @ K) so the state tile
+                # matches the V-major layout; the h0 read-back and the ht store
+                # then both run contiguous along DK.
+                T.gemm(hi_shared, k_shared, state_fragment,
+                       transpose_A=True, clear_accum=True)
+                T.gemm(lo_shared, k_shared, state_fragment, transpose_A=True)
+                for e, d in T.Parallel(block_DV, DK):
+                    if use_initial_state:
+                        state_fragment[e, d] += decay * h0[bb, bh, dv_start + e, d]
+                    ht[bb, bh, dv_start + e, d] = state_fragment[e, d]
+            else:
+                T.gemm(k_shared, hi_shared, state_fragment,
+                       transpose_A=True, clear_accum=True)
+                T.gemm(k_shared, lo_shared, state_fragment, transpose_A=True)
+                for d, e in T.Parallel(DK, block_DV):
+                    if use_initial_state:
+                        state_fragment[d, e] += decay * h0[bb, bh, d, dv_start + e]
+                    ht[bb, bh, d, dv_start + e] = state_fragment[d, e]
 
     return tilelang_gdn_reconstruct_state_kernel
 
@@ -431,6 +481,7 @@ def gdn_reconstruct_state(
     accepted_lengths: torch.Tensor,
     initial_state: Optional[torch.Tensor] = None,
     final_state: Optional[torch.Tensor] = None,
+    state_v_first: bool = False,
 ):
     """Reconstruct accepted-prefix states from gdn_verify_fwd's fp32 caches.
 
@@ -438,7 +489,9 @@ def gdn_reconstruct_state(
     accepted_lengths is a CUDA int32 (B,) tensor, bounded by each verified
     sequence's length (0..16). Pass the same initial state used by verify,
     or None for a zero initial state. final_state may alias initial_state.
-    Returns final_state in K-major (B, HV, 128, 128) layout.
+    Returns final_state in K-major (B, HV, DK, DV) layout, or V-major
+    (B, HV, DV, DK) when state_v_first=True; the initial state must use the
+    same layout.
     """
     total, HQ, DK = k.shape
     HV, DV = nv_cache.shape[1:]
@@ -455,9 +508,10 @@ def gdn_reconstruct_state(
     if cu_seqlens.dtype != torch.int32:
         cu_seqlens = cu_seqlens.to(torch.int32)
     use_initial_state = initial_state is not None
+    state_shape = (batch, HV, DV, DK) if state_v_first else (batch, HV, DK, DV)
     if final_state is None:
         final_state = torch.empty(
-            (batch, HV, DK, DV), device=k.device,
+            state_shape, device=k.device,
             dtype=initial_state.dtype if use_initial_state else torch.float32,
         )
     if initial_state is None:
@@ -465,6 +519,7 @@ def gdn_reconstruct_state(
     kernel = tilelang_gdn_reconstruct_state(
         HQ, HV, DK, DV, k.dtype, initial_state.dtype, final_state.dtype,
         use_initial_state, block_DV=64 if batch * HV <= 192 else 128,
+        state_v_first=state_v_first,
     )
     kernel(k, nv_cache, gate_cache, cu_seqlens, accepted_lengths,
            initial_state, final_state)

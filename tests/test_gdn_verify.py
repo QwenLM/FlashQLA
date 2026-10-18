@@ -6,7 +6,8 @@
 Correctness compares ``gdn_verify_fwd`` against a vectorized recurrent reference
 for the Qwen4-120B GDN geometry (HQ=16, HV=48, DK=DV=128) with verify-block
 sequence lengths (<= chunk_size), including ragged per-seq lengths and both io
-dtypes.
+dtypes. The ``state_v_first=True`` (V-major state) path is checked to be bitwise
+identical to the default K-major layout for both verify and reconstruction.
 
 The speed benchmark (``python tests/test_gdn_verify.py --bench``) times the same
 verify workloads against FlashQLA's chunked-prefill path and the chunk /
@@ -461,6 +462,99 @@ def test_gdn_verify_cache_state_only(B):
     assert rel_err(reconstructed, expected) < 1e-5
 
 
+def transpose_state(state):
+    """K-major (B, HV, DK, DV) <-> V-major (B, HV, DV, DK), made contiguous."""
+    return state.transpose(-1, -2).contiguous()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("B,seqlens,io_dtype,with_state,seed", CASES)
+def test_gdn_verify_state_v_first(B, seqlens, io_dtype, with_state, seed):
+    # The V-major state reassociates the rank-16 update as NVD^T @ K, whose
+    # reduction order over the 16 tokens matches K^T @ NVD exactly, so the
+    # transposed final state and the output are both bitwise identical to the
+    # K-major path.
+    q, k, v, g, beta, cu, state = make_inputs(
+        B, seqlens, *GEOM, io_dtype, "cuda", seed=seed, with_state=with_state
+    )
+    h0_v = transpose_state(state) if with_state else None
+    o_ref, s_ref = gdn_recurrent_ref(q, k, v, g, beta, cu, initial_state=state)
+    o_k, s_k = gdn_verify_fwd(q, k, v, g, beta, cu, initial_state=state)
+    o_v, s_v = gdn_verify_fwd(q, k, v, g, beta, cu, initial_state=h0_v,
+                              state_v_first=True)
+    torch.testing.assert_close(o_v, o_k, rtol=0, atol=0)
+    torch.testing.assert_close(transpose_state(s_v), s_k, rtol=0, atol=0)
+    assert rel_err(o_v, o_ref) < (3e-2 if io_dtype == torch.bfloat16 else 1e-2)
+    assert rel_err(transpose_state(s_v), s_ref) < (
+        6e-2 if io_dtype == torch.bfloat16 else 2e-2
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("state_only", [False, True])
+@pytest.mark.parametrize("B,io_dtype", [(3, torch.bfloat16), (8, torch.float16)])
+def test_gdn_verify_state_v_first_state_only(B, io_dtype, state_only):
+    lengths = [0, 16, 1] if B == 3 else [0, 16, 1, 2, 3, 8, 15, 0]
+    q, k, v, g, beta, cu, state = make_inputs(
+        B, lengths, *GEOM, io_dtype, "cuda", seed=23, with_state=True,
+    )
+    _, s_k = gdn_verify_fwd(
+        None if state_only else q, k, v, g, beta, cu,
+        initial_state=state, state_only=state_only,
+    )
+    _, s_v = gdn_verify_fwd(
+        None if state_only else q, k, v, g, beta, cu,
+        initial_state=transpose_state(state), state_only=state_only,
+        state_v_first=True,
+    )
+    torch.testing.assert_close(transpose_state(s_v), s_k, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("with_state", [False, True])
+def test_gdn_reconstruct_state_v_first(with_state):
+    B, accepted = 4, [0, 16, 1, 2]
+    seqlens = [16] * B
+    q, k, v, g, beta, cu, state = make_inputs(
+        B, seqlens, *GEOM, torch.bfloat16, "cuda", seed=37, with_state=with_state,
+    )
+    nv = torch.empty_like(v, dtype=torch.float32)
+    prefix = torch.empty_like(g)
+    h0_k = state
+    h0_v = transpose_state(state) if with_state else None
+    gdn_verify_fwd(q, k, v, g, beta, cu, initial_state=h0_k,
+                   nv_cache=nv, gate_cache=prefix)
+    lengths = torch.tensor(accepted, dtype=torch.int32, device="cuda")
+    s_k = gdn_reconstruct_state(k, nv, prefix, cu, lengths, initial_state=h0_k)
+    s_v = gdn_reconstruct_state(k, nv, prefix, cu, lengths, initial_state=h0_v,
+                                state_v_first=True)
+    torch.testing.assert_close(transpose_state(s_v), s_k, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+def test_gdn_reconstruct_state_v_first_inplace():
+    # final_state aliasing initial_state must work in the V-major layout too.
+    B, accepted = 4, [0, 16, 1, 2]
+    q, k, v, g, beta, cu, state = make_inputs(
+        B, [16] * B, *GEOM, torch.bfloat16, "cuda", seed=41, with_state=True,
+    )
+    nv = torch.empty_like(v, dtype=torch.float32)
+    prefix = torch.empty_like(g)
+    state_v = transpose_state(state)
+    gdn_verify_fwd(q, k, v, g, beta, cu, initial_state=state_v,
+                   nv_cache=nv, gate_cache=prefix, state_v_first=True)
+    lengths = torch.tensor(accepted, dtype=torch.int32, device="cuda")
+    expected = gdn_reconstruct_state(k, nv, prefix, cu, lengths,
+                                     initial_state=state_v.clone(),
+                                     state_v_first=True)
+    sv = state_v.clone()
+    got = gdn_reconstruct_state(k, nv, prefix, cu, lengths,
+                                initial_state=sv, final_state=sv,
+                                state_v_first=True)
+    assert got is sv
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
 def run_correctness():
     """Run every CASES entry against the recurrent reference; return all-pass."""
     print(f"{'B':>3} {'seqlens':<26} {'dtype':<10} {'state':<6} "
@@ -526,6 +620,19 @@ def run_correctness():
     for B in (1, 8):
         test_gdn_verify_cache_state_only(B)
         print(f"cache from state-only verify, B={B}: PASS")
+    for case in CASES:
+        test_gdn_verify_state_v_first(*case)
+        print(f"state_v_first verify, B={case[0]}, lengths={case[1]}, {case[2]}: PASS")
+    for B, io_dtype in ((3, torch.bfloat16), (8, torch.float16)):
+        for state_only in (False, True):
+            test_gdn_verify_state_v_first_state_only(B, io_dtype, state_only)
+            print(f"state_v_first state-only, B={B}, {io_dtype}, "
+                  f"state_only={state_only}: PASS")
+    for with_state in (False, True):
+        test_gdn_reconstruct_state_v_first(with_state)
+        print(f"state_v_first reconstruct, initial_state={with_state}: PASS")
+    test_gdn_reconstruct_state_v_first_inplace()
+    print("state_v_first reconstruct in-place: PASS")
     return ok
 
 
