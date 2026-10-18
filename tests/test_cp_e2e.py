@@ -18,7 +18,6 @@ Debug one config::
 
     pytest tests/test_cp_e2e.py -k "single-ws2 and inter and kv" -s
 """
-from contextlib import nullcontext
 import os
 import socket
 import sys
@@ -41,6 +40,7 @@ from gdr_common import (
 )
 from flash_qla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule
 from flash_qla.ops.gated_delta_rule.chunk.cp import build_cp_context
+from arch_utils import supports
 
 # (cu_seqlens, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht)
 # Interior boundaries are placed relative to the card edge at total/world_size.
@@ -138,7 +138,7 @@ def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group,
                      forward_only=forward_only)
 
     ctx = _make_ctx(cu_g, Hv, group, enable_intra, is_train=not forward_only)
-    if forward_only:
+    if forward_only and enable_intra:
         # Do not silently test pure inter when a Dual-CP test failed to split.
         assert ctx.is_inter and ctx.is_intra
         assert ctx.intra_cp_cu_seqlens.numel() > ctx.cu_seqlens.numel()
@@ -156,7 +156,7 @@ def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group,
     if h0_qla is not None:
         h0_leaf = h0_qla[start_seq: start_seq + n_local].detach().clone().requires_grad_(not forward_only)
 
-    with torch.no_grad() if forward_only else nullcontext():
+    with torch.set_grad_enabled(not forward_only):
         o, final_state = chunk_gated_delta_rule(
             leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
             scale=scale, initial_state=h0_leaf, output_final_state=True,
@@ -201,14 +201,16 @@ def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group,
 def _cp_worker(rank, world_size, enable_intra, cfg, state_v_first, port):
     try:
         group = _init_distributed(rank, world_size, port)
-        _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group)
+        # All architectures share forward cases; check gradients where supported.
+        forward_only = not supports("inter_intra_bwd" if enable_intra else "bwd")
+        _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group,
+                       forward_only=forward_only)
     finally:
         _cleanup_distributed()
 
 
 @pytest.mark.gpu
 @pytest.mark.slow
-@pytest.mark.needs_bwd
 @pytest.mark.multigpu
 @pytest.mark.parametrize(
     "cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht", CONFIGS,
@@ -227,44 +229,4 @@ def test_cp(cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_
         nprocs=world_size,
         join=True,
         start_method="spawn",
-    )
-
-
-# Forward-only Dual-CP: each case uses two visible devices. This
-# exercises the public API without autograd or the backward reference/kernel.
-# Run on two SM120 GPUs:
-# CUDA_VISIBLE_DEVICES=0,1 python -m pytest tests/test_cp_e2e.py -k dual_cp_forward -v
-_FORWARD_CONFIGS = [
-    pytest.param([0, 4096], 0.0, id="single-full-fallback"),
-    pytest.param([0, 4096], 1 / 16, id="single-decay"),
-    pytest.param([0, 2048, 4096], 1 / 16, id="card-aligned"),
-    pytest.param([0, 1031, 4096], 1 / 16, id="ragged-boundary"),
-    pytest.param([0, 519, 1536, 3079, 4096], 1 / 16, id="multiple-sequences"),
-]
-
-
-def _cp_forward_worker(rank, world_size, cfg, state_v_first, port):
-    try:
-        group = _init_distributed(rank, world_size, port)
-        _run_and_check(rank, world_size, True, cfg, state_v_first, group,
-                       forward_only=True)
-    finally:
-        _cleanup_distributed()
-
-
-@pytest.mark.gpu
-@pytest.mark.slow
-@pytest.mark.multigpu
-@pytest.mark.cp_inter_intra
-@pytest.mark.parametrize("cu_list, g_scale", _FORWARD_CONFIGS)
-@pytest.mark.parametrize("use_h0", [False, True], ids=["zero-seed", "raw-h0"])
-@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
-def test_dual_cp_forward(cu_list, g_scale, use_h0, state_v_first):
-    # GVA as well as both layouts; compare each rank's output and every sequence
-    # final state owned by that rank against the global float64 reference.
-    cfg = (cu_list, 2, 2, 4, g_scale, use_h0, False)
-    mp.start_processes(
-        _cp_forward_worker,
-        args=(2, cfg, state_v_first, _free_port()),
-        nprocs=2, join=True, start_method="spawn",
     )
