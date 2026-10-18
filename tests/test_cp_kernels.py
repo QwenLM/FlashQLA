@@ -310,3 +310,56 @@ def test_aggregate_card_state(
     assert m_no_m is None
     err_no_m = rel_max(h_no_m, h_card)
     assert err_no_m <= 1e-5, f"h_card must not depend on compute_m, rel_max={err_no_m:.2e}"
+
+
+@pytest.mark.gpu
+@pytest.mark.cp_inter_intra
+@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
+@pytest.mark.parametrize("use_raw_h0", [False, True], ids=["zero-seed", "raw-h0"])
+def test_aggregate_card_state_affine_oracle(state_v_first, use_raw_h0):
+    gen = torch.Generator(device=DEVICE).manual_seed(SEED + 3)
+    bounds, H = [0, 1, 4, 9], 4  # singleton and unequal segment counts
+    ht = (torch.randn(bounds[-1], H, K, V, generator=gen, device=DEVICE) * 0.1).bfloat16()
+    # Noncommuting matrices retain enough history to expose order/last-segment errors.
+    mt = (0.7 * torch.eye(K, device=DEVICE) +
+          0.02 * torch.randn(bounds[-1], H, K, K, generator=gen, device=DEVICE)).bfloat16()
+    fallback = torch.ones(bounds[-1], H, dtype=torch.bool, device=DEVICE)
+    for lo, hi in zip(bounds, bounds[1:]):
+        # Head 0 retains history; other heads reset at the first, last, or middle segment.
+        fallback[lo, 1] = fallback[hi - 1, 2] = fallback[(lo + hi) // 2, 3] = False
+    mt[~fallback] = float("nan")  # prepare_h may leave these transitions undefined
+    seed = torch.randn(len(bounds) - 1, H, K, V, generator=gen, device=DEVICE) if use_raw_h0 else None
+
+    # Independent affine composition: [M h; 0 I], without ref_scan's state recurrence.
+    identity = torch.eye(K + V, dtype=torch.float64, device=DEVICE)
+    expected_h, expected_m = [], []
+    for seq, (lo, hi) in enumerate(zip(bounds, bounds[1:])):
+        product = identity.expand(H, -1, -1).clone()
+        for idx in range(lo, hi):
+            affine = identity.expand(H, -1, -1).clone()
+            affine[:, :K, :K] = torch.where(fallback[idx, :, None, None], mt[idx].double(), 0)
+            affine[:, :K, K:] = ht[idx].double()
+            product = affine @ product
+        h = product[:, :K, K:]
+        if seed is not None:
+            # Match the documented communication payload conversion before composition.
+            h = h + product[:, :K, :K] @ seed[seq].to(ht.dtype).double()
+        expected_h.append(h)
+        expected_m.append(product[:, :K, :K])
+
+    def layout(t):
+        return t.transpose(-1, -2).contiguous() if state_v_first else t
+
+    seq_map = torch.tensor(bounds, dtype=torch.int32, device=DEVICE)
+    h_card, m_card = aggregate_card_state(
+        layout(ht), mt, fallback, seq_map,
+        raw_h0=layout(seed) if seed is not None else None, state_v_first=state_v_first,
+    )
+    assert h_card.dtype == m_card.dtype == ht.dtype
+    for name, actual, expected in (
+        ("h", layout(h_card), torch.stack(expected_h)),
+        ("M", m_card, torch.stack(expected_m)),
+    ):
+        assert torch.isfinite(actual).all(), name
+        assert rel_max(actual, expected) <= SCAN_RTOL, name
+    assert torch.count_nonzero(m_card[:, 1:]) == 0
