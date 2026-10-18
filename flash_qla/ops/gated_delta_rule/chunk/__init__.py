@@ -25,7 +25,11 @@ elif tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"]:
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100, sm103, sm120 and sm121 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 # Dual-CP directions are independent: SM120 provides only the forward scan.
-DUAL_CP_FWD_SUPPORTED = aggregate_card_state is not None
+DUAL_CP_FWD_SUPPORTED = (
+    aggregate_card_state is not None
+    and tilelang.contrib.nvcc.get_target_compute_version()
+    in ("9.0", "10.0", "10.3", "12.0")
+)
 DUAL_CP_BWD_SUPPORTED = tilelang.contrib.nvcc.get_target_compute_version() in (
     "9.0", "10.0", "10.3",
 )

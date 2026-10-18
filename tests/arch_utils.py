@@ -13,7 +13,7 @@ run, so tests and profiling stop hard-coding arch names:
 * ``intra``        -- intra-card CP
 * ``inter``        -- inter-card CP
 * ``inter_intra_fwd`` / ``inter_intra_bwd`` -- independent Dual-CP directions.
-  SM120/SM121 provide forward aggregation only; ordinary backward is separate.
+  SM120 provides forward aggregation only; SM121 Dual-CP is unsupported.
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ ARCH_CAPS: dict[str, dict] = {
     "SM100": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra_fwd=True, inter_intra_bwd=True),
     "SM103": dict(chunk_size=64, bwd=True, intra=True, inter=True, inter_intra_fwd=True, inter_intra_bwd=True),
     "SM120": dict(chunk_size=32, bwd=True, intra=True, inter=True, inter_intra_fwd=True, inter_intra_bwd=False),
-    "SM121": dict(chunk_size=32, bwd=True, intra=True, inter=True, inter_intra_fwd=True, inter_intra_bwd=False),
+    "SM121": dict(chunk_size=32, bwd=True, intra=True, inter=True, inter_intra_fwd=False, inter_intra_bwd=False),
 }
 
 # Used when the arch is unknown (no GPU / detection failed). Everything is off, so
