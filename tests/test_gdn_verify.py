@@ -15,6 +15,11 @@ cannot be imported are skipped automatically. Add ``--cuda-graph`` to measure
 GPU latency without Python launch gaps, using 100 ms of graph replays.
 ``--bench-state-only --cuda-graph`` compares full verify with S-only state
 reconstruction on the same inputs and preallocated final-state buffers.
+``--bench-reconstruct --cuda-graph`` measures complete verify + reconstruction
+pairs, including optional NV/prefix cache writes during verify. Accepted lengths
+are GPU tensors; both paths use the original packed input without repacking.
+Add ``--layers 32`` to verify all layers before reconstructing any of them,
+using independent per-layer inputs/states/caches to test a larger working set.
 """
 
 import importlib
@@ -48,7 +53,9 @@ except ModuleNotFoundError:  # pragma: no cover
 
     pytest = _PytestShim()
 
-from flash_qla.ops.gated_delta_rule.chunk.blackwell import gdn_verify_fwd
+from flash_qla.ops.gated_delta_rule.chunk.blackwell import (
+    gdn_verify_fwd, gdn_reconstruct_state,
+)
 
 # Geometry shared by the correctness cases and the speed benchmark.
 GEOM = (16, 48, 128, 128)  # HQ, HV, DK, DV
@@ -338,6 +345,122 @@ def test_gdn_verify_state_only_empty(with_state):
                                rtol=0, atol=0)
 
 
+def packed_prefix_inputs(data, seqlens, accepted):
+    """Independent reference inputs: physically gather the accepted prefixes."""
+    q, k, v, g, beta, _, state = data
+    indices, offset = [], 0
+    for length, keep in zip(seqlens, accepted):
+        indices.extend(range(offset, offset + keep))
+        offset += length
+    indices = torch.tensor(indices, device=k.device, dtype=torch.int64)
+    cu = torch.tensor([0, *accepted], device=k.device, dtype=torch.int32).cumsum(0)
+    return (*(x.index_select(0, indices) for x in (q, k, v, g, beta)), cu, state)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("B,seqlens,io_dtype,with_state,seed", CASES)
+def test_gdn_reconstruct_cache(B, seqlens, io_dtype, with_state, seed):
+    data = make_inputs(B, seqlens, *GEOM, io_dtype, "cuda", seed, with_state)
+    q, k, v, g, beta, cu, state = data
+    nv, prefix = torch.empty_like(v, dtype=torch.float32), torch.empty_like(g)
+    o_full, s_full = gdn_verify_fwd(q, k, v, g, beta, cu, initial_state=state)
+    o, s = gdn_verify_fwd(
+        q, k, v, g, beta, cu, initial_state=state, nv_cache=nv, gate_cache=prefix,
+    )
+    torch.testing.assert_close(o, o_full, rtol=0, atol=0)
+    torch.testing.assert_close(s, s_full, rtol=0, atol=0)
+    choices = ([i] for i in range(seqlens[0] + 1)) if B == 1 else (
+        [0] * B, [n // 2 for n in seqlens], seqlens,
+        [min(n, (i * 7) % 17) for i, n in enumerate(seqlens)],
+    )
+    for accepted in choices:
+        lengths = torch.tensor(accepted, dtype=torch.int32, device="cuda")
+        gathered = packed_prefix_inputs(data, seqlens, accepted)
+        _, expected = gdn_verify_fwd(*gathered[:-1], initial_state=state)
+        _, reference = gdn_recurrent_ref(*gathered[:-1], initial_state=state)
+        _, replay = gdn_verify_fwd(
+            None, k, v, g, beta, cu, initial_state=state,
+            accepted_lengths=lengths, state_only=True,
+        )
+        actual = gdn_reconstruct_state(k, nv, prefix, cu, lengths, initial_state=state)
+        assert rel_err(replay, expected) < 1e-5
+        assert rel_err(actual, expected) < 1e-5
+        assert rel_err(actual, reference) < (6e-2 if io_dtype == torch.bfloat16 else 2e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("B", [3, 8])
+@pytest.mark.parametrize("io_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("with_state", [False, True])
+def test_gdn_reconstruct_cache_repeated(B, io_dtype, with_state):
+    seqlens = [16] * B
+    accepted = [0, 16, 1] if B == 3 else [0, 16, 1, 2, 3, 8, 15, 0]
+    data = make_inputs(B, seqlens, *GEOM, io_dtype, "cuda", 29, with_state)
+    q, k, v, g, beta, cu, initial = data
+    g.zero_()
+    beta.fill_(1)
+    nv, prefix = torch.empty_like(v, dtype=torch.float32), torch.empty_like(g)
+    gdn_verify_fwd(
+        q, k, v, g, beta, cu, initial_state=initial, nv_cache=nv, gate_cache=prefix,
+    )
+    gathered = packed_prefix_inputs(data, seqlens, accepted)
+    _, expected = gdn_recurrent_ref(*gathered[:-1], initial_state=initial)
+    lengths = torch.tensor(accepted, dtype=torch.int32, device="cuda")
+    # Rejected rows must not contaminate any accepted-prefix reconstruction.
+    for i, keep in enumerate(accepted):
+        k[i * 16 + keep:(i + 1) * 16].fill_(float("nan"))
+        nv[i * 16 + keep:(i + 1) * 16].fill_(float("nan"))
+        prefix[i * 16 + keep:(i + 1) * 16].fill_(float("nan"))
+    output = torch.empty_like(expected)
+    for _ in range(3):
+        if with_state:
+            output.copy_(initial)
+        else:
+            output.fill_(float("nan"))
+        actual = gdn_reconstruct_state(
+            k, nv, prefix, cu, lengths,
+            initial_state=output if with_state else None, final_state=output,
+        )
+        assert actual is output
+        assert rel_err(actual, expected) < (3e-3 if with_state else 3e-5)
+        torch.testing.assert_close(actual[0], initial[0] if with_state else
+                                   torch.zeros_like(actual[0]), rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("with_state", [False, True])
+def test_gdn_reconstruct_cache_empty(with_state):
+    q, k, v, g, beta, cu, initial = make_inputs(
+        2, [0, 0], *GEOM, torch.bfloat16, "cuda", with_state=with_state,
+    )
+    nv, prefix = torch.empty_like(v, dtype=torch.float32), torch.empty_like(g)
+    gdn_verify_fwd(
+        q, k, v, g, beta, cu, initial_state=initial, nv_cache=nv, gate_cache=prefix,
+    )
+    lengths = torch.zeros(2, dtype=torch.int32, device="cuda")
+    actual = gdn_reconstruct_state(k, nv, prefix, cu, lengths, initial_state=initial)
+    torch.testing.assert_close(actual, initial if with_state else torch.zeros_like(actual),
+                               rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("B", [1, 8])
+def test_gdn_verify_cache_state_only(B):
+    q, k, v, g, beta, cu, initial = make_inputs(
+        B, [16] * B, *GEOM, torch.bfloat16, "cuda",
+    )
+    nv, prefix = torch.empty_like(v, dtype=torch.float32), torch.empty_like(g)
+    _, expected = gdn_verify_fwd(q, k, v, g, beta, cu, initial_state=initial)
+    o, actual = gdn_verify_fwd(
+        None, k, v, g, beta, cu, initial_state=initial, state_only=True,
+        nv_cache=nv, gate_cache=prefix,
+    )
+    assert o is None and rel_err(actual, expected) < 1e-5
+    lengths = torch.full((B,), 16, dtype=torch.int32, device="cuda")
+    reconstructed = gdn_reconstruct_state(k, nv, prefix, cu, lengths, initial_state=initial)
+    assert rel_err(reconstructed, expected) < 1e-5
+
+
 def run_correctness():
     """Run every CASES entry against the recurrent reference; return all-pass."""
     print(f"{'B':>3} {'seqlens':<26} {'dtype':<10} {'state':<6} "
@@ -388,6 +511,21 @@ def run_correctness():
     for with_state in (False, True):
         test_gdn_verify_state_only_empty(with_state)
         print(f"state-only empty, initial_state={with_state}: PASS")
+    for case in CASES:
+        test_gdn_reconstruct_cache(*case)
+        print(f"cached reconstruction, B={case[0]}, {case[2]}: PASS")
+    for B in (3, 8):
+        for io_dtype in (torch.bfloat16, torch.float16):
+            for with_state in (False, True):
+                test_gdn_reconstruct_cache_repeated(B, io_dtype, with_state)
+                print(f"cached reconstruction repeated/in-place, B={B}, {io_dtype}, "
+                      f"initial_state={with_state}: PASS")
+    for with_state in (False, True):
+        test_gdn_reconstruct_cache_empty(with_state)
+        print(f"cached reconstruction empty, initial_state={with_state}: PASS")
+    for B in (1, 8):
+        test_gdn_verify_cache_state_only(B)
+        print(f"cache from state-only verify, B={B}: PASS")
     return ok
 
 
@@ -488,6 +626,139 @@ def run_state_only_benchmark(configs=STATE_ONLY_BENCH_CONFIGS, iters=200,
               f"{r['full_us']:>11.3f} {r['state_only_us']:>12.3f} "
               f"{r['full_us'] / r['state_only_us']:>8.2f}x {r['es']:>10.2e}",
               flush=True)
+
+
+RECONSTRUCT_BENCH_CONFIGS = [
+    (B, accepted, torch.bfloat16)
+    for B in (1, 4, 16, 64, 128) for accepted in (1, 8, 16)
+] + [(16, "mixed", torch.bfloat16), (128, "mixed", torch.bfloat16)]
+
+
+def make_reconstruct_runs(B, accepted, io_dtype, seed=0):
+    q, k, v, g, beta, cu, initial = make_inputs(
+        B, [16] * B, *GEOM, io_dtype, "cuda", seed=seed,
+    )
+    if accepted == "mixed":
+        keeps = ([0, 16, 1, 8, 4, 15, 2, 12] * ((B + 7) // 8))[:B]
+    else:
+        keeps = [accepted] * B
+    lengths = torch.tensor(keeps, device="cuda", dtype=torch.int32)
+    nv, prefix = torch.empty_like(v, dtype=torch.float32), torch.empty_like(g)
+    out_plain, out_cached = torch.empty_like(v), torch.empty_like(v)
+    full_plain, full_cached = torch.empty_like(initial), torch.empty_like(initial)
+    state_plain, state_cached = torch.empty_like(initial), torch.empty_like(initial)
+
+    def verify():
+        return gdn_verify_fwd(
+            q, k, v, g, beta, cu, initial_state=initial,
+            out=out_plain, final_state=full_plain,
+        )
+
+    def verify_cache():
+        return gdn_verify_fwd(
+            q, k, v, g, beta, cu, initial_state=initial,
+            out=out_cached, final_state=full_cached, nv_cache=nv, gate_cache=prefix,
+        )
+
+    def replay():
+        return gdn_verify_fwd(
+            None, k, v, g, beta, cu, initial_state=initial,
+            final_state=state_plain, state_only=True, accepted_lengths=lengths,
+        )
+
+    def reconstruct():
+        return gdn_reconstruct_state(
+            k, nv, prefix, cu, lengths, initial_state=initial, final_state=state_cached,
+        )
+
+    def plain_total():
+        verify()
+        replay()
+
+    def cached_total():
+        verify_cache()
+        reconstruct()
+
+    plain_total()
+    cached_total()
+    eo, es = rel_err(out_cached, out_plain), rel_err(state_cached, state_plain)
+    assert eo < 1e-5 and es < 1e-5, (eo, es)
+    assert rel_err(full_cached, full_plain) < 1e-5
+    runs = {"plain_total": plain_total, "cached_total": cached_total,
+            "verify": verify, "verify_cache": verify_cache,
+            "replay": replay, "reconstruct": reconstruct}
+    return runs, {"eo": eo, "es": es,
+                  "cache_bytes": nv.numel() * 4 + prefix.numel() * 4}
+
+
+def bench_reconstruct_one(B, accepted, io_dtype, iters=200, warmup=20,
+                          cuda_graph=False):
+    runs, errors = make_reconstruct_runs(B, accepted, io_dtype)
+    times = {name: [] for name in runs}
+    for repeat in range(3):
+        for name in (list(runs) if repeat % 2 == 0 else list(runs)[::-1]):
+            times[name].append(time_call(runs[name], iters, warmup, cuda_graph))
+    result = {name: statistics.median(values) for name, values in times.items()}
+    result.update(errors)
+    return result
+
+
+def run_reconstruct_benchmark(configs=RECONSTRUCT_BENCH_CONFIGS, iters=200,
+                               warmup=20, cuda_graph=False):
+    print(f"GPU: {torch.cuda.get_device_properties(0).name}")
+    print(f"geom: HQ={GEOM[0]} HV={GEOM[1]} DK={GEOM[2]} DV={GEOM[3]}; verify T=16")
+    print(f"cache: {16 * GEOM[1] * (GEOM[3] + 1) * 4 / 1024:.0f} KiB per sequence")
+    print(f"timing: {'CUDA Graph' if cuda_graph else 'CUDA events'}; "
+          "median of 3 alternating runs; all outputs/caches preallocated")
+    print("Total timings capture both kernels together, including cache writes; "
+          "component timings are measured separately. All times in us.")
+    print("A=16 still executes reconstruction for comparison; an application "
+          "can reuse verify's final state when all tokens are accepted.")
+    print(f"{'B':>4} {'A':>5} {'verify':>9} {'verify+C':>9} {'replay':>9} "
+          f"{'from C':>9} {'old total':>10} {'new total':>10} {'speedup':>8} {'S err':>9}")
+    for B, accepted, io_dtype in configs:
+        r = bench_reconstruct_one(B, accepted, io_dtype, iters, warmup, cuda_graph)
+        print(f"{B:>4} {str(accepted):>5} {r['verify']:>9.3f} {r['verify_cache']:>9.3f} "
+              f"{r['replay']:>9.3f} {r['reconstruct']:>9.3f} "
+              f"{r['plain_total']:>10.3f} {r['cached_total']:>10.3f} "
+              f"{r['plain_total'] / r['cached_total']:>7.2f}x {r['es']:>9.1e}", flush=True)
+
+
+def run_reconstruct_layers_benchmark(layers=32, iters=200, warmup=20,
+                                      cuda_graph=False):
+    print(f"GPU: {torch.cuda.get_device_properties(0).name}")
+    print(f"{layers} independent GDN layers, T=16, A=8, BF16 inputs / FP32 states")
+    print("Schedule: verify every layer, then reconstruct every layer; "
+          "no other model operations. Buffers preallocated, median of 3 alternating runs.")
+    print(f"{'B':>4} {'old total(us)':>14} {'new total(us)':>14} "
+          f"{'old/layer':>11} {'new/layer':>11} {'speedup':>8} {'S err':>9}")
+    for B in (1, 4, 16):
+        layer_runs, errors = zip(*(
+            make_reconstruct_runs(B, 8, torch.bfloat16, seed=i) for i in range(layers)
+        ))
+
+        def plain():
+            for runs in layer_runs:
+                runs["verify"]()
+            for runs in layer_runs:
+                runs["replay"]()
+
+        def cached():
+            for runs in layer_runs:
+                runs["verify_cache"]()
+            for runs in layer_runs:
+                runs["reconstruct"]()
+
+        old_times, new_times = [], []
+        for repeat in range(3):
+            order = ((plain, old_times), (cached, new_times))
+            for run, times in (order if repeat % 2 == 0 else reversed(order)):
+                times.append(time_call(run, iters, warmup, cuda_graph))
+        old, new = statistics.median(old_times), statistics.median(new_times)
+        print(f"{B:>4} {old:>14.3f} {new:>14.3f} {old / layers:>11.3f} "
+              f"{new / layers:>11.3f} {old / new:>7.2f}x "
+              f"{max(r['es'] for r in errors):>9.1e}", flush=True)
+        del layer_runs
 
 
 def build_backends(data, scale, geom, device):
@@ -666,10 +937,19 @@ def test_gdn_verify_bench_smoke():
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if "--bench" in args or "--bench-state-only" in args:
+    if any(flag in args for flag in ("--bench", "--bench-state-only", "--bench-reconstruct")):
         iters = int(args[args.index("--iters") + 1]) if "--iters" in args else 200
         warmup = int(args[args.index("--warmup") + 1]) if "--warmup" in args else 20
-        benchmark = run_state_only_benchmark if "--bench-state-only" in args else run_benchmark
+        if "--bench-reconstruct" in args:
+            layers = int(args[args.index("--layers") + 1]) if "--layers" in args else 1
+            if layers > 1:
+                run_reconstruct_layers_benchmark(
+                    layers, iters=iters, warmup=warmup, cuda_graph="--cuda-graph" in args,
+                )
+                raise SystemExit(0)
+            benchmark = run_reconstruct_benchmark
+        else:
+            benchmark = run_state_only_benchmark if "--bench-state-only" in args else run_benchmark
         benchmark(iters=iters, warmup=warmup, cuda_graph="--cuda-graph" in args)
     else:
         ok = run_correctness()

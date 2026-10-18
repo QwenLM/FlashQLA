@@ -16,6 +16,8 @@ The state update splits its FP32 right operand into two bf16/fp16 pieces;
 accumulating both avoids rounding NV to just one low-precision operand.
 The state-only specialization omits Q loads, Q projections, and O entirely
 for SSM state reconstruction after verify.
+Optionally caching FP32 NV and c lets reconstruction apply just the accepted
+rank-a state update, reusing the original initial state and verify inputs.
 """
 
 from typing import Optional
@@ -50,12 +52,17 @@ def tilelang_gdn_verify_fwd(
     store_final_state,
     block_DV=128,
     state_only=False,
+    store_cache=False,
+    use_accepted_lengths=False,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
     block_S = chunk_size
     group = HV // HQ
     projection_rows = block_S if state_only else 2 * block_S
+    cache_dtype = accum_dtype if store_cache else qkva_dtype
+    prefix_dtype = accum_dtype if store_cache else g_dtype
+    num_lengths = T.dynamic("num_lengths")
 
     @T.prim_func
     def tilelang_gdn_verify_fwd_kernel(
@@ -68,6 +75,9 @@ def tilelang_gdn_verify_fwd(
         h0: T.Tensor((batch_size, HV, DK, DV), h0_dtype),
         o: T.Tensor((num_tokens, HV, DV), o_dtype),
         ht: T.Tensor((batch_size, HV, DK, DV), ht_dtype),
+        nv_cache: T.Tensor((num_tokens, HV, DV), cache_dtype),
+        gate_cache: T.Tensor((num_tokens, HV), prefix_dtype),
+        accepted_lengths: T.Tensor((num_lengths,), seqlen_dtype),
     ):
         with T.Kernel(batch_size * HV * (DV // block_DV), threads=128) as (block,):
             # Prevent ptxas from trading occupancy for excessive live registers.
@@ -79,7 +89,7 @@ def tilelang_gdn_verify_fwd(
             bhg = bh // group
             dv_start = bv * block_DV
             bos = cu_seqlens[bb]
-            eos = cu_seqlens[bb + 1]
+            eos = bos + accepted_lengths[bb] if use_accepted_lengths else cu_seqlens[bb + 1]
             tx = T.get_thread_binding()
 
             qk_shared = T.alloc_shared((2 * block_S, DK), qkva_dtype)
@@ -137,6 +147,10 @@ def tilelang_gdn_verify_fwd(
                     cumprod_shared[tx] = T.exp2(gate_local[0] * LOG2E)
                     decay_shared[tx] = T.exp2((gate_last - gate_local[0]) * LOG2E)
                     b_shared[tx] = T.if_then_else(bos + tx < eos, b[bos + tx, bh], 0.0)
+                    if store_cache:
+                        # DV tiles share the same prefix; only one may write it.
+                        if bv == 0 and bos + tx < eos:
+                            gate_cache[bos + tx, bh] = gate_local[0]
 
             T.gemm(
                 qk_shared, qk_shared[:block_S, :], kkqk_fragment,
@@ -189,6 +203,11 @@ def tilelang_gdn_verify_fwd(
                 if tx < block_DV:
                     nv_shared[i, tx] = nv_local[i]
 
+            if store_cache:
+                for i, d in T.Parallel(block_S, block_DV):
+                    if bos + i < eos:
+                        nv_cache[bos + i, bh, dv_start + d] = nv_shared[i, d]
+
             if not state_only:
                 T.gemm(wqk_shared, nv_shared, o_fragment, clear_accum=True)
                 if use_initial_state:
@@ -236,6 +255,9 @@ def gdn_verify_fwd(
     out: Optional[torch.Tensor] = None,
     chunk_size: int = 16,
     state_only: bool = False,
+    nv_cache: Optional[torch.Tensor] = None,
+    gate_cache: Optional[torch.Tensor] = None,
+    accepted_lengths: Optional[torch.Tensor] = None,
 ):
     """GDN verify forward; every sequence must contain at most 16 tokens.
 
@@ -251,6 +273,18 @@ def gdn_verify_fwd(
     Set state_only=True for SSM state reconstruction: returns (None,
     final_state), skips all Q/O work and O allocation, and permits q=None.
     In this mode q, scale, and out are ignored; a supplied out is unchanged.
+
+    To cache verify intermediates for gdn_reconstruct_state, supply both
+    nv_cache (total, HV, 128) and gate_cache (total, HV), contiguous fp32
+    output buffers that do not alias inputs or other outputs. The returned
+    pair is unchanged. Preserve the original initial_state until reconstruction;
+    the cache is tied to that state and these K/V/g/beta inputs.
+
+    accepted_lengths optionally selects each sequence's prefix without
+    repacking inputs or changing cu_seqlens. It is a CUDA int32 tensor (B,)
+    with 0 <= accepted_lengths[b] <= cu_seqlens[b+1] - cu_seqlens[b] <= 16.
+    This also permits an uncached state-only replay on the original inputs.
+    Only selected prefixes are written to out and cache buffers.
     """
     if state_only:
         # Unused tensor argument; no Q tensor or O allocation is needed.
@@ -264,6 +298,19 @@ def gdn_verify_fwd(
     assert HV % HQ == 0, "GVA requires HV % HQ == 0"
     assert DK == DV == 128, f"unsupported geometry DK={DK} DV={DV}"
     assert chunk_size == 16, "GDN verify requires chunk_size=16"
+    store_cache = nv_cache is not None
+    if store_cache != (gate_cache is not None):
+        raise ValueError("nv_cache and gate_cache must be supplied together")
+    if store_cache:
+        for name, cache, shape in (
+            ("nv_cache", nv_cache, (total, HV, DV)),
+            ("gate_cache", gate_cache, (total, HV)),
+        ):
+            if (cache.shape != shape or cache.dtype != torch.float32
+                    or cache.device != k.device or not cache.is_contiguous()):
+                raise ValueError(f"{name} must be contiguous fp32 {shape} on {k.device}")
+    if accepted_lengths is not None:
+        _check_accepted_lengths(accepted_lengths, batch, k.device)
 
     if cu_seqlens.dtype != torch.int32:
         cu_seqlens = cu_seqlens.to(torch.int32)
@@ -294,7 +341,131 @@ def gdn_verify_fwd(
         # Small batches need more CTAs; large batches reuse Q/K across all DV.
         block_DV=64 if batch * HV <= 192 else 128,
         state_only=state_only,
+        store_cache=store_cache,
+        use_accepted_lengths=accepted_lengths is not None,
     )
+    # Disabled cache/length specializations ignore the input placeholders.
     kernel(q, k, v, g, beta, cu_seqlens, initial_state,
-           v if state_only else out, final_state)
+           v if state_only else out, final_state,
+           nv_cache if store_cache else v, gate_cache if store_cache else g,
+           cu_seqlens if accepted_lengths is None else accepted_lengths)
     return None if state_only else out, final_state
+
+
+def _check_accepted_lengths(lengths, batch, device):
+    if (lengths.shape != (batch,) or lengths.dtype != torch.int32
+            or lengths.device != device or not lengths.is_contiguous()):
+        raise ValueError(f"accepted_lengths must be contiguous int32 ({batch},) on {device}")
+
+
+@tilelang.jit(
+    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+)
+def tilelang_gdn_reconstruct_state(
+    HQ, HV, DK, DV, io_dtype, h0_dtype, ht_dtype, use_initial_state,
+    block_DV=128,
+):
+    batch = T.dynamic("batch")
+    total = T.dynamic("total")
+    block_S = 16
+
+    @T.prim_func
+    def tilelang_gdn_reconstruct_state_kernel(
+        k: T.Tensor((total, HQ, DK), io_dtype),
+        nv: T.Tensor((total, HV, DV), "float32"),
+        prefix: T.Tensor((total, HV), "float32"),
+        cu_seqlens: T.Tensor((batch + 1,), "int32"),
+        accepted: T.Tensor((batch,), "int32"),
+        h0: T.Tensor((batch, HV, DK, DV), h0_dtype),
+        ht: T.Tensor((batch, HV, DK, DV), ht_dtype),
+    ):
+        with T.Kernel(batch * HV * (DV // block_DV), threads=128) as block:
+            T.annotate_min_blocks_per_sm(4)
+            bv = block % (DV // block_DV)
+            bh = (block // (DV // block_DV)) % HV
+            bb = block // ((DV // block_DV) * HV)
+            bhg = bh // (HV // HQ)
+            dv_start = bv * block_DV
+            bos = cu_seqlens[bb]
+            length = accepted[bb]
+            tx = T.get_thread_binding()
+            k_shared = T.alloc_shared((block_S, DK), io_dtype)
+            hi_shared = T.alloc_shared((block_S, block_DV), io_dtype)
+            lo_shared = T.alloc_shared((block_S, block_DV), io_dtype)
+            decay_shared = T.alloc_shared((block_S,), "float32", scope="shared")
+            state_fragment = T.alloc_fragment((DK, block_DV), "float32")
+
+            # A prefix of NV depends only on that prefix, never later drafts.
+            c_last = T.if_then_else(length > 0, prefix[bos + length - 1, bh], 0.0)
+            if tx < block_S:
+                decay_shared[tx] = T.if_then_else(
+                    tx < length,
+                    T.exp2((c_last - prefix[bos + tx, bh]) * LOG2E), 0.0,
+                )
+            for i, d in T.Parallel(block_S, DK):
+                k_shared[i, d] = T.if_then_else(i < length, k[bos + i, bhg, d], 0.0)
+            for i, d in T.Parallel(block_S, block_DV):
+                scaled_nv = T.if_then_else(
+                    i < length, decay_shared[i] * nv[bos + i, bh, dv_start + d], 0.0,
+                )
+                hi = T.cast(scaled_nv, io_dtype)
+                hi_shared[i, d] = hi
+                lo_shared[i, d] = scaled_nv - T.cast(hi, "float32")
+            T.gemm(k_shared, hi_shared, state_fragment,
+                   transpose_A=True, clear_accum=True)
+            T.gemm(k_shared, lo_shared, state_fragment, transpose_A=True)
+            decay = T.exp2(c_last * LOG2E)
+            for d, e in T.Parallel(DK, block_DV):
+                if use_initial_state:
+                    state_fragment[d, e] += decay * h0[bb, bh, d, dv_start + e]
+                ht[bb, bh, d, dv_start + e] = state_fragment[d, e]
+
+    return tilelang_gdn_reconstruct_state_kernel
+
+
+def gdn_reconstruct_state(
+    k: torch.Tensor,
+    nv_cache: torch.Tensor,
+    gate_cache: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    accepted_lengths: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    final_state: Optional[torch.Tensor] = None,
+):
+    """Reconstruct accepted-prefix states from gdn_verify_fwd's fp32 caches.
+
+    k and cu_seqlens describe the original verify input, without repacking.
+    accepted_lengths is a CUDA int32 (B,) tensor, bounded by each verified
+    sequence's length (0..16). Pass the same initial state used by verify,
+    or None for a zero initial state. final_state may alias initial_state.
+    Returns final_state in K-major (B, HV, 128, 128) layout.
+    """
+    total, HQ, DK = k.shape
+    HV, DV = nv_cache.shape[1:]
+    batch = cu_seqlens.numel() - 1
+    assert DK == DV == 128 and HV % HQ == 0
+    _check_accepted_lengths(accepted_lengths, batch, k.device)
+    for name, cache, shape in (
+        ("nv_cache", nv_cache, (total, HV, DV)),
+        ("gate_cache", gate_cache, (total, HV)),
+    ):
+        if (cache.shape != shape or cache.dtype != torch.float32
+                or cache.device != k.device or not cache.is_contiguous()):
+            raise ValueError(f"{name} must be contiguous fp32 {shape} on {k.device}")
+    if cu_seqlens.dtype != torch.int32:
+        cu_seqlens = cu_seqlens.to(torch.int32)
+    use_initial_state = initial_state is not None
+    if final_state is None:
+        final_state = torch.empty(
+            (batch, HV, DK, DV), device=k.device,
+            dtype=initial_state.dtype if use_initial_state else torch.float32,
+        )
+    if initial_state is None:
+        initial_state = final_state
+    kernel = tilelang_gdn_reconstruct_state(
+        HQ, HV, DK, DV, k.dtype, initial_state.dtype, final_state.dtype,
+        use_initial_state, block_DV=64 if batch * HV <= 192 else 128,
+    )
+    kernel(k, nv_cache, gate_cache, cu_seqlens, accepted_lengths,
+           initial_state, final_state)
+    return final_state
