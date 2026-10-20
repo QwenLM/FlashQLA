@@ -53,6 +53,14 @@ CONFIGS = [
     pytest.param([0, 3072, 6144, 9216], 2, 4, 4, 1.0, id="three-ws2"),
 ]
 
+# enable_intra composes the intra-card occupancy split on top of the zigzag ownership
+# (Stage B); it needs the combined inter+intra capability (aggregate_card_state), gated in
+# conftest via the cp_inter_intra marker.
+MODES = [
+    pytest.param(False, id="inter"),
+    pytest.param(True, id="inter_intra", marks=pytest.mark.cp_inter_intra),
+]
+
 _GRAD_LEAF = {"dq": "q", "dk": "k", "dv": "v", "dg": "g", "db": "beta"}
 
 
@@ -109,7 +117,7 @@ def _reference(q, k, v, g, beta, cu_g, scale):
     return dict(o=o_r, dq=dq, dk=dk, dv=dv, db=db, dg=dg)
 
 
-def _run_and_check(rank, world_size, cfg, state_v_first, group):
+def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group):
     cu_list, _, Hk, Hv, g_scale = cfg
     T = cu_list[-1]
 
@@ -121,8 +129,8 @@ def _run_and_check(rank, world_size, cfg, state_v_first, group):
     ref = _reference(q, k, v, g, beta, cu_g, scale)
 
     ctx = build_cp_context(
-        cu_g, group=group, enable_inter=True, enable_intra=False,
-        num_v_heads=Hv, is_train=True, zigzag=True,
+        cu_g, group=group, enable_inter=True, enable_intra=enable_intra,
+        num_v_heads=Hv, is_train=True, zigzag=True, force_intra_cp=enable_intra,
     )
 
     idx = _zigzag_owned_idx(cu_list, world_size, rank, q.device)
@@ -139,16 +147,16 @@ def _run_and_check(rank, world_size, cfg, state_v_first, group):
     o.float().sum().backward()
     dist.barrier()
 
-    tag = f"[rank{rank}/{world_size} zigzag]"
+    tag = f"[rank{rank}/{world_size} zigzag {'inter_intra' if enable_intra else 'inter'}]"
     assert_relative(o, ref["o"][:, idx], f"{tag} o")
     for gname, lname in _GRAD_LEAF.items():
         assert_relative(leaves[lname].grad, ref[gname][:, idx], f"{tag} {gname}")
 
 
-def _cp_worker(rank, world_size, cfg, state_v_first, port):
+def _cp_worker(rank, world_size, enable_intra, cfg, state_v_first, port):
     try:
         group = _init_distributed(rank, world_size, port)
-        _run_and_check(rank, world_size, cfg, state_v_first, group)
+        _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group)
     finally:
         _cleanup_distributed()
 
@@ -158,15 +166,17 @@ def _cp_worker(rank, world_size, cfg, state_v_first, port):
 @pytest.mark.needs_bwd
 @pytest.mark.multigpu
 @pytest.mark.parametrize("cu_list, world_size, num_k_heads, num_v_heads, g_scale", CONFIGS)
+@pytest.mark.parametrize("enable_intra", MODES)
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
-def test_cp_zigzag(cu_list, world_size, num_k_heads, num_v_heads, g_scale, state_v_first):
+def test_cp_zigzag(cu_list, world_size, num_k_heads, num_v_heads, g_scale,
+                   enable_intra, state_v_first):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs >= {world_size} GPUs, found {torch.cuda.device_count()}")
 
     cfg = (cu_list, world_size, num_k_heads, num_v_heads, g_scale)
     mp.start_processes(
         _cp_worker,
-        args=(world_size, cfg, state_v_first, _free_port()),
+        args=(world_size, enable_intra, cfg, state_v_first, _free_port()),
         nprocs=world_size,
         join=True,
         start_method="spawn",
