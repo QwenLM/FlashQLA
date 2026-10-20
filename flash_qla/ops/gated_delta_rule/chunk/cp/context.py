@@ -47,6 +47,19 @@ class FlashQLACPContext:
     conv1d_kernel_size: int | None = None
     pre_num_conv_tokens: int | None = None
 
+    # --- inter-card zigzag layout ---
+    # zigzag spreads a document's NC=2*cp chunks non-contiguously: rank r owns chunk r
+    # and chunk NC-1-r of every doc. The fold then runs per document in chunk order over
+    # the full all-gathered (h, M) buffer, reusing correct_initial_states. All tensors are
+    # built in build_cp_context(zigzag=True); the framework only feeds each rank its chunks
+    # in the agreed [early-halves d=0..D-1, late-halves d=0..D-1] layout.
+    is_zigzag: bool = False
+    num_docs: int = 0                                        # D documents in the pack
+    num_chunks: int = 0                                      # NC = 2 * cp_size
+    chunk_to_gathered_slot: torch.Tensor | None = None       # [D*NC] doc-chunk slot -> gather index
+    fold_seq_map: torch.Tensor | None = None                 # [D+1] per-doc groups for the fold
+    owned_fold_slot: torch.Tensor | None = None              # [n_local] local seg -> fold output slot
+
     # --- intra-card ---
     intra_cp_cu_seqlens: torch.Tensor | None = None
     seq_map_r2c: torch.Tensor | None = None
@@ -67,7 +80,15 @@ class FlashQLACPContext:
             post_num_ranks=self.post_num_ranks,
             conv1d_kernel_size=self.conv1d_kernel_size,
             pre_num_conv_tokens=self.pre_num_conv_tokens,
+            is_zigzag=self.is_zigzag,
+            num_docs=self.num_docs,
+            num_chunks=self.num_chunks,
         )
+        # the fold reindex tensors are the same for fwd and bwd gathers; carry them.
+        if self.is_zigzag:
+            copied.chunk_to_gathered_slot = self.chunk_to_gathered_slot.clone()
+            copied.fold_seq_map = self.fold_seq_map.clone()
+            copied.owned_fold_slot = self.owned_fold_slot.clone()
         # carry the intra-level partition tensors whenever the intra split is active.
         if self.is_intra:
             copied.intra_cp_cu_seqlens = (
@@ -108,6 +129,7 @@ def build_cp_context(
     g: torch.Tensor | None = None,
     is_train: bool = True,
     force_intra_cp: bool = False,
+    zigzag: bool = False,
 ) -> FlashQLACPContext:
     """Unified CP-context builder over the canonical ``(cu_seqlens, num_v_heads)``.
     ``enable_inter``/``enable_intra`` select the mode: (T,F) pure inter | (F,T) pure
@@ -141,6 +163,44 @@ def build_cp_context(
             RuntimeWarning, stacklevel=2,
         )
         enable_intra = False
+
+    if zigzag:
+        # zigzag is an inter-card layout. Short-conv halo (contiguous previous card) does
+        # not hold under zigzag, so it is rejected for now.
+        assert enable_inter and group is not None, "zigzag requires inter-card CP with a group"
+        assert conv1d_kernel_size is None, "zigzag with short-conv halo is not implemented yet"
+        inter_ctx = _calc_inter_cp_seqs_zigzag(
+            cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, group=group,
+        )
+        if not (enable_intra and num_v_heads is not None):
+            return inter_ctx
+        # intra splits each owned chunk (its own local segment) for occupancy; the inter
+        # zigzag fold then runs at per-owned-chunk granularity on the aggregated states.
+        intra_ctx = _calc_intra_cp_seqs(
+            raw_cu_seqlens=inter_ctx.cu_seqlens, chunk_size=CHUNK_SIZE,
+            num_v_heads=num_v_heads, g=g if AUTOCP_MODEL else None,
+            is_train=is_train, force_intra_cp=force_intra_cp,
+        )
+        return FlashQLACPContext(
+            is_inter=True,
+            is_intra=intra_ctx.is_intra,
+            is_zigzag=True,
+            group=group,
+            cu_seqlens=inter_ctx.cu_seqlens,
+            cu_seqlens_cpu=inter_ctx.cu_seqlens_cpu,
+            is_first_rank=inter_ctx.is_first_rank,
+            is_last_rank=inter_ctx.is_last_rank,
+            num_docs=inter_ctx.num_docs,
+            num_chunks=inter_ctx.num_chunks,
+            chunk_to_gathered_slot=inter_ctx.chunk_to_gathered_slot,
+            fold_seq_map=inter_ctx.fold_seq_map,
+            owned_fold_slot=inter_ctx.owned_fold_slot,
+            intra_cp_cu_seqlens=intra_ctx.intra_cp_cu_seqlens,
+            seq_map_r2c=intra_ctx.seq_map_r2c,
+            seq_map_c2r=intra_ctx.seq_map_c2r,
+            ht_mask=intra_ctx.ht_mask,
+            ht_mask_bwd=intra_ctx.ht_mask_bwd,
+        )
 
     if enable_inter and enable_intra:
         assert group is not None and num_v_heads is not None
@@ -265,6 +325,88 @@ def _calc_inter_cp_seqs(
         conv1d_kernel_size=conv1d_kernel_size,
         pre_num_conv_tokens=pre_num_conv_tokens,
     )
+
+# ---------------------------------------------------------------------------
+# build inter-card zigzag context
+# ---------------------------------------------------------------------------
+@tensor_cache
+def _calc_inter_cp_seqs_zigzag(
+    cu_seqlens: torch.LongTensor,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    world_size: int | None = None,
+    rank: int | None = None,
+    group: "dist.ProcessGroup | None" = None,
+) -> FlashQLACPContext:
+    """Inter-card context for the zigzag layout: rank ``r`` owns chunk ``r`` and chunk
+    ``NC-1-r`` (NC = 2*cp) of every document. Each owned chunk becomes its own local
+    varlen segment, laid out as ``[early halves d=0..D-1, late halves d=0..D-1]`` -- the
+    order the framework must feed this rank's tokens in. Builds the reindex that maps the
+    all-gathered per-chunk ``(h, M)`` into per-document chunk order plus the extraction
+    that reads each owned chunk's folded entering state back out."""
+    if world_size is None:
+        assert group is not None
+        world_size = dist.get_world_size(group=group)
+        rank = dist.get_rank(group=group)
+
+    if cu_seqlens_cpu is None:
+        cu_seqlens_cpu = cu_seqlens.cpu()
+    cu_seqlens_cpu = cu_seqlens_cpu.to(dtype=torch.long)
+
+    device = cu_seqlens.device
+    cp = world_size
+    NC = 2 * cp
+    D = len(cu_seqlens_cpu) - 1
+    doc_lens = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).tolist()
+    for d, L in enumerate(doc_lens):
+        assert L % NC == 0, (
+            f"zigzag requires every doc length divisible by num_chunks={NC}; doc {d} "
+            f"has length {L}. Pad the document to a multiple of 2*cp."
+        )
+
+    # local segments: early halves (chunk r) then late halves (chunk NC-1-r), each of
+    # length L_d / NC.
+    chunk_lens = [L // NC for L in doc_lens]
+    local_lens = chunk_lens + chunk_lens
+    local_cu = [0]
+    for cl in local_lens:
+        local_cu.append(local_cu[-1] + cl)
+    local_cu_cpu = torch.tensor(local_cu, dtype=torch.int32)
+    local_cu_gpu = local_cu_cpu.to(device=device, non_blocking=True)
+
+    n_local = 2 * D
+    # doc-chunk-order slot p = d*NC + c -> flat all-gather index rank_g*n_local + local_seg.
+    c2g = torch.empty(D * NC, dtype=torch.long)
+    for d in range(D):
+        for c in range(NC):
+            if c < cp:
+                rank_g, local_seg = c, d              # early half on rank c
+            else:
+                rank_g, local_seg = NC - 1 - c, D + d  # late half on rank NC-1-c
+            c2g[d * NC + c] = rank_g * n_local + local_seg
+
+    fold_seq_map = torch.arange(0, D * NC + 1, NC, dtype=torch.int32)
+
+    # local seg -> fold output slot (the doc-chunk position it owns).
+    owned = torch.empty(n_local, dtype=torch.long)
+    for d in range(D):
+        owned[d] = d * NC + rank
+        owned[D + d] = d * NC + (NC - 1 - rank)
+
+    return FlashQLACPContext(
+        is_inter=True,
+        is_zigzag=True,
+        group=group,
+        cu_seqlens=local_cu_gpu,
+        cu_seqlens_cpu=local_cu_cpu,
+        is_first_rank=(rank == 0),
+        is_last_rank=(rank == world_size - 1),
+        num_docs=D,
+        num_chunks=NC,
+        chunk_to_gathered_slot=c2g.to(device=device, non_blocking=True),
+        fold_seq_map=fold_seq_map.to(device=device, non_blocking=True),
+        owned_fold_slot=owned.to(device=device, non_blocking=True),
+    )
+
 
 # ---------------------------------------------------------------------------
 # build intra-card context

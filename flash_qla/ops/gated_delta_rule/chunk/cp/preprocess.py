@@ -91,6 +91,59 @@ def _inter_correct_bwd(dh_seq, m_first, dht, cp_context, state_v_first):
 
 
 # ---------------------------------------------------------------------------
+# zigzag inter correction: full all-gather of per-owned-chunk (h, M), reindex into
+# per-document chunk order, fold each document, extract this rank's owned chunks.
+# ---------------------------------------------------------------------------
+def _full_warmup(cu_seqlens_cpu, Hv, chunk_size, device, dtype):
+    """Every owned chunk is a document-interior piece folded across cards, so all of
+    them need the full per-segment M -- warm up every chunk (conservative but correct)."""
+    lens = cu_seqlens_cpu.tolist()
+    nseg = len(lens) - 1
+    nw = torch.zeros((nseg, Hv), dtype=dtype, device=device)
+    for i in range(nseg):
+        nw[i, :] = (lens[i + 1] - lens[i] + chunk_size - 1) // chunk_size
+    return nw
+
+
+def _zigzag_reindex(packed_a, packed_b, cp_context):
+    """All-gather the packed (a, b) per-owned-chunk pair, unpack, flatten to
+    [world*n_local, ...] and index_select into per-document chunk order."""
+    hm = pack_hm(packed_a, packed_b)
+    ag_hm, _ = all_gather_into_tensor(hm, group=cp_context.group)
+    a_all, b_all = unpack_hm(ag_hm, packed_a, packed_b)
+    a_flat = a_all.reshape(-1, *packed_a.shape[1:])
+    b_flat = b_all.reshape(-1, *packed_b.shape[1:])
+    slot = cp_context.chunk_to_gathered_slot
+    return a_flat.index_select(0, slot).contiguous(), b_flat.index_select(0, slot).contiguous()
+
+
+def _inter_correct_fwd_zigzag(ht, mt, initial_state, cp_context, state_v_first):
+    from flash_qla.ops.gated_delta_rule.chunk import correct_initial_states
+
+    H = ht.shape[1]
+    h_buf, m_buf = _zigzag_reindex(ht, mt, cp_context)
+    fb = torch.ones((h_buf.shape[0], H), dtype=torch.bool, device=ht.device)
+    cp_h0_all = correct_initial_states(
+        raw_h0=initial_state, ht_buffer=h_buf, mt_buffer=m_buf,
+        fallback_mask=fb, seq_map_r2c=cp_context.fold_seq_map, state_v_first=state_v_first,
+    )
+    return cp_h0_all.index_select(0, cp_context.owned_fold_slot).contiguous()
+
+
+def _inter_correct_bwd_zigzag(dh, mt, dht, cp_context, state_v_first):
+    from flash_qla.ops.gated_delta_rule.chunk import correct_terminal_states
+
+    H = dh.shape[1]
+    dh_buf, m_buf = _zigzag_reindex(dh, mt, cp_context)
+    fb = torch.ones((dh_buf.shape[0], H), dtype=torch.bool, device=dh.device)
+    cp_dht_all = correct_terminal_states(
+        raw_dht=dht, dht_buffer=dh_buf, mt_buffer=m_buf,
+        fallback_mask=fb, seq_map_r2c=cp_context.fold_seq_map, state_v_first=state_v_first,
+    )
+    return cp_dht_all.index_select(0, cp_context.owned_fold_slot).contiguous()
+
+
+# ---------------------------------------------------------------------------
 # forward
 # ---------------------------------------------------------------------------
 def cp_preprocess_fwd(
@@ -117,6 +170,46 @@ def cp_preprocess_fwd(
     Hv = v.shape[2]
     chunk_size = a.shape[-1]
     fallback = num_warmup_bwd = fallback_bwd = None
+
+    # --- zigzag inter ---
+    if cp_context.is_zigzag:
+        if is_intra:
+            # intra occupancy split on top of zigzag ownership. Warmup/fallback are set
+            # conservatively full (no gate-decay pruning yet) -- correct but not optimal.
+            cp_cu = cp_context.intra_cp_cu_seqlens
+            seq_map_r2c = cp_context.seq_map_r2c
+            num_warmup = _full_warmup(cp_cu.cpu(), Hv, chunk_size, k.device, cp_cu.dtype)
+            fb_part = torch.ones((cp_cu.numel() - 1, Hv), dtype=torch.bool, device=k.device)
+            _, ht, mt = fused_gdr_h(
+                k=k, v=v, a=a, g=g, b=beta, initial_state=None,
+                output_final_state=True, output_h=False, cu_seqlens=cp_cu,
+                num_warmup_chunks=num_warmup, state_v_first=state_v_first,
+            )
+            # collapse each owned chunk's partitions into one (h, M).
+            h_seq, m_seq = aggregate_card_state(
+                ht, mt, fb_part, seq_map_r2c, raw_h0=None,
+                state_v_first=state_v_first, compute_m=True,
+            )
+            # inter zigzag fold -> per-owned-chunk entering state.
+            card_h0 = _inter_correct_fwd_zigzag(h_seq, m_seq, initial_state, cp_context, state_v_first)
+            # scan the corrected per-owned-chunk h0 back into each intra partition.
+            cp_h0 = correct_initial_states(
+                raw_h0=card_h0, ht_buffer=ht, mt_buffer=mt,
+                fallback_mask=fb_part, seq_map_r2c=seq_map_r2c, state_v_first=state_v_first,
+            )
+            return cp_h0, CPCache(h0=cp_h0, mt=mt, m_first=m_seq)
+
+        cu = cp_context.cu_seqlens
+        num_warmup = _full_warmup(cp_context.cu_seqlens_cpu, Hv, chunk_size, k.device, cu.dtype)
+        # stage 1: per-owned-chunk (he, M) from a zero in-state.
+        _, ht, mt = fused_gdr_h(
+            k=k, v=v, a=a, g=g, b=beta, initial_state=None,
+            output_final_state=True, output_h=False, cu_seqlens=cu,
+            num_warmup_chunks=num_warmup, state_v_first=state_v_first,
+        )
+        cp_h0 = _inter_correct_fwd_zigzag(ht, mt, initial_state, cp_context, state_v_first)
+        # cache the forward per-chunk M for the backward reverse fold.
+        return cp_h0, CPCache(h0=cp_h0, mt=mt)
 
     # --- Stage 1: prepare_h ---
     if is_intra:
@@ -227,6 +320,52 @@ def cp_preprocess_bwd(
     Hv = v.shape[2]
     chunk_size = a.shape[-1]
     mt = fallback = None
+
+    # --- zigzag inter ---
+    if cp_context.is_zigzag:
+        assert dht is None, (
+            "zigzag CP does not support a terminal-state gradient yet; the per-segment "
+            "final state is not the document-final state. Use output_final_state=False."
+        )
+        cp_h0 = cp_cache.h0
+        if is_intra:
+            cp_cu = cp_context.intra_cp_cu_seqlens
+            seq_map_r2c = cp_context.seq_map_r2c
+            mt = cp_cache.mt            # forward per-partition M (stage-3 reverse fold)
+            m_seq = cp_cache.m_first    # forward per-owned-chunk M (inter reverse fold)
+            num_warmup = _full_warmup(cp_cu.cpu(), Hv, chunk_size, k.device, cp_cu.dtype)
+            fb_part = torch.ones((cp_cu.numel() - 1, Hv), dtype=torch.bool, device=k.device)
+            # stage 1: per-partition dh from a zero terminal grad.
+            _, dh = fused_gdr_dh(
+                q=q, k=k, a=a, g=g, b=beta, do=do, dht=None,
+                output_dh0=True, output_dh=False, scale=scale, cu_seqlens=cp_cu,
+                num_warmup_chunks=num_warmup, state_v_first=state_v_first,
+            )
+            # collapse partitions -> per-owned-chunk dh (reverse).
+            dh_seq, _ = aggregate_card_state(
+                dh, mt, fb_part, seq_map_r2c, raw_h0=None,
+                state_v_first=state_v_first, reverse=True, transpose_m=True, compute_m=False,
+            )
+            # inter reverse fold with the forward per-owned-chunk M.
+            card_dht = _inter_correct_bwd_zigzag(dh_seq, m_seq, dht, cp_context, state_v_first)
+            # scan the corrected terminal grad back into each partition.
+            cp_dht = correct_terminal_states(
+                raw_dht=card_dht, dht_buffer=dh, mt_buffer=mt,
+                fallback_mask=fb_part, seq_map_r2c=seq_map_r2c, state_v_first=state_v_first,
+            )
+            return cp_h0, cp_dht
+
+        cu = cp_context.cu_seqlens
+        num_warmup = _full_warmup(cp_context.cu_seqlens_cpu, Hv, chunk_size, k.device, cu.dtype)
+        # stage 1: per-owned-chunk dh from a zero terminal grad.
+        _, dh = fused_gdr_dh(
+            q=q, k=k, a=a, g=g, b=beta, do=do, dht=None,
+            output_dh0=True, output_dh=False, scale=scale, cu_seqlens=cu,
+            num_warmup_chunks=num_warmup, state_v_first=state_v_first,
+        )
+        # reverse-fold using the forward per-chunk M (cached).
+        cp_dht = _inter_correct_bwd_zigzag(dh, cp_cache.mt, dht, cp_context, state_v_first)
+        return cp_h0, cp_dht
 
     # --- Stage 1: prepare_dh (recover the fwd-cached h0/mt first) ---
     if is_intra:

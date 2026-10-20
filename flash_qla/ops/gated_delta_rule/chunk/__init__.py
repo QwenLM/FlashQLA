@@ -179,6 +179,11 @@ def chunk_gated_delta_rule_bwd(
     # the first local seq's grad (it belongs to the previous card).
     if dh0 is None or initial_state is None:
         dh0 = None
+    elif cp_context.is_zigzag:
+        # zigzag fwd seeds the per-document fold with initial_state, but the per-segment
+        # (n_local) -> per-doc initial-state gradient reduction is not implemented; these
+        # GDN layers train with h0=None, so drop it rather than return a mismatched grad.
+        dh0 = None
     else:
         if cp_context.is_intra:
             dh0 = dh0[cp_context.seq_map_r2c[:-1].long()]
