@@ -29,6 +29,22 @@ from flash_qla.utils import l2norm
 
 HEAD_DIM = 128
 SEQLENS = [32768, 65536, 131072, 262144, 524288, 1048576]
+# varlen pack: one big doc + these small docs (each a multiple of 2*cp and chunk_size);
+# the big doc absorbs the rest so the total stays the swept T.
+SMALL_DOCS = [4096, 2048, 2048]
+
+
+def build_cu_seqlens(T, pack):
+    """pack='single' -> [0, T]; pack='varlen' -> [0, big, +small, ...] (big first)."""
+    if pack == "single":
+        return [0, T]
+    big = T - sum(SMALL_DOCS)
+    lens = [big, *SMALL_DOCS]
+    cu, acc = [0], 0
+    for L in lens:
+        acc += L
+        cu.append(acc)
+    return cu
 # (label, enable_intra, zigzag)
 VARIANTS = [
     ("inter/plain", False, False),
@@ -130,20 +146,20 @@ def _run(rank, world_size, cfg, port):
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     group = dist.group.WORLD
     device = f"cuda:{rank}"
-    h_qk, h_v, seqlens, warmup, iters = cfg
+    h_qk, h_v, seqlens, warmup, iters, pack = cfg
 
     rows = []
     for T in seqlens:
-        n_local = T // world_size
         res = {}
         for label, enable_intra, zigzag in VARIANTS:
             cleanup_cuda()
             try:
-                cu_g = torch.tensor([0, T], dtype=torch.int32, device=device)
+                cu_g = torch.tensor(build_cu_seqlens(T, pack), dtype=torch.int32, device=device)
                 ctx = _make_ctx(label, enable_intra, zigzag, cu_g, h_v, group)
                 if enable_intra and not ctx.is_intra:
                     res[label] = (float("nan"), float("nan"))
                     continue
+                n_local = int(ctx.cu_seqlens[-1])   # rank-local token count (both layouts == T/ws)
                 d = _local_inputs(n_local, h_qk, h_v, device, seed=1234 + rank)
                 infer = _bench(_infer_call(d, ctx), device, warmup, iters)
                 train = _bench(_train_call(d, ctx), device, warmup, iters)
@@ -155,7 +171,7 @@ def _run(rank, world_size, cfg, port):
         rows.append((T, res))
 
     if rank == 0:
-        _report(rows, h_qk, h_v, world_size)
+        _report(rows, h_qk, h_v, world_size, pack)
     dist.barrier()
     dist.destroy_process_group()
 
@@ -170,9 +186,10 @@ def _ratio(plain, zz):
     return f"{zz / plain:>5.2f}x"
 
 
-def _report(rows, h_qk, h_v, world_size):
+def _report(rows, h_qk, h_v, world_size, pack):
+    desc = "single doc" if pack == "single" else f"varlen: 1 big + {SMALL_DOCS}"
     for di, direction in enumerate(("INFER (fwd)", "TRAIN (fwd+bwd)")):
-        print(f"\n>>> {direction}  h_qk={h_qk} h_v={h_v} CP{world_size} bs=1  "
+        print(f"\n>>> {direction}  h_qk={h_qk} h_v={h_v} CP{world_size} bs=1  [{desc}]  "
               f"(ms = worst rank; ratio = zzcp/plain, >1 = zzcp slower)")
         hdr = (f"{'seqlen':>9} | {'inter plain':>11} {'inter zzcp':>11} {'zz/pl':>6} | "
                f"{'dual plain':>11} {'dual zzcp':>11} {'zz/pl':>6}")
@@ -193,6 +210,7 @@ def main():
     p.add_argument("--h-qk", type=int, default=16)
     p.add_argument("--h-v", type=int, default=16)
     p.add_argument("--seqlens", type=str, default=",".join(str(s) for s in SEQLENS))
+    p.add_argument("--pack", choices=["single", "varlen"], default="single")
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=10)
     args = p.parse_args()
@@ -200,15 +218,20 @@ def main():
     ws = args.world_size
     seqlens = []
     for s in (int(x) for x in args.seqlens.split(",")):
-        if s % (2 * ws) != 0 or (s // ws) % CHUNK_SIZE != 0:
-            print(f"[skip] T={s}: need divisible by 2*ws={2 * ws} and per-card "
-                  f"T/ws multiple of chunk={CHUNK_SIZE}")
+        docs = build_cu_seqlens(s, args.pack)
+        doc_lens = [docs[i + 1] - docs[i] for i in range(len(docs) - 1)]
+        # zzcp needs every doc divisible by 2*ws; plain needs total % ws and per-card chunk.
+        bad = (s % (2 * ws) != 0 or (s // ws) % CHUNK_SIZE != 0
+               or any(L <= 0 or L % (2 * ws) != 0 for L in doc_lens))
+        if bad:
+            print(f"[skip] T={s} pack={args.pack}: need total % 2*ws={2 * ws}=0, "
+                  f"per-card T/ws % chunk={CHUNK_SIZE}=0, every doc % 2*ws=0 (docs={doc_lens})")
             continue
         seqlens.append(s)
     assert seqlens, "no valid seqlens"
     assert torch.cuda.device_count() >= ws, f"need {ws} GPUs"
 
-    cfg = (args.h_qk, args.h_v, seqlens, args.warmup, args.iters)
+    cfg = (args.h_qk, args.h_v, seqlens, args.warmup, args.iters, args.pack)
     mp.start_processes(_run, args=(ws, cfg, _free_port()), nprocs=ws, join=True,
                        start_method="spawn")
 
