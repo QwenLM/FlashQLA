@@ -59,6 +59,12 @@ class FlashQLACPContext:
     chunk_to_gathered_slot: torch.Tensor | None = None       # [D*NC] doc-chunk slot -> gather index
     fold_seq_map: torch.Tensor | None = None                 # [D+1] per-doc groups for the fold
     owned_fold_slot: torch.Tensor | None = None              # [n_local] local seg -> fold output slot
+    # fused fold (see _calc_inter_cp_seqs_zigzag): address the gathered cat([h, M])
+    # buffer directly, so no reindex is materialised before the scan.
+    fold_h_slot: torch.Tensor | None = None                  # [D*NC] -> gathered h row
+    fold_m_slot: torch.Tensor | None = None                  # [D*NC] -> gathered M row
+    fold_out_slot: torch.Tensor | None = None                # [D*NC] -> output row, -1 = skip
+    fold_split_slot: torch.Tensor | None = None              # [D*NC] -> row, h/M gathered apart
 
     # --- intra-card ---
     intra_cp_cu_seqlens: torch.Tensor | None = None
@@ -90,6 +96,10 @@ class FlashQLACPContext:
             copied.chunk_to_gathered_slot = self.chunk_to_gathered_slot.clone()
             copied.fold_seq_map = self.fold_seq_map.clone()
             copied.owned_fold_slot = self.owned_fold_slot.clone()
+            copied.fold_h_slot = self.fold_h_slot
+            copied.fold_m_slot = self.fold_m_slot
+            copied.fold_out_slot = self.fold_out_slot
+            copied.fold_split_slot = self.fold_split_slot
             # shared, not cloned: it is the ``tensor_cache`` key behind
             # ``get_full_warmup``, so a fresh clone each step would miss every backward.
             copied.cu_seqlens_cpu = self.cu_seqlens_cpu
@@ -222,6 +232,10 @@ def build_cp_context(
             chunk_to_gathered_slot=inter_ctx.chunk_to_gathered_slot,
             fold_seq_map=inter_ctx.fold_seq_map,
             owned_fold_slot=inter_ctx.owned_fold_slot,
+            fold_h_slot=inter_ctx.fold_h_slot,
+            fold_m_slot=inter_ctx.fold_m_slot,
+            fold_out_slot=inter_ctx.fold_out_slot,
+            fold_split_slot=inter_ctx.fold_split_slot,
             intra_cp_cu_seqlens=intra_ctx.intra_cp_cu_seqlens,
             intra_cp_cu_seqlens_cpu=intra_ctx.intra_cp_cu_seqlens_cpu,
             seq_map_r2c=intra_ctx.seq_map_r2c,
@@ -420,6 +434,33 @@ def _calc_inter_cp_seqs_zigzag(
         owned[d] = d * NC + rank
         owned[D + d] = d * NC + (NC - 1 - rank)
 
+    # --- fused-fold slot maps ---
+    # The fused kernel scans straight out of the all-gather of `cat([h, M], dim=0)`, so
+    # each rank contributes 2*n_local rows: h first, then M. These three maps are what
+    # replace the physical reindex -- `h_slot`/`m_slot` address the two row ranges of the
+    # gathered buffer, and `out_slot` says where (or whether) a scanned chunk is written.
+    stride = 2 * n_local
+    h_slot = torch.empty(D * NC, dtype=torch.int32)
+    m_slot = torch.empty(D * NC, dtype=torch.int32)
+    out_slot = torch.empty(D * NC, dtype=torch.int32)
+    # h and M only share a dtype on the forward (both come from fused_gdr_h / the same
+    # aggregate). On the backward dh is fp32 against a bf16 cached M, so they cannot ride
+    # one cat-packed tensor and are gathered separately -- then each buffer is just
+    # [world*n_local, ...] and one map serves both.
+    split_slot = torch.empty(D * NC, dtype=torch.int32)
+    for d in range(D):
+        for c in range(NC):
+            if c < cp:
+                rank_g, local_seg = c, d
+            else:
+                rank_g, local_seg = NC - 1 - c, D + d
+            p = d * NC + c
+            h_slot[p] = rank_g * stride + local_seg
+            m_slot[p] = rank_g * stride + n_local + local_seg
+            split_slot[p] = rank_g * n_local + local_seg
+            # every chunk is scanned, but only this rank's two per doc are stored.
+            out_slot[p] = local_seg if rank_g == rank else -1
+
     return FlashQLACPContext(
         is_inter=True,
         is_zigzag=True,
@@ -433,6 +474,10 @@ def _calc_inter_cp_seqs_zigzag(
         chunk_to_gathered_slot=c2g.to(device=device, non_blocking=True),
         fold_seq_map=fold_seq_map.to(device=device, non_blocking=True),
         owned_fold_slot=owned.to(device=device, non_blocking=True),
+        fold_h_slot=h_slot.to(device=device, non_blocking=True),
+        fold_m_slot=m_slot.to(device=device, non_blocking=True),
+        fold_out_slot=out_slot.to(device=device, non_blocking=True),
+        fold_split_slot=split_slot.to(device=device, non_blocking=True),
     )
 
 

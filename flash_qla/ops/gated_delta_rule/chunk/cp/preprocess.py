@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from .comm import all_gather_into_tensor, pack_hm, unpack_hm
+from .comm import all_gather_into_tensor, pack_hm, pack_states, unpack_hm
 
 @dataclass
 class CPCache:
@@ -106,30 +106,84 @@ def _zigzag_reindex(packed_a, packed_b, cp_context):
     return a_flat.index_select(0, slot).contiguous(), b_flat.index_select(0, slot).contiguous()
 
 
-def _inter_correct_fwd_zigzag(ht, mt, initial_state, cp_context, state_v_first):
-    from flash_qla.ops.gated_delta_rule.chunk import correct_initial_states
+def _zigzag_gather(packed_a, packed_b, cp_context):
+    """All-gather (a, b) for the fused fold. No unpack, no reindex.
 
-    H = ht.shape[1]
-    h_buf, m_buf = _zigzag_reindex(ht, mt, cp_context)
-    fb = torch.ones((h_buf.shape[0], H), dtype=torch.bool, device=ht.device)
-    cp_h0_all = correct_initial_states(
-        raw_h0=initial_state, ht_buffer=h_buf, mt_buffer=m_buf,
-        fallback_mask=fb, seq_map_r2c=cp_context.fold_seq_map, state_v_first=state_v_first,
+    Returns ``(a_buf, b_buf, a_slot, b_slot)``; the fold kernel reads both buffers
+    through the slot maps, so whatever layout NCCL produced is left alone.
+
+    Two shapes, picked by dtype:
+
+    * **same dtype** (forward: both come from ``fused_gdr_h``, or both from the same
+      ``aggregate_card_state``) -- row-stack into one tensor and issue a single
+      collective. ``fold_h_slot`` / ``fold_m_slot`` address the two row ranges.
+    * **different dtypes** (backward: ``dh`` is fp32 from ``fused_gdr_dh`` while ``M``
+      is the bf16 one cached in the forward) -- one tensor cannot hold both, so gather
+      them apart. Each buffer is then plain ``[world*n_local, ...]`` and the single
+      ``fold_split_slot`` serves both.
+
+    Either way the fold runs straight off the gathered buffer; the second collective is
+    the only difference, and it costs far less than the copies it replaces.
+    """
+    if packed_a.dtype == packed_b.dtype:
+        buf = pack_states(packed_a, packed_b)
+        ag, _ = all_gather_into_tensor(buf, group=cp_context.group)
+        flat = ag.reshape(-1, *buf.shape[1:])
+        return flat, flat, cp_context.fold_h_slot, cp_context.fold_m_slot
+
+    a_all, _ = all_gather_into_tensor(packed_a, group=cp_context.group)
+    b_all, _ = all_gather_into_tensor(packed_b, group=cp_context.group)
+    slot = cp_context.fold_split_slot
+    return (a_all.reshape(-1, *packed_a.shape[1:]),
+            b_all.reshape(-1, *packed_b.shape[1:]), slot, slot)
+
+
+def _inter_correct_fwd_zigzag(ht, mt, initial_state, cp_context, state_v_first):
+    from flash_qla.ops.gated_delta_rule.chunk import (
+        correct_initial_states, correct_initial_states_zigzag,
     )
-    return cp_h0_all.index_select(0, cp_context.owned_fold_slot).contiguous()
+
+    if correct_initial_states_zigzag is None:      # sm120: no fused fold, two-step path
+        H = ht.shape[1]
+        h_buf, m_buf = _zigzag_reindex(ht, mt, cp_context)
+        fb = torch.ones((h_buf.shape[0], H), dtype=torch.bool, device=ht.device)
+        cp_h0_all = correct_initial_states(
+            raw_h0=initial_state, ht_buffer=h_buf, mt_buffer=m_buf,
+            fallback_mask=fb, seq_map_r2c=cp_context.fold_seq_map,
+            state_v_first=state_v_first,
+        )
+        return cp_h0_all.index_select(0, cp_context.owned_fold_slot).contiguous()
+
+    h_buf, m_buf, h_slot, m_slot = _zigzag_gather(ht, mt, cp_context)
+    return correct_initial_states_zigzag(
+        initial_state, h_buf, m_buf, cp_context.fold_seq_map,
+        h_slot, m_slot, cp_context.fold_out_slot,
+        n_local=ht.shape[0], state_v_first=state_v_first,
+    )
 
 
 def _inter_correct_bwd_zigzag(dh, mt, dht, cp_context, state_v_first):
-    from flash_qla.ops.gated_delta_rule.chunk import correct_terminal_states
-
-    H = dh.shape[1]
-    dh_buf, m_buf = _zigzag_reindex(dh, mt, cp_context)
-    fb = torch.ones((dh_buf.shape[0], H), dtype=torch.bool, device=dh.device)
-    cp_dht_all = correct_terminal_states(
-        raw_dht=dht, dht_buffer=dh_buf, mt_buffer=m_buf,
-        fallback_mask=fb, seq_map_r2c=cp_context.fold_seq_map, state_v_first=state_v_first,
+    from flash_qla.ops.gated_delta_rule.chunk import (
+        correct_terminal_states, correct_terminal_states_zigzag,
     )
-    return cp_dht_all.index_select(0, cp_context.owned_fold_slot).contiguous()
+
+    if correct_terminal_states_zigzag is None:     # sm120: no fused fold, two-step path
+        H = dh.shape[1]
+        dh_buf, m_buf = _zigzag_reindex(dh, mt, cp_context)
+        fb = torch.ones((dh_buf.shape[0], H), dtype=torch.bool, device=dh.device)
+        cp_dht_all = correct_terminal_states(
+            raw_dht=dht, dht_buffer=dh_buf, mt_buffer=m_buf,
+            fallback_mask=fb, seq_map_r2c=cp_context.fold_seq_map,
+            state_v_first=state_v_first,
+        )
+        return cp_dht_all.index_select(0, cp_context.owned_fold_slot).contiguous()
+
+    dh_buf, m_buf, h_slot, m_slot = _zigzag_gather(dh, mt, cp_context)
+    return correct_terminal_states_zigzag(
+        dht, dh_buf, m_buf, cp_context.fold_seq_map,
+        h_slot, m_slot, cp_context.fold_out_slot,
+        n_local=dh.shape[0], state_v_first=state_v_first,
+    )
 
 
 # ---------------------------------------------------------------------------
