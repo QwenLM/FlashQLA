@@ -62,6 +62,7 @@ class FlashQLACPContext:
 
     # --- intra-card ---
     intra_cp_cu_seqlens: torch.Tensor | None = None
+    intra_cp_cu_seqlens_cpu: torch.Tensor | None = None
     seq_map_r2c: torch.Tensor | None = None
     seq_map_c2r: torch.Tensor | None = None
     ht_mask: torch.Tensor | None = None
@@ -89,11 +90,15 @@ class FlashQLACPContext:
             copied.chunk_to_gathered_slot = self.chunk_to_gathered_slot.clone()
             copied.fold_seq_map = self.fold_seq_map.clone()
             copied.owned_fold_slot = self.owned_fold_slot.clone()
+            # shared, not cloned: it is the ``tensor_cache`` key behind
+            # ``get_full_warmup``, so a fresh clone each step would miss every backward.
+            copied.cu_seqlens_cpu = self.cu_seqlens_cpu
         # carry the intra-level partition tensors whenever the intra split is active.
         if self.is_intra:
             copied.intra_cp_cu_seqlens = (
                 self.intra_cp_cu_seqlens.clone() if self.intra_cp_cu_seqlens is not None else None
             )
+            copied.intra_cp_cu_seqlens_cpu = self.intra_cp_cu_seqlens_cpu
             copied.seq_map_r2c = self.seq_map_r2c.clone() if self.seq_map_r2c is not None else None
             copied.seq_map_c2r = self.seq_map_c2r.clone() if self.seq_map_c2r is not None else None
             copied.ht_mask = self.ht_mask.clone() if self.ht_mask is not None else None
@@ -116,6 +121,28 @@ class FlashQLACPContext:
         return (
             _create_scan_seq_map(self.post_num_ranks, dev_idx),
             _create_scan_fb_mask(self.post_num_ranks, num_v_heads, dev_idx),
+        )
+
+    def get_full_warmup(self, num_v_heads: int, chunk_size: int) -> torch.Tensor:
+        """The zigzag path's ``[nseg, Hv]`` warmup-chunk count, over whichever
+        segmentation the kernels are fed: the intra partitions when the intra split is
+        active, else the owned chunks.
+
+        Zigzag cannot use ``get_warmup_chunks_bidi``'s gate-decay pruning -- every owned
+        chunk is a document-interior piece folded across cards, so all of them need the
+        full per-segment M. The count is then a pure function of the segmentation, so
+        ``_create_full_warmup`` caches it on the CPU segment tensor the context already
+        holds. That keeps it off the per-step path, where it used to cost a blocking
+        ``.cpu()`` D2H plus one kernel launch per segment, twice per training step.
+        """
+        if self.is_intra:
+            cu, cu_cpu = self.intra_cp_cu_seqlens, self.intra_cp_cu_seqlens_cpu
+        else:
+            cu, cu_cpu = self.cu_seqlens, self.cu_seqlens_cpu
+        if cu_cpu is None:
+            cu_cpu = cu.cpu()
+        return _create_full_warmup(
+            cu_cpu, num_v_heads, chunk_size, cu.device.index, cu.dtype,
         )
 
 def build_cp_context(
@@ -196,6 +223,7 @@ def build_cp_context(
             fold_seq_map=inter_ctx.fold_seq_map,
             owned_fold_slot=inter_ctx.owned_fold_slot,
             intra_cp_cu_seqlens=intra_ctx.intra_cp_cu_seqlens,
+            intra_cp_cu_seqlens_cpu=intra_ctx.intra_cp_cu_seqlens_cpu,
             seq_map_r2c=intra_ctx.seq_map_r2c,
             seq_map_c2r=intra_ctx.seq_map_c2r,
             ht_mask=intra_ctx.ht_mask,
@@ -485,6 +513,9 @@ def _build_intra_cp_context(
         seq_map_r2c.append(len(cp_cu_seqlens))
     cp_cu_seqlens.append(raw_cu_seqlens_list[-1])
 
+    # kept so ``get_full_warmup`` can read the segmentation without a D2H on the GPU
+    # copy below; it is also the stable ``tensor_cache`` key for that warmup.
+    cp_cu_seqlens_cpu = torch.tensor(cp_cu_seqlens, dtype=seqlen_dtype, device="cpu")
     cp_cu_seqlens = torch.tensor(
         cp_cu_seqlens, dtype=seqlen_dtype, device=device, requires_grad=False
     )
@@ -503,6 +534,7 @@ def _build_intra_cp_context(
         is_intra=True,
         cu_seqlens=raw_cu_seqlens,
         intra_cp_cu_seqlens=cp_cu_seqlens,
+        intra_cp_cu_seqlens_cpu=cp_cu_seqlens_cpu,
         seq_map_r2c=seq_map_r2c,
         seq_map_c2r=seq_map_c2r,
         ht_mask=ht_mask,
@@ -577,3 +609,24 @@ def _create_scan_seq_map(num_ranks: int, device_idx: int) -> torch.Tensor:
 @tensor_cache
 def _create_scan_fb_mask(num_ranks: int, num_v_heads: int, device_idx: int) -> torch.Tensor:
     return torch.ones((num_ranks + 1, num_v_heads), dtype=torch.bool, device=f"cuda:{device_idx}")
+
+
+@tensor_cache
+def _create_full_warmup(
+    cu_seqlens_cpu: torch.Tensor,
+    num_v_heads: int,
+    chunk_size: int,
+    device_idx: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """``[nseg, Hv]`` warmup-chunk count with no pruning -- see ``get_full_warmup``.
+
+    ``cu_seqlens_cpu`` must be on the host: the whole point is to derive the counts
+    without a D2H, then ship the result in one H2D.
+    """
+    lens = cu_seqlens_cpu.tolist()
+    nw = torch.tensor(
+        [(lens[i + 1] - lens[i] + chunk_size - 1) // chunk_size for i in range(len(lens) - 1)],
+        dtype=dtype, device="cpu",
+    )
+    return nw.unsqueeze(1).expand(-1, num_v_heads).contiguous().to(f"cuda:{device_idx}")

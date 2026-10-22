@@ -94,17 +94,6 @@ def _inter_correct_bwd(dh_seq, m_first, dht, cp_context, state_v_first):
 # zigzag inter correction: full all-gather of per-owned-chunk (h, M), reindex into
 # per-document chunk order, fold each document, extract this rank's owned chunks.
 # ---------------------------------------------------------------------------
-def _full_warmup(cu_seqlens_cpu, Hv, chunk_size, device, dtype):
-    """Every owned chunk is a document-interior piece folded across cards, so all of
-    them need the full per-segment M -- warm up every chunk (conservative but correct)."""
-    lens = cu_seqlens_cpu.tolist()
-    nseg = len(lens) - 1
-    nw = torch.zeros((nseg, Hv), dtype=dtype, device=device)
-    for i in range(nseg):
-        nw[i, :] = (lens[i + 1] - lens[i] + chunk_size - 1) // chunk_size
-    return nw
-
-
 def _zigzag_reindex(packed_a, packed_b, cp_context):
     """All-gather the packed (a, b) per-owned-chunk pair, unpack, flatten to
     [world*n_local, ...] and index_select into per-document chunk order."""
@@ -178,7 +167,7 @@ def cp_preprocess_fwd(
             # conservatively full (no gate-decay pruning yet) -- correct but not optimal.
             cp_cu = cp_context.intra_cp_cu_seqlens
             seq_map_r2c = cp_context.seq_map_r2c
-            num_warmup = _full_warmup(cp_cu.cpu(), Hv, chunk_size, k.device, cp_cu.dtype)
+            num_warmup = cp_context.get_full_warmup(Hv, chunk_size)
             fb_part = torch.ones((cp_cu.numel() - 1, Hv), dtype=torch.bool, device=k.device)
             _, ht, mt = fused_gdr_h(
                 k=k, v=v, a=a, g=g, b=beta, initial_state=None,
@@ -200,7 +189,7 @@ def cp_preprocess_fwd(
             return cp_h0, CPCache(h0=cp_h0, mt=mt, m_first=m_seq)
 
         cu = cp_context.cu_seqlens
-        num_warmup = _full_warmup(cp_context.cu_seqlens_cpu, Hv, chunk_size, k.device, cu.dtype)
+        num_warmup = cp_context.get_full_warmup(Hv, chunk_size)
         # stage 1: per-owned-chunk (he, M) from a zero in-state.
         _, ht, mt = fused_gdr_h(
             k=k, v=v, a=a, g=g, b=beta, initial_state=None,
@@ -333,7 +322,7 @@ def cp_preprocess_bwd(
             seq_map_r2c = cp_context.seq_map_r2c
             mt = cp_cache.mt            # forward per-partition M (stage-3 reverse fold)
             m_seq = cp_cache.m_first    # forward per-owned-chunk M (inter reverse fold)
-            num_warmup = _full_warmup(cp_cu.cpu(), Hv, chunk_size, k.device, cp_cu.dtype)
+            num_warmup = cp_context.get_full_warmup(Hv, chunk_size)
             fb_part = torch.ones((cp_cu.numel() - 1, Hv), dtype=torch.bool, device=k.device)
             # stage 1: per-partition dh from a zero terminal grad.
             _, dh = fused_gdr_dh(
@@ -356,7 +345,7 @@ def cp_preprocess_bwd(
             return cp_h0, cp_dht
 
         cu = cp_context.cu_seqlens
-        num_warmup = _full_warmup(cp_context.cu_seqlens_cpu, Hv, chunk_size, k.device, cu.dtype)
+        num_warmup = cp_context.get_full_warmup(Hv, chunk_size)
         # stage 1: per-owned-chunk dh from a zero terminal grad.
         _, dh = fused_gdr_dh(
             q=q, k=k, a=a, g=g, b=beta, do=do, dht=None,
