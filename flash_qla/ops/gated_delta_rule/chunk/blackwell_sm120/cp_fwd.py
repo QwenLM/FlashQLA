@@ -683,14 +683,20 @@ def tilelang_aggregate_m(
             product = T.alloc_fragment((DK, block_cols), dtype="float32")
             for i, j in T.Parallel(DK, block_cols):
                 running[i, j] = T.if_then_else(i == bc * block_cols + j, 1, 0)
+            has_history = T.alloc_var("bool")
+            has_history = True
             for i_s in T.serial(seq_map[bb + 1] - seq_map[bb]):
-                idx = seq_map[bb + 1] - 1 - i_s if reverse else seq_map[bb] + i_s
-                if fallback[idx, bh]:
-                    T.copy(mt[idx, bh, :, :], m_shared)
-                    T.gemm(m_shared, running, product, clear_accum=True)
-                    T.copy(product, running)
-                else:
-                    T.clear(running)
+                if has_history:
+                    idx = seq_map[bb + 1] - 1 - i_s if reverse else seq_map[bb] + i_s
+                    if fallback[idx, bh]:
+                        T.copy(mt[idx, bh, :, :], m_shared)
+                        T.gemm(m_shared, running, product, clear_accum=True)
+                        T.copy(product, running)
+                    else:
+                        # A non-fallback segment overwrites the incoming state;
+                        # its effective transition is zero for the remaining scan.
+                        T.clear(running)
+                        has_history = False
             T.copy(running, out[bb, bh, :, bc * block_cols:(bc + 1) * block_cols])
 
     return tilelang_aggregate_m_kernel
