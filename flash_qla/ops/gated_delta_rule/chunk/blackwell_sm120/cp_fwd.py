@@ -5,6 +5,8 @@ import torch
 import tilelang
 import tilelang.language as T
 
+from .cp_scan import tilelang_correct_h0_ws
+
 
 @tilelang.jit()
 def tilelang_get_warmup_chunks(
@@ -538,7 +540,7 @@ def correct_initial_states(
         res_dtype = raw_h0.dtype
         use_raw_h0 = True
 
-    tilelang_correct_h0_kernel = tilelang_correct_h0(
+    tilelang_correct_h0_kernel = tilelang_correct_h0_ws(
         H=num_heads,
         DK=k_head_dim,
         DV=v_head_dim,
@@ -603,7 +605,7 @@ def correct_terminal_states(
         res_dtype = raw_dht.dtype
         use_raw_h0 = True
 
-    tilelang_correct_ht_kernel = tilelang_correct_h0(
+    tilelang_correct_ht_kernel = tilelang_correct_h0_ws(
         H=num_heads,
         DK=k_head_dim,
         DV=v_head_dim,
