@@ -62,10 +62,6 @@ def tilelang_kkt_solve(
         b_shared = T.alloc_shared((block_S), dtype=accum_dtype, scope="shared")
         a32_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
 
-        # Diagonal 16x16 inversion workspaces (2 blocks)
-        a16i_row = T.alloc_fragment((2, 16), dtype=accum_dtype)
-        a16i_sum = T.alloc_fragment((2, 16), dtype=accum_dtype)
-
         # 2 diagonal 16x16 blocks (padded to 17 for alignment)
         a16i_shared = T.alloc_shared((2, 17, 16), dtype=accum_dtype)
         # 1 sub-diagonal 16x16 coupling (blocks 0->1)
@@ -130,21 +126,25 @@ def tilelang_kkt_solve(
                         j_s, j_t
                     ]
 
-        # Invert diagonal 16x16 blocks (2 blocks in parallel)
-        # Forward substitution for lower triangular L with unit diagonal
-        for k_s in T.unroll(1, 16):
-            for j_s, k_t in T.Parallel(2, 16):
-                if k_t < k_s:
-                    a16i_row[j_s, k_t] = a16i_shared[j_s, k_s, k_t]
-            T.clear(a16i_sum)
-            for k_r in T.unroll(k_s):
-                for j_s, k_t in T.Parallel(2, 16):
-                    a16i_sum[j_s, k_t] -= (
-                            a16i_shared[j_s, k_r, k_t] * a16i_row[j_s, k_r]
-                        )
-            for j_s, k_t in T.Parallel(2, 16):
-                if k_t < k_s:
-                    a16i_shared[j_s, k_s, k_t] = a16i_sum[j_s, k_t]
+        # Each half-warp owns one 16x16 block, one column per lane.
+        T.sync_threads()
+        if T.get_thread_binding() < 32:
+            column = T.get_thread_binding() % 16
+            block = T.get_thread_binding() // 16
+            diag = T.alloc_local((16,), dtype=accum_dtype)
+            total = T.alloc_local((1,), dtype=accum_dtype)
+            for row in T.unroll(16):
+                diag[row] = a16i_shared[block, row, column]
+            for row in T.unroll(1, 16):
+                total[0] = 0
+                for prev in T.unroll(row):
+                    coefficient = T.shfl_sync(diag[row], prev, width=16)
+                    total[0] -= diag[prev] * coefficient
+                if column < row:
+                    diag[row] = total[0]
+            for row in T.unroll(16):
+                a16i_shared[block, row, column] = diag[row]
+        T.sync_threads()
 
             # Compute coupling between blocks 0 and 1 (single pair)
             # Step 1: temp = L11^{-1} @ (-L10)  [16x16]
