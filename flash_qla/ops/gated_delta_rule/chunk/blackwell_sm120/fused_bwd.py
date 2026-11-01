@@ -159,7 +159,10 @@ def tilelang_fused_chunk_gdr_bwd(
             # q -> tmp_shared_2_1
             # q_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
             k_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
-            # v_shared was removed: A reads v from global memory, saving 8192 bytes of shared memory.
+            # Stage half of V (4 KiB): contiguous global loads before MMA-layout reads.
+            # A full V tile would exceed the SM120 shared-memory budget.
+            v_panel = T.alloc_shared((block_S, DV // 2), dtype=qkva_dtype)
+            bar_v_panel = T.alloc_barrier(arrive_count=128)
             a_shared = T.alloc_shared((block_S, block_S), dtype=qkva_dtype)
             # half the dk dim
             h_shared = T.alloc_shared(
@@ -966,14 +969,24 @@ def tilelang_fused_chunk_gdr_bwd(
                     # W = V - g * U
                     for j_s, j_v in T.Parallel(block_S, DV):
                         u_fragment[j_s, j_v] *= -g_exp_shared[j_s]
-                    for j_s, j_v in T.Parallel(block_S, DV):
-                        if seq_start_idx + (num_iters - i_s - 1) * block_S + j_s < seq_end_idx:
-                            u_fragment[j_s, j_v] += v[
-                                batch_idx,
-                                seq_start_idx + (num_iters - i_s - 1) * block_S + j_s,
-                                bh,
-                                j_v,
-                            ]
+                    for panel in T.serial(2):
+                        for j_s, j_v in T.Parallel(block_S, DV // 2):
+                            v_panel[j_s, j_v] = T.if_then_else(
+                                seq_start_idx + (num_iters - i_s - 1) * block_S + j_s < seq_end_idx,
+                                v[
+                                    batch_idx,
+                                    seq_start_idx + (num_iters - i_s - 1) * block_S + j_s,
+                                    bh, panel * (DV // 2) + j_v,
+                                ],
+                                0,
+                            )
+                        T.barrier_arrive(bar_v_panel)
+                        T.barrier_wait(bar_v_panel, 0)
+                        for j_s, j_v in T.Parallel(block_S, DV // 2):
+                            u_fragment[j_s, panel * (DV // 2) + j_v] += v_panel[j_s, j_v]
+                        # All A warps must finish reading before the next panel overwrites it.
+                        T.barrier_arrive(bar_v_panel)
+                        T.barrier_wait(bar_v_panel, 1)
                     # S2[2] W
                     T.copy(u_fragment, tmp_shared_2_2)
                     T.barrier_arrive(bar_05)

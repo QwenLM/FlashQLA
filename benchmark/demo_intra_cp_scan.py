@@ -41,8 +41,6 @@ def bench_us(jobs, repeats):
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     for round_idx in range(9):
         order = [(i + round_idx) % len(jobs) for i in range(len(jobs))]
-        if round_idx % 2:
-            order.reverse()
         for i in order:
             start.record()
             graphs[i].replay()
