@@ -469,11 +469,11 @@ def tilelang_fused_chunk_gdr_bwd(
                             ,j_v%2] += dh_fragment_1[j_k,j_v] * h_shared[j_k, j_v]
                     T.barrier_arrive(bar_08_2)
                     T.barrier_wait(bar_08_2, (i_s + 0) % 2)
-                    # copy left part from hbm
+                    # Reload the left half through TMA; bar_08_3 publishes completion to K/A.
                     if state_v_first:
-                        T.copy(h[batch_idx,cur_idx,bh,0:DV,:DK//2],h_shared)
+                        T.tma_copy(h[batch_idx,cur_idx,bh,0:DV,:DK//2],h_shared,barrier=bar_08_3)
                     else:
-                        T.copy(h[batch_idx,cur_idx,bh,:DK//2,0:DV],h_shared)
+                        T.tma_copy(h[batch_idx,cur_idx,bh,:DK//2,0:DV],h_shared,barrier=bar_08_3)
                     T.barrier_arrive(bar_08_3)
                     T.barrier_wait(bar_08_3,(i_s+0)%2)
                     # W1: dh_fragment_0(left part)
