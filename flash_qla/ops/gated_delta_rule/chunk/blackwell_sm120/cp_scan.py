@@ -53,7 +53,7 @@ def tilelang_correct_h0_ws(
                 T.clear(state)
             for i in T.serial(count):
                 idx = end - 1 - i if reverse else start + i
-                stage = i % stages
+                stage = T.cast(i % stages, "int32")
                 if state_v_first:
                     T.copy(state, out[idx, bh, lo:lo + block_DV, :])
                 else:
@@ -85,7 +85,7 @@ def tilelang_correct_h0_ws(
             if tx < 160:
                 for i in T.serial(count):
                     idx = end - 1 - i if reverse else start + i
-                    stage = i % stages
+                    stage = T.cast(i % stages, "int32")
                     T.barrier_wait(m_free[stage], (i // stages + 1) % 2)
                     if fallback[idx, bh]:
                         T.tma_copy(m[idx, bh, :, :], m_stage[stage, :, :],
