@@ -24,6 +24,23 @@ def all_gather_into_tensor(
     return out, handle
 
 
+def pack_states(S_ext: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
+    """Pack (h, M) for the zigzag fold by stacking rows, not bytes.
+
+    At K == V == 128 the two states have identical shape, and under CP they carry the
+    same dtype, so a plain ``cat`` along dim 0 gives one contiguous ``[2n, H, 128, 128]``
+    payload. One collective, and -- unlike ``pack_hm`` -- the gathered result needs no
+    unpacking: ``[world, 2n, ...]`` reshapes to ``[world*2n, ...]`` for free, and the
+    fold kernel addresses h and M as two row ranges via its slot maps.
+
+    Asserts rather than falling back: if this invariant ever breaks we want to hear
+    about it, not to silently return to the five-pass path.
+    """
+    assert S_ext.shape == M.shape, (S_ext.shape, M.shape)
+    assert S_ext.dtype == M.dtype, (S_ext.dtype, M.dtype)
+    return torch.cat([S_ext, M], dim=0)
+
+
 def pack_hm(S_ext: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
     assert S_ext.shape[:1] == M.shape[:1], (S_ext.shape, M.shape)
     return torch.cat([

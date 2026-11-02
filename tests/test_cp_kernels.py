@@ -307,3 +307,119 @@ def test_aggregate_card_state(
     assert m_no_m is None
     err_no_m = rel_max(h_no_m, h_card)
     assert err_no_m <= 1e-5, f"h_card must not depend on compute_m, rel_max={err_no_m:.2e}"
+
+
+# ===========================================================================
+# correct_{initial,terminal}_states_zigzag -- the fused inter fold
+# ===========================================================================
+# The fused kernel scans straight out of the all-gather buffer via slot maps instead of
+# requiring a physically reindexed copy. It does the same arithmetic in the same order as
+# `_zigzag_reindex` + the plain fold, so the two must agree BITWISE -- a tolerance here
+# would hide exactly the indexing mistakes this test exists to catch.
+_ZIGZAG_SHAPES = [
+    pytest.param(2, 1, id="cp2-d1"),    # single sequence: the case the perf work targets
+    pytest.param(4, 2, id="cp4-d2"),
+    pytest.param(8, 3, id="cp8-d3"),
+]
+
+
+def _zigzag_maps(cp, D, rank, device):
+    """Mirrors context.py:_calc_inter_cp_seqs_zigzag. Kept as an independent
+    transcription so a bug there cannot cancel itself out in this test."""
+    NC, n_local = 2 * cp, 2 * D
+    stride = 2 * n_local
+    c2g, h_slot, m_slot, split_slot, out_slot = [], [], [], [], []
+    for d in range(D):
+        for c in range(NC):
+            rank_g, local_seg = (c, d) if c < cp else (NC - 1 - c, D + d)
+            c2g.append(rank_g * n_local + local_seg)
+            h_slot.append(rank_g * stride + local_seg)
+            m_slot.append(rank_g * stride + n_local + local_seg)
+            split_slot.append(rank_g * n_local + local_seg)
+            out_slot.append(local_seg if rank_g == rank else -1)
+    owned = [d * NC + rank for d in range(D)] + [d * NC + (NC - 1 - rank) for d in range(D)]
+
+    def i32(x):
+        return torch.tensor(x, dtype=torch.int32, device=device)
+
+    return {
+        "c2g": torch.tensor(c2g, dtype=torch.long, device=device),
+        "owned": torch.tensor(owned, dtype=torch.long, device=device),
+        "h_slot": i32(h_slot), "m_slot": i32(m_slot), "split_slot": i32(split_slot),
+        "out_slot": i32(out_slot),
+        "fold_seq_map": torch.arange(0, D * NC + 1, NC, dtype=torch.int32, device=device),
+    }
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("cp, D", _ZIGZAG_SHAPES)
+@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
+@pytest.mark.parametrize("use_raw_state", [False, True], ids=["zero_seed", "raw_seed"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["fwd", "bwd"])
+@pytest.mark.parametrize(
+    "h_dtype, m_dtype",
+    [
+        pytest.param(torch.bfloat16, torch.bfloat16, id="prod-fwd"),
+        # the backward's real pairing: fp32 dh against the bf16 M cached in the forward.
+        # dtypes differ, so h and M cannot ride one cat-packed tensor.
+        pytest.param(torch.float32, torch.bfloat16, id="prod-bwd"),
+    ],
+)
+def test_correct_states_zigzag(cp, D, state_v_first, use_raw_state, reverse,
+                               h_dtype, m_dtype):
+    from flash_qla.ops.gated_delta_rule.chunk import (
+        correct_initial_states_zigzag, correct_terminal_states_zigzag,
+    )
+    if correct_initial_states_zigzag is None:
+        pytest.skip("fused zigzag fold not built for this arch (sm120)")
+
+    torch.manual_seed(SEED + cp * 100 + D)
+    H, rank = 4, 1
+    NC, n_local = 2 * cp, 2 * D
+    maps = _zigzag_maps(cp, D, rank, DEVICE)
+    state_shape = (V, K) if state_v_first else (K, V)
+
+    # per-rank payloads, exactly as each card would hand them to the collective
+    h_rank = torch.randn(cp, n_local, H, *state_shape, device=DEVICE).to(h_dtype)
+    m_rank = torch.randn(cp, n_local, H, K, K, device=DEVICE).to(m_dtype)
+    raw_shape = (D, H, *state_shape)
+    raw = torch.randn(raw_shape, device=DEVICE, dtype=torch.float32) if use_raw_state else None
+
+    fused = correct_terminal_states_zigzag if reverse else correct_initial_states_zigzag
+    plain = correct_terminal_states if reverse else correct_initial_states
+
+    # --- reference: reindex into doc-chunk order, fold, then pull out owned rows ---
+    h_all = h_rank.reshape(cp * n_local, H, *state_shape)
+    m_all = m_rank.reshape(cp * n_local, H, K, K)
+    h_buf = h_all.index_select(0, maps["c2g"]).contiguous()
+    m_buf = m_all.index_select(0, maps["c2g"]).contiguous()
+    fb = torch.ones((D * NC, H), dtype=torch.bool, device=DEVICE)
+    kw = dict(fallback_mask=fb, seq_map_r2c=maps["fold_seq_map"],
+              state_v_first=state_v_first)
+    if reverse:
+        ref_all = plain(raw_dht=raw, dht_buffer=h_buf, mt_buffer=m_buf, **kw)
+    else:
+        ref_all = plain(raw_h0=raw, ht_buffer=h_buf, mt_buffer=m_buf, **kw)
+    ref = ref_all.index_select(0, maps["owned"]).contiguous()
+
+    # --- fused, two collectives: h and M gathered apart, one map serves both ---
+    got_split = fused(raw, h_all, m_all, maps["fold_seq_map"],
+                      maps["split_slot"], maps["split_slot"], maps["out_slot"],
+                      n_local=n_local, state_v_first=state_v_first)
+    assert got_split.shape == ref.shape, (got_split.shape, ref.shape)
+    assert torch.equal(got_split, ref), (
+        f"split-gather fold differs from reindex+fold: "
+        f"max |delta|={(got_split.float() - ref.float()).abs().max():.3e}"
+    )
+
+    # --- fused, one collective: cat([h, M]) per rank, two maps into one tensor ---
+    if h_dtype != m_dtype:
+        return   # cannot cat; the split path above is what production uses here
+    packed = torch.cat([h_rank, m_rank], dim=1).reshape(cp * 2 * n_local, H, *state_shape)
+    got_cat = fused(raw, packed, packed, maps["fold_seq_map"],
+                    maps["h_slot"], maps["m_slot"], maps["out_slot"],
+                    n_local=n_local, state_v_first=state_v_first)
+    assert torch.equal(got_cat, ref), (
+        f"cat-packed fold differs from reindex+fold: "
+        f"max |delta|={(got_cat.float() - ref.float()).abs().max():.3e}"
+    )

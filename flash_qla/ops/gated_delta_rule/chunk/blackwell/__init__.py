@@ -9,6 +9,7 @@ from .kkt_solve import kkt_solve
 from .cp_fwd import (
     get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states,
     correct_terminal_states, aggregate_card_state,
+    correct_initial_states_zigzag, correct_terminal_states_zigzag,
 )
 
 
@@ -24,4 +25,6 @@ __all__ = [
     "correct_initial_states",
     "correct_terminal_states",
     "aggregate_card_state",
+    "correct_initial_states_zigzag",
+    "correct_terminal_states_zigzag",
 ]

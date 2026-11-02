@@ -303,11 +303,19 @@ def tilelang_correct_h0(
     store_intra_h0: bool = True,
     store_inter_h: bool = False,
     compute_m: bool = False,
+    use_zigzag: bool = False,
     block_DV: int | None = None,
     num_stages: int | None = None,
 ):
     cp_batch_size = T.dynamic("cp_batch_size")
     raw_batch_size = T.dynamic("raw_batch_size")
+    out_batch_size = T.dynamic("out_batch_size")
+    slot_size = T.dynamic("slot_size")
+    out_state_shape = (
+        (out_batch_size, H, DV, DK)
+        if state_v_first
+        else (out_batch_size, H, DK, DV)
+    )
     state_shape = (
         (cp_batch_size, H, DV, DK)
         if state_v_first
@@ -339,6 +347,7 @@ def tilelang_correct_h0(
         bb, bh, bv, seq_start_idx, seq_end_idx, num_iters,
         raw_h0, ht_buffer, mt_buffer, fallback_mask,
         cp_h0, h_card, m_card,
+        h_slot, m_slot, out_slot,
     ):
         lo = bv * block_DV
 
@@ -381,7 +390,12 @@ def tilelang_correct_h0(
                 T.copy(mrun_frag, mrun_shared)
 
             for i_s in T.serial(num_iters):
-                idx = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+                # `p` is the position in the scan; under zigzag the buffers are the raw
+                # all-gather output, so the row to touch comes from a slot map rather
+                # than from `p` itself. Non-zigzag binds the same PrimExpr, which is why
+                # the emitted TIR is identical to before this indirection existed.
+                p = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+                h_idx = T.Cast("int32", h_slot[p]) if use_zigzag else p
                 s = i_s % num_stages
 
                 if store_intra_h0:
@@ -391,14 +405,14 @@ def tilelang_correct_h0(
                     T.barrier_arrive(hprev_ready[s])
 
                 T.sync_threads(BAR_CONSUMER, 128)
-                if fallback_mask[idx, bh]:
+                if fallback_mask[h_idx, bh]:
                     T.copy(h_fragment, hd_shared)     # save h_prev as a gemm operand
                     T.fence_proxy_async()
                 T.sync_threads(BAR_CONSUMER, 128)
 
                 T.barrier_wait(data_is_ready[s], (i_s // num_stages + 0) % 2)
-                T.copy(h_stage[s, :, :], h_fragment)          # h_fragment = h_idx
-                if fallback_mask[idx, bh]:
+                T.copy(h_stage[s, :, :], h_fragment)          # h_fragment = h[h_idx]
+                if fallback_mask[h_idx, bh]:
                     if state_v_first:
                         if transpose_m:
                             T.gemm(hd_shared, m_stage[s, :, :], h_fragment,
@@ -415,7 +429,7 @@ def tilelang_correct_h0(
                                    clear_accum=False)
 
                 if compute_m and bv == 0:
-                    if fallback_mask[idx, bh]:
+                    if fallback_mask[h_idx, bh]:
                         T.clear(mrun_frag)
                         T.gemm(m_stage[s, :, :], mrun_shared, mrun_frag,
                                clear_accum=True)
@@ -442,18 +456,22 @@ def tilelang_correct_h0(
             if tx < 160:
                 # ==================== load warp ====================
                 for i_s in T.serial(num_iters):
-                    idx = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+                    p = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+                    # h and M are separate rows of one cat-packed buffer under zigzag,
+                    # hence two maps rather than one.
+                    h_idx = T.Cast("int32", h_slot[p]) if use_zigzag else p
+                    m_idx = T.Cast("int32", m_slot[p]) if use_zigzag else p
                     s = i_s % num_stages
                     T.barrier_wait(data_is_free[s], (i_s // num_stages + 1) % 2)
                     if state_v_first:
-                        T.tma_copy(ht_buffer[idx, bh, lo:lo + block_DV, 0:DK],
+                        T.tma_copy(ht_buffer[h_idx, bh, lo:lo + block_DV, 0:DK],
                                    h_stage[s, :, :], barrier=data_is_ready[s])
                     else:
-                        T.tma_copy(ht_buffer[idx, bh, 0:DK, lo:lo + block_DV],
+                        T.tma_copy(ht_buffer[h_idx, bh, 0:DK, lo:lo + block_DV],
                                    h_stage[s, :, :], barrier=data_is_ready[s])
 
-                    if fallback_mask[idx, bh]:
-                        T.tma_copy(mt_buffer[idx, bh, 0:DK, 0:DK],
+                    if fallback_mask[h_idx, bh]:
+                        T.tma_copy(mt_buffer[m_idx, bh, 0:DK, 0:DK],
                                    m_stage[s, :, :], barrier=data_is_ready[s])
                     T.barrier_arrive(data_is_ready[s])
 
@@ -461,16 +479,22 @@ def tilelang_correct_h0(
                 # ==================== store warp ====================
                 if store_intra_h0:
                     for i_s in T.serial(num_iters):
-                        idx = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+                        p = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+                        # Under zigzag every chunk is scanned (the running product needs
+                        # them all) but only the ones this rank owns are written out;
+                        # out_slot is -1 for the rest. That is what removes the trailing
+                        # index_select and shrinks the output to n_local rows.
+                        w_idx = T.Cast("int32", out_slot[p]) if use_zigzag else p
                         s = i_s % num_stages
                         T.barrier_wait(hprev_ready[s], (i_s // num_stages + 0) % 2)
 
-                        if state_v_first:
-                            T.copy(hp_stage[s, :, :],
-                                   cp_h0[idx, bh, lo:lo + block_DV, 0:DK])
-                        else:
-                            T.copy(hp_stage[s, :, :],
-                                   cp_h0[idx, bh, 0:DK, lo:lo + block_DV])
+                        if w_idx >= 0:
+                            if state_v_first:
+                                T.copy(hp_stage[s, :, :],
+                                       cp_h0[w_idx, bh, lo:lo + block_DV, 0:DK])
+                            else:
+                                T.copy(hp_stage[s, :, :],
+                                       cp_h0[w_idx, bh, 0:DK, lo:lo + block_DV])
                         T.barrier_arrive(hprev_free[s])
 
     def _grid_prologue(bbhv, seq_map_r2c):
@@ -483,7 +507,51 @@ def tilelang_correct_h0(
 
     grid = T.ceildiv(DV, block_DV) * H * raw_batch_size
 
-    if store_inter_h:
+    if use_zigzag:
+        # zigzag inter fold. ht_buffer/mt_buffer are the raw all-gather output and the
+        # doc-chunk order lives in the slot maps, so nothing is physically reordered
+        # before the scan. h and M are two row ranges of ONE cat-packed tensor, which is
+        # why the caller binds the same tensor to both -- h_slot and m_slot carry the
+        # offset. Only this rank's chunks are written (out_slot is -1 elsewhere), so
+        # cp_h0 has n_local rows rather than the gathered buffer's.
+        if use_raw_h0:
+            @T.prim_func
+            def tilelang_correct_h0_kernel(
+                raw_h0: T.Tensor(raw_state_shape, dtype=res_dtype),
+                ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
+                mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
+                fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
+                seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
+                h_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                m_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                out_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                cp_h0: T.Tensor(out_state_shape, dtype=res_dtype),
+            ):
+                with T.Kernel(grid, threads=WS_THREADS) as (bbhv,):
+                    bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                    scan_body(bb, bh, bv, s0, s1, ni, raw_h0, ht_buffer, mt_buffer,
+                              fallback_mask, cp_h0, ht_buffer, mt_buffer,
+                              h_slot, m_slot, out_slot)
+        else:
+            @T.prim_func
+            def tilelang_correct_h0_kernel(
+                ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
+                mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
+                fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
+                seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
+                h_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                m_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                out_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                cp_h0: T.Tensor(out_state_shape, dtype=res_dtype),
+            ):
+                with T.Kernel(grid, threads=WS_THREADS) as (bbhv,):
+                    bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                    # cp_h0 doubles as the unused raw_h0 slot (same dtype, never read).
+                    scan_body(bb, bh, bv, s0, s1, ni, cp_h0, ht_buffer, mt_buffer,
+                              fallback_mask, cp_h0, ht_buffer, mt_buffer,
+                              h_slot, m_slot, out_slot)
+
+    elif store_inter_h:
         if compute_m:
             @T.prim_func
             def tilelang_correct_h0_kernel(
@@ -498,7 +566,8 @@ def tilelang_correct_h0(
                 with T.Kernel(grid, threads=WS_THREADS) as (bbhv,):
                     bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
                     scan_body(bb, bh, bv, s0, s1, ni, raw_h0, ht_buffer, mt_buffer,
-                              fallback_mask, ht_buffer, h_card, m_card)
+                              fallback_mask, ht_buffer, h_card, m_card,
+                              seq_map_r2c, seq_map_r2c, seq_map_r2c)
         else:
             @T.prim_func
             def tilelang_correct_h0_kernel(
@@ -512,7 +581,8 @@ def tilelang_correct_h0(
                 with T.Kernel(grid, threads=WS_THREADS) as (bbhv,):
                     bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
                     scan_body(bb, bh, bv, s0, s1, ni, raw_h0, ht_buffer, mt_buffer,
-                              fallback_mask, ht_buffer, h_card, mt_buffer)
+                              fallback_mask, ht_buffer, h_card, mt_buffer,
+                              seq_map_r2c, seq_map_r2c, seq_map_r2c)
 
     elif use_raw_h0:
         # correct mode with a raw_h0 seed. h_card / m_card slots use placeholders.
@@ -528,7 +598,8 @@ def tilelang_correct_h0(
             with T.Kernel(grid, threads=WS_THREADS) as (bbhv,):
                 bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
                 scan_body(bb, bh, bv, s0, s1, ni, raw_h0, ht_buffer, mt_buffer,
-                          fallback_mask, cp_h0, ht_buffer, mt_buffer)
+                          fallback_mask, cp_h0, ht_buffer, mt_buffer,
+                          seq_map_r2c, seq_map_r2c, seq_map_r2c)
 
     else:
         # correct mode, zero seed.
@@ -544,7 +615,8 @@ def tilelang_correct_h0(
                 bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
                 # cp_h0 doubles as the unused raw_h0 slot (same dtype, never read).
                 scan_body(bb, bh, bv, s0, s1, ni, cp_h0, ht_buffer, mt_buffer,
-                          fallback_mask, cp_h0, ht_buffer, mt_buffer)
+                          fallback_mask, cp_h0, ht_buffer, mt_buffer,
+                          seq_map_r2c, seq_map_r2c, seq_map_r2c)
 
     return tilelang_correct_h0_kernel
 
@@ -679,6 +751,113 @@ def correct_terminal_states(
         )
 
     return cp_dht
+
+
+# ---------------------------------------------------------------------------
+# zigzag inter fold: scan straight out of the all-gather buffer
+# ---------------------------------------------------------------------------
+def _correct_states_zigzag(
+    raw_state: torch.Tensor | None,  # [num_docs, H, K, V] (or [.., V, K])
+    h_buffer: torch.Tensor,          # all-gathered h rows
+    m_buffer: torch.Tensor,          # all-gathered M rows; may be the same tensor as h_buffer
+    fold_seq_map: torch.Tensor,      # [num_docs + 1]
+    h_slot: torch.Tensor,            # [num_docs * num_chunks] -> row of h_buffer
+    m_slot: torch.Tensor,            # [num_docs * num_chunks] -> row of m_buffer
+    out_slot: torch.Tensor,          # likewise -> output row, or -1 to skip
+    n_local: int,
+    state_v_first: bool,
+    reverse: bool,
+    transpose_m: bool,
+):
+    """Shared body of the two zigzag entry points.
+
+    The caller passes the raw all-gather output and the slot maps that address it, so no
+    reindex is materialised. When h and M share a dtype they ride one cat-packed tensor
+    and ``h_buffer is m_buffer``, the two maps differing by the n_local row offset; when
+    they do not (backward's fp32 dh against a bf16 M) they are separate gathers and both
+    maps are the same. The kernel does not care which -- it just follows the maps.
+    """
+    n_rows, num_heads, dim_2, dim_3 = h_buffer.shape
+    if state_v_first:
+        v_head_dim, k_head_dim = dim_2, dim_3
+    else:
+        k_head_dim, v_head_dim = dim_2, dim_3
+    assert k_head_dim == v_head_dim == 128, (
+        "the zigzag fold addresses h and M by row, which needs K == V == 128"
+    )
+    assert m_buffer.shape[0] == n_rows, (h_buffer.shape, m_buffer.shape)
+
+    use_raw_h0 = raw_state is not None
+    res_dtype = raw_state.dtype if use_raw_h0 else torch.float32
+
+    # every gathered chunk is a document-interior piece, so the fold never falls back.
+    fallback_mask = torch.ones(
+        (n_rows, num_heads), dtype=torch.bool, device=h_buffer.device
+    )
+
+    kernel = tilelang_correct_h0(
+        H=num_heads,
+        DK=k_head_dim,
+        DV=v_head_dim,
+        res_dtype=res_dtype,
+        accum_dtype="float32",
+        h_buffer_dtype=h_buffer.dtype,
+        m_buffer_dtype=m_buffer.dtype,
+        seqlen_dtype=h_slot.dtype,
+        mask_dtype=fallback_mask.dtype,
+        use_raw_h0=use_raw_h0,
+        state_v_first=state_v_first,
+        reverse=reverse,
+        transpose_m=transpose_m,
+        use_zigzag=True,
+    )
+    out = torch.empty(
+        (n_local, num_heads, v_head_dim, k_head_dim)
+        if state_v_first
+        else (n_local, num_heads, k_head_dim, v_head_dim),
+        dtype=res_dtype,
+        device=h_buffer.device,
+    )
+    args = [h_buffer, m_buffer, fallback_mask, fold_seq_map,
+            h_slot, m_slot, out_slot, out]
+    if use_raw_h0:
+        args.insert(0, raw_state)
+    kernel(*args)
+    return out
+
+
+def correct_initial_states_zigzag(
+    raw_h0: torch.Tensor | None,
+    h_buffer: torch.Tensor,
+    m_buffer: torch.Tensor,
+    fold_seq_map: torch.Tensor,
+    h_slot: torch.Tensor,
+    m_slot: torch.Tensor,
+    out_slot: torch.Tensor,
+    n_local: int,
+    state_v_first: bool = False,
+):
+    return _correct_states_zigzag(
+        raw_h0, h_buffer, m_buffer, fold_seq_map, h_slot, m_slot, out_slot, n_local,
+        state_v_first=state_v_first, reverse=False, transpose_m=False,
+    )
+
+
+def correct_terminal_states_zigzag(
+    raw_dht: torch.Tensor | None,
+    h_buffer: torch.Tensor,
+    m_buffer: torch.Tensor,
+    fold_seq_map: torch.Tensor,
+    h_slot: torch.Tensor,
+    m_slot: torch.Tensor,
+    out_slot: torch.Tensor,
+    n_local: int,
+    state_v_first: bool = False,
+):
+    return _correct_states_zigzag(
+        raw_dht, h_buffer, m_buffer, fold_seq_map, h_slot, m_slot, out_slot, n_local,
+        state_v_first=state_v_first, reverse=True, transpose_m=True,
+    )
 
 
 # ---------------------------------------------------------------------------
