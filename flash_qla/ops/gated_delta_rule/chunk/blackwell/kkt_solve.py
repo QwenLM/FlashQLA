@@ -310,11 +310,6 @@ def kkt_solve(
     chunk_size: int = 64,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ):
-    """计算裸单位下三角逆矩阵，使用 FP32 shared 工作区和 FP16 MMA 输入。
-
-    Returns [B, N, H, chunk_size] in k.dtype, without gate or column-beta
-    scaling. The full Blackwell GDR dispatch still uses DK=DV=128, chunk=64.
-    """
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H = b.shape
     assert K in (64, 128)
