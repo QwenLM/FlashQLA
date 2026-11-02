@@ -154,12 +154,19 @@ def tilelang_kkt_solve(
         k_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
         b_shared = T.alloc_shared((block_S,), dtype=accum_dtype)
         a_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
-        # Eight extra FP16 columns reduce bank conflicts for row/MMA loads.
-        a_shared = T.alloc_shared((block_S, block_S + 8), dtype="float16")
+        a_output = T.alloc_fragment((block_S, block_S), dtype=qkva_dtype)
+        a_shared = T.alloc_shared((block_S, block_S + 4), dtype=accum_dtype)
         a8i_row = T.alloc_local((8,), dtype=accum_dtype)
         a8i_scale = T.alloc_local((1,), dtype=accum_dtype)
 
-        T.annotate_layout({a_shared: tilelang.layout.make_linear_layout(a_shared)})
+        T.annotate_layout({
+            a_shared: tilelang.layout.make_linear_layout(a_shared),
+            a_output: T.Fragment(
+                (block_S, block_S),
+                forward_thread_fn=lambda r, c: (r * (block_S // 4) + c // 4) % 128,
+                forward_index_fn=lambda r, c: r // (512 // block_S) * 4 + c % 4,
+            ),
+        })
         thread_idx = T.get_thread_binding()
 
         # Load K; overlap full-chunk async copies with beta loads.
@@ -182,10 +189,12 @@ def tilelang_kkt_solve(
 
         # A = I + StrictLower(diag(beta) @ K @ K^T).
         for j_s, j_t in T.Parallel(block_S, block_S):
-            a_shared[j_s, j_t] = T.if_then_else(
+            a_fragment[j_s, j_t] = T.if_then_else(
                 j_s > j_t, a_fragment[j_s, j_t] * b_shared[j_s],
                 T.if_then_else(j_s == j_t, 1, 0),
             )
+        for j_s, j_t in T.Parallel(block_S, block_S):
+            a_shared[j_s, j_t] = a_fragment[j_s, j_t]
         T.sync_threads()
 
         # Diagonal (block_S / 8) x 8x8 inverses, one row per thread.
@@ -214,8 +223,10 @@ def tilelang_kkt_solve(
 
         # Save A in the original layout and input dtype; mask tail rows.
         for j_s, j_t in T.Parallel(block_S, block_S):
+            a_output[j_s, j_t] = a_shared[j_s, j_t]
+        for j_s, j_t in T.Parallel(block_S, block_S):
             if left + j_s < seq_end_idx:
-                a[bb, left + j_s, bh, j_t] = a_shared[j_s, j_t]
+                a[bb, left + j_s, bh, j_t] = a_output[j_s, j_t]
 
     if is_varlen:
 
@@ -299,7 +310,7 @@ def kkt_solve(
     chunk_size: int = 64,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ):
-    """Compute the bare unit-lower inverse, with FP16 intermediate storage.
+    """计算裸单位下三角逆矩阵，使用 FP32 shared 工作区和 FP16 MMA 输入。
 
     Returns [B, N, H, chunk_size] in k.dtype, without gate or column-beta
     scaling. The full Blackwell GDR dispatch still uses DK=DV=128, chunk=64.
