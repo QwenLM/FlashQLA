@@ -399,6 +399,8 @@ def tilelang_fused_chunk_gdr_bwd(
                     ]
                 else:
                     b_shared[j_s] = 0
+            # All 512 threads prefill shared inputs before splitting into warp groups.
+            T.sync_threads()
             if tx < 128:
                 T.set_max_nreg(CONSUMER_S_NREG, 1)
 
