@@ -9,13 +9,13 @@ No correctness checks — use ``pytest tests/test_gdr_unit.py`` for that.
 
 Usage examples::
 
-    python utils/profile_gdr.py --set develop
-    python utils/profile_gdr.py --set profile --skip-bwd
-    python utils/profile_gdr.py --set develop --no-cp
-    python utils/profile_gdr.py --set develop --cp-cache
-    python utils/profile_gdr.py --set develop --state-v-first
-    python utils/profile_gdr.py --set develop --no-h0
-    python utils/profile_gdr.py --set develop --data-dtype float16
+    python profile/profile_gdr.py --set develop
+    python profile/profile_gdr.py --set profile --skip-bwd
+    python profile/profile_gdr.py --set develop --no-cp
+    python profile/profile_gdr.py --set develop --cp-cache
+    python profile/profile_gdr.py --set develop --state-v-first
+    python profile/profile_gdr.py --set develop --no-h0
+    python profile/profile_gdr.py --set develop --data-dtype float16
 """
 
 import argparse
@@ -47,7 +47,6 @@ from flash_qla.ops.gated_delta_rule.chunk import (
     chunk_gated_delta_rule_fwd as _chunk_gdr_fwd_impl,
     chunk_gated_delta_rule_bwd as _chunk_gdr_bwd_impl,
     _auto_intra_cp_context,
-    CHUNK_SIZE,
 )
 from flash_qla.utils import l2norm, pack
 from utils import profile
@@ -59,7 +58,7 @@ def chunk_gated_delta_rule_fwd_qla(
     enable_fwd_cp_cache=False, cp_context=None, is_train=True,
 ):
     if cp_context is None:
-        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train)
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, auto_cp, is_train)
     return _chunk_gdr_fwd_impl(
         q, k, v, g, beta, scale, initial_state, cu_seqlens,
         output_final_state, output_h, auto_cp, state_v_first,
@@ -73,7 +72,7 @@ def chunk_gated_delta_rule_bwd_qla(
     is_train=True,
 ):
     if cp_context is None:
-        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, CHUNK_SIZE, auto_cp, is_train)
+        cp_context = _auto_intra_cp_context(k, v, cu_seqlens, auto_cp, is_train)
     return _chunk_gdr_bwd_impl(
         q, k, v, g, beta, A, do, dht, scale, initial_state,
         cu_seqlens, state_v_first, auto_cp, cp_cache, cp_context,
@@ -326,24 +325,24 @@ def profile_gated_delta_rule(
     # Build QLA result dict (always, when kernel events are available)
     result_qla = None
     if has_qla_kernels:
+        cp_on = "tilelang_prepare_dh_kernel_kernel" in prof_qla
+        has_cp_h = "tilelang_correct_h0_kernel_kernel" in prof_qla
         result_qla = {
             "[bwd] csum": _get(prof_qla, "tilelang_chunk_local_cumsum_kernel_kernel"),
             "[bwd] recom": _get(
                 prof_qla, "tilelang_prepare_h_kernel_kernel", 1
-            ) if "tilelang_prepare_h_kernel_kernel#1" in prof_qla else _get(
+            ) if has_cp_h else _get(
                 prof_qla, "tilelang_prepare_h_kernel_kernel"
             ),
             "[bwd] gdr": _get(prof_qla, "tilelang_fused_chunk_gdr_bwd_kernel_kernel"),
-            "[bwd] cp-w": _get(prof_qla, "tilelang_get_warmup_chunks_bidi_kernel_kernel"),
-            "[bwd] cp-h": (
-                _get(prof_qla, "tilelang_prepare_h_kernel_kernel")
-                if "tilelang_prepare_h_kernel_kernel#1" in prof_qla
-                else nan
-            ),
-            "[bwd] cp-c": _get(prof_qla, "tilelang_correct_h0_kernel_kernel"),
-            "[bwd] cp-c-dht": _get(prof_qla, "tilelang_correct_h0_kernel_kernel", 1),
-            "[bwd] cp-dh": _get(prof_qla, "tilelang_prepare_dh_kernel_kernel"),
         }
+        if cp_on:
+            result_qla["[bwd] cp-w"] = _get(prof_qla, "tilelang_get_warmup_chunks_bidi_kernel_kernel")
+            if has_cp_h:
+                result_qla["[bwd] cp-h"] = _get(prof_qla, "tilelang_prepare_h_kernel_kernel")
+            result_qla["[bwd] cp-c"] = _get(prof_qla, "tilelang_correct_h0_kernel_kernel")
+            result_qla["[bwd] cp-c-dht"] = _get(prof_qla, "tilelang_correct_h0_kernel_kernel", 1)
+            result_qla["[bwd] cp-dh"] = _get(prof_qla, "tilelang_prepare_dh_kernel_kernel")
         if num_k_heads < num_v_heads:
             result_qla["[bwd] reduc"] = (
                 _get(prof_qla, "tilelang_group_reduce_vector_kernel_kernel") * 2
@@ -361,11 +360,12 @@ def profile_gated_delta_rule(
             "[bwd] gdr": _get(prof_fla, "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64"),
             "[bwd] dqkwg": _get(prof_fla, "kernel_kernel"),
             "[bwd] wy": _get(prof_fla, "prepare_wy_repr_bwd_kernel"),
-            "[bwd] cp-w": nan,
-            "[bwd] cp-h": nan,
-            "[bwd] cp-c": nan,
-            "[bwd] cp-dh": nan,
         }
+        if cp_on:
+            result_fla["[bwd] cp-w"] = nan
+            result_fla["[bwd] cp-h"] = nan
+            result_fla["[bwd] cp-c"] = nan
+            result_fla["[bwd] cp-dh"] = nan
         # torch ops that FLA launches between fused kernels
         fla_misc = 0.0
         for k_name, v_time in prof_fla.items():
