@@ -7,6 +7,8 @@ from collections.abc import Callable
 import torch
 import tilelang
 
+from .copy import copy_to_device, copy_to_host
+
 _KEY_VALUE_TYPES = (int, float, bool, str, bytes, type(None))
 
 
@@ -95,13 +97,15 @@ def _fallback_prepare_chunk_indices(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
 ) -> torch.LongTensor:
+    cu_seqlens_cpu = copy_to_host(cu_seqlens)
     indices = torch.cat(
         [
             torch.arange(n)
-            for n in tilelang.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
+            for n in tilelang.cdiv(prepare_lens(cu_seqlens_cpu), chunk_size).tolist()
         ]
     )
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+    indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
+    return copy_to_device(indices, cu_seqlens.device, dtype=cu_seqlens.dtype)
 
 
 @tensor_cache
@@ -113,7 +117,7 @@ def _fallback_prepare_chunk_offsets(
     num_chunks_per_seq = (seqlens + chunk_size - 1) // chunk_size
     chunk_offsets = torch.zeros_like(cu_seqlens)
     chunk_offsets[1:] = torch.cumsum(num_chunks_per_seq, dim=0)
-    return chunk_offsets, chunk_offsets[-1].item()
+    return chunk_offsets, copy_to_host(chunk_offsets[-1]).item()
 
 
 def prepare_varlen_metadata(
@@ -132,9 +136,9 @@ def prepare_varlen_metadata(
     indices = torch.stack((positions.eq(0).cumsum(0) - 1, positions), dim=1)
     cu_seqlens._flash_qla_prepared_varlen = (
         CHUNK_SIZE,
-        offsets.to(cu_seqlens, non_blocking=True),
+        copy_to_device(offsets, cu_seqlens.device, dtype=cu_seqlens.dtype, non_blocking=True),
         int(offsets[-1]),
-        indices.to(cu_seqlens, non_blocking=True),
+        copy_to_device(indices, cu_seqlens.device, dtype=cu_seqlens.dtype, non_blocking=True),
     )
     return cu_seqlens
 

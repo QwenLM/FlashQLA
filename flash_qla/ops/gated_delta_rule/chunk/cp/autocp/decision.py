@@ -6,6 +6,10 @@ from __future__ import annotations
 import functools
 import math
 
+import torch
+
+from flash_qla.utils.copy import copy_to_host
+
 from .launch import current_arch
 from .utils import (
     CP_ONLY_KERNELS,
@@ -65,10 +69,14 @@ def decide(cu_seqlens=None, seq_lens=None, num_chunks=None, num_v_heads=None,
         raise ValueError("num_v_heads is required")
 
     if num_chunks is not None:
+        if isinstance(num_chunks, torch.Tensor):
+            num_chunks = copy_to_host(num_chunks).tolist()
         chunks = [int(c) for c in num_chunks]
     elif cu_seqlens is not None:
         chunks = seq_chunks(cu_seqlens, chunk)
     elif seq_lens is not None:
+        if isinstance(seq_lens, torch.Tensor):
+            seq_lens = copy_to_host(seq_lens).tolist()
         chunks = [math.ceil(int(x) / chunk) for x in seq_lens]
     else:
         raise ValueError("provide one of cu_seqlens / seq_lens / num_chunks")
@@ -78,10 +86,12 @@ def decide(cu_seqlens=None, seq_lens=None, num_chunks=None, num_v_heads=None,
     H, cmax = int(num_v_heads), max(chunks)
     if warmup_per_head is None:
         if g is not None:
-            avg_per_head = g.float().mean(dim=1).reshape(-1).tolist()
+            avg_per_head = copy_to_host(g.detach().float().mean(dim=1).reshape(-1)).tolist()
             warmup_per_head = warmup_from_gate_avg(avg_per_head, chunk)
         else:
             warmup_per_head = [math.inf] * H
+    elif isinstance(warmup_per_head, torch.Tensor):
+        warmup_per_head = copy_to_host(warmup_per_head).tolist()
     feat_kw = dict(warmup_per_head=warmup_per_head, is_train=is_train,
                    backend=coefs["backend"])
     base_feat = struct_features(chunks, cmax, H, P, **feat_kw)
