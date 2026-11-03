@@ -9,8 +9,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ref_cp import ref_warmup, ref_warmup_bidi, ref_scan, rel_max, THRESHOLD
+from arch_utils import ARCH
 from flash_qla.ops.gated_delta_rule.chunk import (
     CHUNK_SIZE,
+    _CP_SUPPORTS_SLOT_SCAN,
     get_warmup_chunks,
     get_warmup_chunks_bidi,
     correct_initial_states,
@@ -22,7 +24,8 @@ DEVICE = "cuda"
 K = V = 128                # the scan kernels assert this
 SEED = 20260819
 
-SCAN_RTOL = 2e-2
+SCAN_RTOL = 2e-5
+LEGACY_SCAN_RTOL = 2e-2
 
 
 LAYOUTS = [
@@ -98,14 +101,18 @@ def _make_g(cu, num_heads, *, seed=SEED):
 # ===========================================================================
 # Synthetic scan inputs
 # ===========================================================================
-def _make_scan_inputs(seq_map, n_cp, H, *, state_v_first, fallback_pattern, seed=SEED):
+def _make_scan_inputs(
+    seq_map, n_cp, H, *, state_v_first, fallback_pattern, seed=SEED, near_identity=False,
+):
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     shape = (n_cp, H, V, K) if state_v_first else (n_cp, H, K, V)
     ht = torch.randn(shape, generator=gen, device=DEVICE, dtype=torch.float32) * 0.1
-    # spectral norm well under 1 so the M product decays instead of blowing up
+    # Short scans use contracting M; long scans retain history to expose accumulated error.
     mt = torch.randn(
         (n_cp, H, K, K), generator=gen, device=DEVICE, dtype=torch.float32
-    ) * (0.5 / K ** 0.5)
+    ) * (0.0001 if near_identity else 0.5 / K ** 0.5)
+    if near_identity:
+        mt += torch.eye(K, device=DEVICE) * 0.999
     if fallback_pattern == "all":
         fallback = torch.ones(n_cp, H, dtype=torch.bool, device=DEVICE)
     elif fallback_pattern == "none":
@@ -178,29 +185,44 @@ def test_get_warmup_chunks_bidi(segments, ragged_tail, num_heads, force_inter):
 # ===========================================================================
 # correct_initial_states / correct_terminal_states
 # ===========================================================================
+# Vary batch/head parallelism and scan length through the automatic launcher.
+# The expected result is independent of which precision or tile it selects.
+_CORRECTION_SHAPES = [
+    pytest.param([1], 1, SCAN_RTOL, id="single-unsplit"),
+    pytest.param([5], 1, SCAN_RTOL, id="single-h1"),
+    pytest.param([2, 2, 2], 8, SCAN_RTOL, id="uniform-h8"),
+    pytest.param([1, 3, 2], 16, SCAN_RTOL, id="mixed-h16"),
+    pytest.param([5], 128, SCAN_RTOL, id="single-h128"),
+    pytest.param([64] + [1] * 47, 1, 5e-5, id="long64-b48"),
+    pytest.param([256] + [1] * 47, 1, 2e-4, id="long256-b48"),
+]
+
 _FWD_BUF_DTYPES = [
     pytest.param(torch.float32, torch.float32, id="fp32"),
-    pytest.param(torch.bfloat16, torch.bfloat16, id="prod-bf16"),
+    pytest.param(torch.bfloat16, torch.bfloat16, id="legacy-bf16"),
 ]
 _BWD_BUF_DTYPES = [
     pytest.param(torch.float32, torch.float32, id="fp32"),
-    pytest.param(torch.float32, torch.bfloat16, id="prod-mixed"),
+    pytest.param(torch.float32, torch.bfloat16, id="legacy-mixed"),
 ]
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("segments", LAYOUTS)
+@pytest.mark.parametrize("segments, num_heads, fp32_rtol", _CORRECTION_SHAPES)
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 @pytest.mark.parametrize("use_raw_h0", [False, True], ids=["zero_seed", "raw_h0"])
 @pytest.mark.parametrize("fallback_pattern", FALLBACK_PATTERNS)
 @pytest.mark.parametrize("h_dtype, m_dtype", _FWD_BUF_DTYPES)
 def test_correct_initial_states(
-    segments, state_v_first, use_raw_h0, fallback_pattern, h_dtype, m_dtype
+    segments, num_heads, fp32_rtol, state_v_first, use_raw_h0, fallback_pattern, h_dtype, m_dtype,
 ):
-    H = 4
+    scan_rtol = (fp32_rtol if h_dtype == m_dtype == torch.float32
+                 and ARCH in ("SM90", "SM100", "SM103") else LEGACY_SCAN_RTOL)
+    H = num_heads
     cu, seq_map, _, _ = _build_layout(segments, ragged_tail=False)
     n_cp = cu.shape[0] - 1
     ht, mt, fallback = _make_scan_inputs(
         seq_map, n_cp, H, state_v_first=state_v_first, fallback_pattern=fallback_pattern,
+        near_identity=max(segments) >= 64,
     )
     ht, mt = ht.to(h_dtype), mt.to(m_dtype)
     raw_shape = (len(segments), H, V, K) if state_v_first else (len(segments), H, K, V)
@@ -215,34 +237,37 @@ def test_correct_initial_states(
     )
     err = rel_max(out, ref)
     assert out.dtype == torch.float32, "the main kernel's seed must stay fp32"
-    assert err <= SCAN_RTOL, f"cp_h0 rel_max={err:.2e} > {SCAN_RTOL:g}"
+    assert err <= scan_rtol, f"cp_h0 rel_max={err:.2e} > {scan_rtol:g}"
 
     if fallback_pattern == "none":
         seq_map_list = seq_map.tolist()
         for bb in range(len(segments)):
             lo, hi = seq_map_list[bb], seq_map_list[bb + 1]
             seed = raw_h0[bb] if raw_h0 is not None else torch.zeros_like(out[lo])
-            assert rel_max(out[lo], seed) <= SCAN_RTOL, f"seq {bb} seed"
+            assert rel_max(out[lo], seed) <= scan_rtol, f"seq {bb} seed"
             for idx in range(lo + 1, hi):
-                assert rel_max(out[idx], ht[idx - 1]) <= SCAN_RTOL, f"seq {bb} segment {idx}"
+                assert rel_max(out[idx], ht[idx - 1]) <= scan_rtol, f"seq {bb} segment {idx}"
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("segments", LAYOUTS)
+@pytest.mark.parametrize("segments, num_heads, fp32_rtol", _CORRECTION_SHAPES)
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 @pytest.mark.parametrize("use_raw_dht", [False, True], ids=["zero_seed", "raw_dht"])
 @pytest.mark.parametrize("fallback_pattern", FALLBACK_PATTERNS)
 @pytest.mark.parametrize("h_dtype, m_dtype", _BWD_BUF_DTYPES)
 def test_correct_terminal_states(
-    segments, state_v_first, use_raw_dht, fallback_pattern, h_dtype, m_dtype
+    segments, num_heads, fp32_rtol, state_v_first, use_raw_dht, fallback_pattern, h_dtype, m_dtype,
 ):
     """The backward twin: same scan, walked in reverse, with M transposed."""
-    H = 4
+    scan_rtol = (fp32_rtol if h_dtype == m_dtype == torch.float32
+                 and ARCH in ("SM90", "SM100", "SM103") else LEGACY_SCAN_RTOL)
+    H = num_heads
     cu, seq_map, _, _ = _build_layout(segments, ragged_tail=False)
     n_cp = cu.shape[0] - 1
     dht, mt, fallback = _make_scan_inputs(
         seq_map, n_cp, H, state_v_first=state_v_first,
         fallback_pattern=fallback_pattern, seed=SEED + 1,
+        near_identity=max(segments) >= 64,
     )
     dht, mt = dht.to(h_dtype), mt.to(m_dtype)
     raw_shape = (len(segments), H, V, K) if state_v_first else (len(segments), H, K, V)
@@ -258,7 +283,7 @@ def test_correct_terminal_states(
     )
     err = rel_max(out, ref)
     assert out.dtype == torch.float32, "the main kernel's seed must stay fp32"
-    assert err <= SCAN_RTOL, f"cp_dht rel_max={err:.2e} > {SCAN_RTOL:g}"
+    assert err <= scan_rtol, f"cp_dht rel_max={err:.2e} > {scan_rtol:g}"
 
 
 # ===========================================================================
@@ -266,24 +291,29 @@ def test_correct_terminal_states(
 # ===========================================================================
 @pytest.mark.gpu
 @pytest.mark.cp_inter_intra
-@pytest.mark.parametrize("segments", LAYOUTS)
+@pytest.mark.parametrize("segments, num_heads, fp32_rtol", _CORRECTION_SHAPES)
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 @pytest.mark.parametrize("fallback_pattern", FALLBACK_PATTERNS)
 @pytest.mark.parametrize("use_raw_h0", [False, True], ids=["zero-seed", "raw-h0"])
 @pytest.mark.parametrize(
     "reverse, transpose_m", [(False, False), (True, True)], ids=["fwd", "bwd"],
 )
+@pytest.mark.parametrize("h_dtype, m_dtype", _FWD_BUF_DTYPES)
 def test_aggregate_card_state(
-    segments, state_v_first, fallback_pattern, use_raw_h0, reverse, transpose_m
+    segments, num_heads, fp32_rtol, state_v_first, fallback_pattern, use_raw_h0,
+    reverse, transpose_m, h_dtype, m_dtype,
 ):
-    H = 4
+    scan_rtol = (fp32_rtol if h_dtype == m_dtype == torch.float32
+                 and ARCH in ("SM90", "SM100", "SM103") else LEGACY_SCAN_RTOL)
+    H = num_heads
     cu, seq_map, _, _ = _build_layout(segments, ragged_tail=False)
     n_cp = cu.shape[0] - 1
     ht, mt, fallback = _make_scan_inputs(
         seq_map, n_cp, H, state_v_first=state_v_first,
         fallback_pattern=fallback_pattern, seed=SEED + 2,
+        near_identity=max(segments) >= 64,
     )
-    ht, mt = ht.bfloat16(), mt.bfloat16()
+    ht, mt = ht.to(h_dtype), mt.to(m_dtype)
     raw_shape = (len(segments), H, V, K) if state_v_first else (len(segments), H, K, V)
     raw_h0 = torch.randn(raw_shape, device=DEVICE, dtype=torch.float32) if use_raw_h0 else None
 
@@ -296,17 +326,96 @@ def test_aggregate_card_state(
         reverse=reverse, transpose_m=transpose_m,
     )
     err_h = rel_max(h_card, ref_h)
-    assert err_h <= SCAN_RTOL, f"h_card rel_max={err_h:.2e} > {SCAN_RTOL:g}"
+    assert err_h <= scan_rtol, f"h_card rel_max={err_h:.2e} > {scan_rtol:g}"
     err_m = rel_max(m_card, ref_m)
-    assert err_m <= SCAN_RTOL, f"m_card rel_max={err_m:.2e} > {SCAN_RTOL:g}"
+    assert err_m <= scan_rtol, f"m_card rel_max={err_m:.2e} > {scan_rtol:g}"
 
     h_no_m, m_no_m = aggregate_card_state(
         ht, mt, fallback, seq_map, raw_h0=raw_h0, state_v_first=state_v_first,
         reverse=reverse, transpose_m=transpose_m, compute_m=False,
     )
     assert m_no_m is None
-    err_no_m = rel_max(h_no_m, h_card)
-    assert err_no_m <= 1e-5, f"h_card must not depend on compute_m, rel_max={err_no_m:.2e}"
+    assert rel_max(h_no_m, ref_h) <= scan_rtol
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "is_zigzag, num_heads",
+    [
+        pytest.param(False, 1, id="boundary-h1"),
+        pytest.param(False, 32, id="boundary-h32"),
+        pytest.param(False, 64, id="boundary-h64"),
+        pytest.param(False, 128, id="boundary-h128"),
+        pytest.param(True, 1, id="zigzag-h1"),
+        pytest.param(True, 16, id="zigzag-h16"),
+        pytest.param(True, 32, id="zigzag-h32"),
+        pytest.param(True, 64, id="zigzag-h64"),
+    ],
+)
+@pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["fwd", "bwd"])
+@pytest.mark.parametrize("use_raw_state", [False, True], ids=["zero-seed", "raw-seed"])
+@pytest.mark.parametrize("packed", [False, True], ids=["split-mixed", "packed-fp32"])
+@pytest.mark.parametrize("fallback_pattern", ["all", "random"])
+def test_correct_states_slots_precision(
+    is_zigzag, num_heads, state_v_first, reverse, use_raw_state, packed, fallback_pattern,
+):
+    """Indirect reads and sparse/scattered writes against a logical-order fp64 scan.
+
+    The h/M rows deliberately have unrelated addresses in the packed gather. The split
+    mixed-dtype case exercises the fallback used by older state producers.
+    """
+    if not _CP_SUPPORTS_SLOT_SCAN:
+        pytest.skip("slot scan not built for this architecture")
+    H, n_cp = num_heads, 8
+    seq_map = torch.tensor([0, 3, 8] if is_zigzag else [0, 8], dtype=torch.int32, device=DEVICE)
+    ht, mt, fallback = _make_scan_inputs(
+        seq_map, n_cp, H, state_v_first=state_v_first, fallback_pattern=fallback_pattern,
+    )
+    if packed:
+        h_slot = torch.tensor([11, 0, 9, 6, 15, 2, 13, 4], dtype=torch.int32, device=DEVICE)
+        m_slot = torch.tensor([10, 1, 8, 7, 14, 3, 12, 5], dtype=torch.int32, device=DEVICE)
+        h_buffer = torch.empty((2 * n_cp, H, K, V), device=DEVICE)
+        m_buffer = h_buffer
+    else:
+        h_slot = torch.tensor([5, 0, 4, 3, 7, 1, 6, 2], dtype=torch.int32, device=DEVICE)
+        m_slot = h_slot
+        h_buffer = torch.empty_like(ht)
+        mt = mt.bfloat16()
+        m_buffer = torch.empty_like(mt)
+    h_buffer[h_slot.long()] = ht
+    m_buffer[m_slot.long()] = mt
+    if is_zigzag:
+        out_slot = torch.tensor([-1, 3, 0, -1, 2, -1, 1, -1], dtype=torch.int32, device=DEVICE)
+        n_seqs, output_rows = 2, 4
+    else:
+        out_slot = torch.full((n_cp,), -1, dtype=torch.int32, device=DEVICE)
+        out_slot[0 if reverse else -1] = 0
+        n_seqs, output_rows = 1, 1
+    raw = torch.randn((n_seqs, H, K, V), device=DEVICE) * 0.1 if use_raw_state else None
+    # A supplied mask is indexed by physical h rows, independently of m/out slots.
+    mask = None
+    if fallback_pattern != "all":
+        mask = torch.ones(h_buffer.shape[:2], dtype=torch.bool, device=DEVICE)
+        mask[h_slot.long()] = fallback
+    wrapper = correct_terminal_states if reverse else correct_initial_states
+    out = wrapper(
+        raw, h_buffer, m_buffer, mask, seq_map, state_v_first=state_v_first,
+        h_slot=h_slot, m_slot=m_slot, out_slot=out_slot, is_zigzag=is_zigzag,
+    )
+    ref, _, _ = ref_scan(
+        ht, mt, fallback, seq_map, raw_h0=raw, state_v_first=state_v_first,
+        reverse=reverse, transpose_m=reverse,
+    )
+    expected = torch.empty((output_rows, H, K, V), device=DEVICE, dtype=torch.float64)
+    owned = out_slot >= 0
+    expected[out_slot[owned].long()] = ref[owned]
+    if not is_zigzag:
+        expected = expected[0]
+    assert out.shape == expected.shape
+    assert out.dtype == torch.float32
+    err = rel_max(out, expected)
+    assert err <= SCAN_RTOL, f"slots rel_max={err:.2e} > {SCAN_RTOL:g}"
 
 
 # ===========================================================================
@@ -367,11 +476,8 @@ def _zigzag_maps(cp, D, rank, device):
 )
 def test_correct_states_zigzag(cp, D, state_v_first, use_raw_state, reverse,
                                h_dtype, m_dtype):
-    from flash_qla.ops.gated_delta_rule.chunk import (
-        correct_initial_states_zigzag, correct_terminal_states_zigzag,
-    )
-    if correct_initial_states_zigzag is None:
-        pytest.skip("fused zigzag fold not built for this arch (sm120)")
+    if not _CP_SUPPORTS_SLOT_SCAN:
+        pytest.skip("slot scan not built for this architecture")
 
     torch.manual_seed(SEED + cp * 100 + D)
     H, rank = 4, 1
@@ -385,8 +491,7 @@ def test_correct_states_zigzag(cp, D, state_v_first, use_raw_state, reverse,
     raw_shape = (D, H, *state_shape)
     raw = torch.randn(raw_shape, device=DEVICE, dtype=torch.float32) if use_raw_state else None
 
-    fused = correct_terminal_states_zigzag if reverse else correct_initial_states_zigzag
-    plain = correct_terminal_states if reverse else correct_initial_states
+    correct = correct_terminal_states if reverse else correct_initial_states
 
     # --- reference: reindex into doc-chunk order, fold, then pull out owned rows ---
     h_all = h_rank.reshape(cp * n_local, H, *state_shape)
@@ -397,15 +502,17 @@ def test_correct_states_zigzag(cp, D, state_v_first, use_raw_state, reverse,
     kw = dict(fallback_mask=fb, seq_map_r2c=maps["fold_seq_map"],
               state_v_first=state_v_first)
     if reverse:
-        ref_all = plain(raw_dht=raw, dht_buffer=h_buf, mt_buffer=m_buf, **kw)
+        ref_all = correct(raw_dht=raw, dht_buffer=h_buf, mt_buffer=m_buf, **kw)
     else:
-        ref_all = plain(raw_h0=raw, ht_buffer=h_buf, mt_buffer=m_buf, **kw)
+        ref_all = correct(raw_h0=raw, ht_buffer=h_buf, mt_buffer=m_buf, **kw)
     ref = ref_all.index_select(0, maps["owned"]).contiguous()
 
     # --- fused, two collectives: h and M gathered apart, one map serves both ---
-    got_split = fused(raw, h_all, m_all, maps["fold_seq_map"],
-                      maps["split_slot"], maps["split_slot"], maps["out_slot"],
-                      n_local=n_local, state_v_first=state_v_first)
+    got_split = correct(
+        raw, h_all, m_all, None, maps["fold_seq_map"], state_v_first=state_v_first,
+        h_slot=maps["split_slot"], m_slot=maps["split_slot"],
+        out_slot=maps["out_slot"], is_zigzag=True,
+    )
     assert got_split.shape == ref.shape, (got_split.shape, ref.shape)
     assert torch.equal(got_split, ref), (
         f"split-gather fold differs from reindex+fold: "
@@ -416,9 +523,11 @@ def test_correct_states_zigzag(cp, D, state_v_first, use_raw_state, reverse,
     if h_dtype != m_dtype:
         return   # cannot cat; the split path above is what production uses here
     packed = torch.cat([h_rank, m_rank], dim=1).reshape(cp * 2 * n_local, H, *state_shape)
-    got_cat = fused(raw, packed, packed, maps["fold_seq_map"],
-                    maps["h_slot"], maps["m_slot"], maps["out_slot"],
-                    n_local=n_local, state_v_first=state_v_first)
+    got_cat = correct(
+        raw, packed, packed, None, maps["fold_seq_map"], state_v_first=state_v_first,
+        h_slot=maps["h_slot"], m_slot=maps["m_slot"],
+        out_slot=maps["out_slot"], is_zigzag=True,
+    )
     assert torch.equal(got_cat, ref), (
         f"cat-packed fold differs from reindex+fold: "
         f"max |delta|={(got_cat.float() - ref.float()).abs().max():.3e}"

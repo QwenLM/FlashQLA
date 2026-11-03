@@ -25,19 +25,16 @@ def all_gather_into_tensor(
 
 
 def pack_states(S_ext: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
-    """Pack (h, M) for the zigzag fold by stacking rows, not bytes.
+    """Pack equally shaped (h, M) states as two contiguous row ranges.
 
-    At K == V == 128 the two states have identical shape, and under CP they carry the
-    same dtype, so a plain ``cat`` along dim 0 gives one contiguous ``[2n, H, 128, 128]``
-    payload. One collective, and -- unlike ``pack_hm`` -- the gathered result needs no
-    unpacking: ``[world, 2n, ...]`` reshapes to ``[world*2n, ...]`` for free, and the
-    fold kernel addresses h and M as two row ranges via its slot maps.
-
-    Asserts rather than falling back: if this invariant ever breaks we want to hear
-    about it, not to silently return to the five-pass path.
+    The gathered ``[world, 2n, ...]`` tensor flattens to ``[world*2n, ...]`` as a
+    view; slot maps address h and M directly in either inter-card layout. Callers
+    gather different shapes or dtypes separately.
     """
     assert S_ext.shape == M.shape, (S_ext.shape, M.shape)
     assert S_ext.dtype == M.dtype, (S_ext.dtype, M.dtype)
+    # TODO: Have prepare_h / aggregate_card_state write gather-ready hm storage:
+    # all owned chunks for zigzag, only the boundary chunk for contiguous CP.
     return torch.cat([S_ext, M], dim=0)
 
 

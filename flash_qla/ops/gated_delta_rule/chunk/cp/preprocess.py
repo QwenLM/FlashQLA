@@ -21,11 +21,11 @@ class CPCache:
 
 def _assert_inter_intra_supported(is_inter, is_intra, aggregate_card_state):
     """Combined inter+intra CP needs ``aggregate_card_state``, which only the
-    SM100/SM103 kernels provide so far. Fail loudly instead of on a ``None`` call."""
+    SM90/SM100/SM103 kernels provide. Fail loudly instead of on a ``None`` call."""
     if is_inter and is_intra and aggregate_card_state is None:
         raise NotImplementedError(
             "Combined inter+intra CP requires `aggregate_card_state`, which is not "
-            "implemented for this architecture (SM100/SM103 only). Use pure inter-card "
+            "implemented for this architecture (SM90/SM100/SM103 only). Use pure inter-card "
             "CP (build_cp_context(..., enable_inter=True)) or pure intra-card CP instead."
         )
 
@@ -38,28 +38,46 @@ def _inter_correct_fwd(h_seq, m_seq, initial_state, cp_context, state_v_first):
     """Gather per-seq (h, M) over the ``pre`` cards sharing this card's first local
     sequence and correct it; returns the per-seq card_h0 with seq[0] corrected (seq[1:]
     keep ``initial_state``). On the first rank the card_h0 is just ``initial_state``."""
-    from flash_qla.ops.gated_delta_rule.chunk import correct_initial_states
+    from flash_qla.ops.gated_delta_rule.chunk import (
+        _CP_SUPPORTS_SLOT_SCAN, correct_initial_states,
+    )
 
     Hv = h_seq.shape[1]
-    hm = pack_hm(h_seq[-1], m_seq[-1])
-    ag_hm, _ = all_gather_into_tensor(hm, group=cp_context.group)
     rank = dist.get_rank(group=cp_context.group)
     pre = cp_context.pre_num_ranks
-    h_buf, m_buf = unpack_hm(ag_hm[rank - pre: rank + 1], h_seq[-1], m_seq[-1])
+    if _CP_SUPPORTS_SLOT_SCAN:
+        h_buf, m_buf, packed = _gather_states(
+            h_seq[-1:], m_seq[-1:], cp_context.group, rank - pre, rank + 1,
+        )
+    else:
+        hm = pack_hm(h_seq[-1], m_seq[-1])
+        ag_hm, _ = all_gather_into_tensor(hm, group=cp_context.group)
+        h_buf, m_buf = unpack_hm(ag_hm[rank - pre: rank + 1], h_seq[-1], m_seq[-1])
 
     if cp_context.is_first_rank:
         return initial_state
 
-    seq_map, fb_mask = cp_context.get_fwd_scan_tensors(Hv)
-    cp_h0_all = correct_initial_states(
-        raw_h0=None, ht_buffer=h_buf, mt_buffer=m_buf,
-        fallback_mask=fb_mask, seq_map_r2c=seq_map, state_v_first=state_v_first,
-    )
+    if _CP_SUPPORTS_SLOT_SCAN:
+        seq_map, h_slot, m_slot, out_slot = cp_context.get_inter_fold_tensors(
+            reverse=False, packed=packed,
+        )
+        boundary_h0 = correct_initial_states(
+            None, h_buf, m_buf, None, seq_map, state_v_first=state_v_first,
+            h_slot=h_slot, m_slot=m_slot, out_slot=out_slot,
+        )
+    else:
+        seq_map, fb_mask = cp_context.get_fwd_scan_tensors(Hv)
+        cp_h0_all = correct_initial_states(
+            raw_h0=None, ht_buffer=h_buf, mt_buffer=m_buf,
+            fallback_mask=fb_mask, seq_map_r2c=seq_map, state_v_first=state_v_first,
+        )
+        boundary_h0 = cp_h0_all[pre]
     if initial_state is None:
         card_h0 = torch.zeros(h_seq.shape, dtype=torch.float32, device=h_seq.device)
     else:
-        card_h0 = initial_state.clone()
-    card_h0[0] = cp_h0_all[h_buf.shape[0] - 1]
+        card_h0 = (initial_state.to(dtype=torch.float32, copy=True)
+                   if _CP_SUPPORTS_SLOT_SCAN else initial_state.clone())
+    card_h0[0] = boundary_h0
     return card_h0
 
 
@@ -67,32 +85,69 @@ def _inter_correct_bwd(dh_seq, m_first, dht, cp_context, state_v_first):
     """Gather per-seq dh over the ``post`` cards sharing this card's last local
     sequence and correct it; returns the per-seq terminal grad with seq[-1] set from
     the following cards (or ``dht`` unchanged when there is nothing to correct)."""
-    from flash_qla.ops.gated_delta_rule.chunk import correct_terminal_states
+    from flash_qla.ops.gated_delta_rule.chunk import (
+        _CP_SUPPORTS_SLOT_SCAN, correct_terminal_states,
+    )
 
     Hv = dh_seq.shape[1]
     N = dh_seq.shape[0]
-    hm = pack_hm(dh_seq[0], m_first)
-    ag_hm, _ = all_gather_into_tensor(hm, group=cp_context.group)
     rank = dist.get_rank(group=cp_context.group)
     post = cp_context.post_num_ranks
-    dh_buf, m_buf = unpack_hm(ag_hm[rank: rank + 1 + post], dh_seq[0], m_first)
+    if _CP_SUPPORTS_SLOT_SCAN:
+        dh_buf, m_buf, packed = _gather_states(
+            dh_seq[:1], m_first.unsqueeze(0), cp_context.group, rank, rank + 1 + post,
+        )
+    else:
+        hm = pack_hm(dh_seq[0], m_first)
+        ag_hm, _ = all_gather_into_tensor(hm, group=cp_context.group)
+        dh_buf, m_buf = unpack_hm(ag_hm[rank: rank + 1 + post], dh_seq[0], m_first)
 
     if dht is None and cp_context.is_last_rank:
         return None
-    card_dht = torch.zeros(dh_seq.shape, dtype=torch.float32, device=dh_seq.device) if dht is None else dht.clone()
+    if dht is None:
+        card_dht = torch.zeros(dh_seq.shape, dtype=torch.float32, device=dh_seq.device)
+    else:
+        card_dht = (dht.to(dtype=torch.float32, copy=True)
+                    if _CP_SUPPORTS_SLOT_SCAN else dht.clone())
     if not cp_context.is_last_rank:
-        seq_map, fb_mask = cp_context.get_bwd_scan_tensors(Hv)
-        cp_dht_all = correct_terminal_states(
-            raw_dht=None, dht_buffer=dh_buf, mt_buffer=m_buf,
-            fallback_mask=fb_mask, seq_map_r2c=seq_map, state_v_first=state_v_first,
-        )
-        card_dht[N - 1] = cp_dht_all[0]
+        if _CP_SUPPORTS_SLOT_SCAN:
+            seq_map, h_slot, m_slot, out_slot = cp_context.get_inter_fold_tensors(
+                reverse=True, packed=packed,
+            )
+            boundary_dht = correct_terminal_states(
+                None, dh_buf, m_buf, None, seq_map, state_v_first=state_v_first,
+                h_slot=h_slot, m_slot=m_slot, out_slot=out_slot,
+            )
+        else:
+            seq_map, fb_mask = cp_context.get_bwd_scan_tensors(Hv)
+            boundary_dht = correct_terminal_states(
+                raw_dht=None, dht_buffer=dh_buf, mt_buffer=m_buf,
+                fallback_mask=fb_mask, seq_map_r2c=seq_map, state_v_first=state_v_first,
+            )[0]
+        card_dht[N - 1] = boundary_dht
     return card_dht
 
 
+def _gather_states(a, b, group, first_rank=0, end_rank=None):
+    """Gather states without unpacking; all returned reshapes are views.
+
+    Equal shapes and dtypes share one row-packed collective. Otherwise each state
+    has its own collective, which also supports rectangular recurrent states.
+    """
+    if a.shape == b.shape and a.dtype == b.dtype:
+        packed = pack_states(a, b)
+        gathered, _ = all_gather_into_tensor(packed, group=group)
+        flat = gathered[first_rank:end_rank].flatten(0, 1)
+        return flat, flat, True
+    a_all, _ = all_gather_into_tensor(a, group=group)
+    b_all, _ = all_gather_into_tensor(b, group=group)
+    return (a_all[first_rank:end_rank].flatten(0, 1),
+            b_all[first_rank:end_rank].flatten(0, 1), False)
+
+
 # ---------------------------------------------------------------------------
-# zigzag inter correction: full all-gather of per-owned-chunk (h, M), reindex into
-# per-document chunk order, fold each document, extract this rank's owned chunks.
+# zigzag inter correction: gather per-owned-chunk (h, M), scan each document in
+# chunk order, and output this rank's owned chunks. SM120/SM121 reindex before scanning.
 # ---------------------------------------------------------------------------
 def _zigzag_reindex(packed_a, packed_b, cp_context):
     """All-gather the packed (a, b) per-owned-chunk pair, unpack, flatten to
@@ -112,38 +167,22 @@ def _zigzag_gather(packed_a, packed_b, cp_context):
     Returns ``(a_buf, b_buf, a_slot, b_slot)``; the fold kernel reads both buffers
     through the slot maps, so whatever layout NCCL produced is left alone.
 
-    Two shapes, picked by dtype:
-
-    * **same dtype** (forward: both come from ``fused_gdr_h``, or both from the same
-      ``aggregate_card_state``) -- row-stack into one tensor and issue a single
-      collective. ``fold_h_slot`` / ``fold_m_slot`` address the two row ranges.
-    * **different dtypes** (backward: ``dh`` is fp32 from ``fused_gdr_dh`` while ``M``
-      is the bf16 one cached in the forward) -- one tensor cannot hold both, so gather
-      them apart. Each buffer is then plain ``[world*n_local, ...]`` and the single
-      ``fold_split_slot`` serves both.
-
-    Either way the fold runs straight off the gathered buffer; the second collective is
-    the only difference, and it costs far less than the copies it replaces.
+    Equal shapes/dtypes share one collective. Mixed dtypes or rectangular states
+    are gathered separately and both use ``fold_split_slot``.
     """
-    if packed_a.dtype == packed_b.dtype:
-        buf = pack_states(packed_a, packed_b)
-        ag, _ = all_gather_into_tensor(buf, group=cp_context.group)
-        flat = ag.reshape(-1, *buf.shape[1:])
-        return flat, flat, cp_context.fold_h_slot, cp_context.fold_m_slot
-
-    a_all, _ = all_gather_into_tensor(packed_a, group=cp_context.group)
-    b_all, _ = all_gather_into_tensor(packed_b, group=cp_context.group)
+    a_buf, b_buf, packed = _gather_states(packed_a, packed_b, cp_context.group)
+    if packed:
+        return a_buf, b_buf, cp_context.fold_h_slot, cp_context.fold_m_slot
     slot = cp_context.fold_split_slot
-    return (a_all.reshape(-1, *packed_a.shape[1:]),
-            b_all.reshape(-1, *packed_b.shape[1:]), slot, slot)
+    return a_buf, b_buf, slot, slot
 
 
 def _inter_correct_fwd_zigzag(ht, mt, initial_state, cp_context, state_v_first):
     from flash_qla.ops.gated_delta_rule.chunk import (
-        correct_initial_states, correct_initial_states_zigzag,
+        _CP_SUPPORTS_SLOT_SCAN, correct_initial_states,
     )
 
-    if correct_initial_states_zigzag is None:      # sm120: no fused fold, two-step path
+    if not _CP_SUPPORTS_SLOT_SCAN:
         H = ht.shape[1]
         h_buf, m_buf = _zigzag_reindex(ht, mt, cp_context)
         fb = torch.ones((h_buf.shape[0], H), dtype=torch.bool, device=ht.device)
@@ -155,19 +194,19 @@ def _inter_correct_fwd_zigzag(ht, mt, initial_state, cp_context, state_v_first):
         return cp_h0_all.index_select(0, cp_context.owned_fold_slot).contiguous()
 
     h_buf, m_buf, h_slot, m_slot = _zigzag_gather(ht, mt, cp_context)
-    return correct_initial_states_zigzag(
-        initial_state, h_buf, m_buf, cp_context.fold_seq_map,
-        h_slot, m_slot, cp_context.fold_out_slot,
-        n_local=ht.shape[0], state_v_first=state_v_first,
+    return correct_initial_states(
+        initial_state, h_buf, m_buf, None, cp_context.fold_seq_map,
+        state_v_first=state_v_first, h_slot=h_slot, m_slot=m_slot,
+        out_slot=cp_context.fold_out_slot, is_zigzag=True,
     )
 
 
 def _inter_correct_bwd_zigzag(dh, mt, dht, cp_context, state_v_first):
     from flash_qla.ops.gated_delta_rule.chunk import (
-        correct_terminal_states, correct_terminal_states_zigzag,
+        _CP_SUPPORTS_SLOT_SCAN, correct_terminal_states,
     )
 
-    if correct_terminal_states_zigzag is None:     # sm120: no fused fold, two-step path
+    if not _CP_SUPPORTS_SLOT_SCAN:
         H = dh.shape[1]
         dh_buf, m_buf = _zigzag_reindex(dh, mt, cp_context)
         fb = torch.ones((dh_buf.shape[0], H), dtype=torch.bool, device=dh.device)
@@ -179,10 +218,10 @@ def _inter_correct_bwd_zigzag(dh, mt, dht, cp_context, state_v_first):
         return cp_dht_all.index_select(0, cp_context.owned_fold_slot).contiguous()
 
     dh_buf, m_buf, h_slot, m_slot = _zigzag_gather(dh, mt, cp_context)
-    return correct_terminal_states_zigzag(
-        dht, dh_buf, m_buf, cp_context.fold_seq_map,
-        h_slot, m_slot, cp_context.fold_out_slot,
-        n_local=dh.shape[0], state_v_first=state_v_first,
+    return correct_terminal_states(
+        dht, dh_buf, m_buf, None, cp_context.fold_seq_map,
+        state_v_first=state_v_first, h_slot=h_slot, m_slot=m_slot,
+        out_slot=cp_context.fold_out_slot, is_zigzag=True,
     )
 
 

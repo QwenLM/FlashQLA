@@ -11,27 +11,28 @@ from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 # `store_inter_h` / `compute_m` modes of `tilelang_correct_h0`, which exist in the
 # SM90/SM100/SM103 kernels; where it is `None` (e.g. SM120), pure inter and pure intra
 # still work and `cp_preprocess_fwd/bwd` reject inter+intra with an explicit error.
-# `correct_{initial,terminal}_states_zigzag` are gated the same way: they rely on
-# `tilelang_correct_h0`'s `use_zigzag` mode, which lives in the same two kernels. Where
-# they are `None`, zigzag falls back to `_zigzag_reindex` + the plain fold.
+# Correction kernels read gathered buffers via slots for either inter-card layout.
+# The selected architecture determines slot-scan support; SM120/SM121 retain
+# their unpack/reindex fallback.
 if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
-    from .hopper import correct_initial_states_zigzag, correct_terminal_states_zigzag
     from .hopper.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 64
+    _CP_SUPPORTS_SLOT_SCAN = True
 elif tilelang.contrib.nvcc.get_target_compute_version() in ["10.0", "10.3"]:
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
-    from .blackwell import correct_initial_states_zigzag, correct_terminal_states_zigzag
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 64
+    _CP_SUPPORTS_SLOT_SCAN = True
 elif tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"]:
     from .blackwell_sm120 import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
-    correct_initial_states_zigzag = correct_terminal_states_zigzag = None
+    aggregate_card_state = None
     from .blackwell_sm120.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 32
+    _CP_SUPPORTS_SLOT_SCAN = False
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100, sm103, sm120 and sm121 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 from .cp import (

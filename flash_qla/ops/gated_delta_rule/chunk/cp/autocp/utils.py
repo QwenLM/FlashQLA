@@ -84,7 +84,14 @@ def coefs_path_for(arch: str) -> str | None:
 def is_calibrated(arch: str) -> bool:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", AutocpInfo)
-        return coefs_path_for(arch) is not None
+        path = coefs_path_for(arch)
+    if path is None:
+        return False
+    # Keep auto-CP on its heuristic until current launches are calibrated.
+    with open(path, newline="") as f:
+        records = list(csv.DictReader(f))
+    rows = {row["kernel"].strip() for row in records}
+    return set(coef_rows(BACKEND_OF[arch], KERNELS)).issubset(rows)
 
 
 def load_coefs(path: str | None = None, *, arch: str) -> dict:
@@ -188,7 +195,9 @@ class StructFeatures:
 
     @property
     def shape(self) -> LaunchShape:
-        return LaunchShape(H=self.H, n_part=self.num_partitions, P=self.P)
+        return LaunchShape(
+            H=self.H, n_part=self.num_partitions, P=self.P, n_raw=self.num_raw,
+        )
 
 
 def warmup_from_gate_avg(avg_per_head, chunk: int,
@@ -240,7 +249,7 @@ def struct_features(chunks, S: int, H: int, P: int, warmup_per_head,
             bwd.append((0, copies))
 
     runs = {"fb": fb, "co": co, "prep": prep, "bwd": bwd}
-    shape = LaunchShape(H=H, n_part=n_part, P=P)
+    shape = LaunchShape(H=H, n_part=n_part, P=P, n_raw=len(chunks))
     memo: dict[tuple[str, int], float] = {}
     depths: dict[str, float] = {}
     for kernel, family in KERNEL_FAMILY.items():

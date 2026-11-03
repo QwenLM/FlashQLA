@@ -133,6 +133,13 @@ class FlashQLACPContext:
             _create_scan_fb_mask(self.post_num_ranks, num_v_heads, dev_idx),
         )
 
+    def get_inter_fold_tensors(self, reverse: bool, packed: bool):
+        """Slots for a contiguous rank slice of the default inter layout."""
+        n_ranks = 1 + (self.post_num_ranks if reverse else self.pre_num_ranks)
+        return _create_inter_fold_tensors(
+            n_ranks, reverse, packed, str(self.cu_seqlens.device),
+        )
+
     def get_full_warmup(self, num_v_heads: int, chunk_size: int) -> torch.Tensor:
         """The zigzag path's ``[nseg, Hv]`` warmup-chunk count, over whichever
         segmentation the kernels are fed: the intra partitions when the intra split is
@@ -185,6 +192,11 @@ def build_cp_context(
       to read the gate, and no CUDA graph capture (a miss under capture asserts).
     - ``force_intra_cp`` bypasses the intra decision and always splits, for tests and
       profiling that need the intra path on configurations it would skip.
+    - KV and VK state layouts share the same partition decision and context cache.
+    - ``zigzag=True`` assigns rank r chunks r and 2*world_size-1-r of every global
+      document. Each document length must be divisible by 2*world_size. Inputs are
+      ordered as all documents' early chunks, then all documents' late chunks.
+      The default remains a contiguous token partition across ranks.
     """
 
     if enable_inter and group is None:
@@ -273,6 +285,7 @@ def build_cp_context(
             conv1d_kernel_size=inter_ctx.conv1d_kernel_size,
             pre_num_conv_tokens=inter_ctx.pre_num_conv_tokens,
             intra_cp_cu_seqlens=intra_ctx.intra_cp_cu_seqlens,
+            intra_cp_cu_seqlens_cpu=intra_ctx.intra_cp_cu_seqlens_cpu,
             seq_map_r2c=intra_ctx.seq_map_r2c,
             seq_map_c2r=intra_ctx.seq_map_c2r,
             ht_mask=intra_ctx.ht_mask,
@@ -412,7 +425,7 @@ def _calc_inter_cp_seqs_zigzag(
     local_cu = [0]
     for cl in local_lens:
         local_cu.append(local_cu[-1] + cl)
-    local_cu_cpu = torch.tensor(local_cu, dtype=torch.int32)
+    local_cu_cpu = torch.tensor(local_cu, dtype=cu_seqlens.dtype)
     local_cu_gpu = local_cu_cpu.to(device=device, non_blocking=True)
 
     n_local = 2 * D
@@ -443,10 +456,8 @@ def _calc_inter_cp_seqs_zigzag(
     h_slot = torch.empty(D * NC, dtype=torch.int32)
     m_slot = torch.empty(D * NC, dtype=torch.int32)
     out_slot = torch.empty(D * NC, dtype=torch.int32)
-    # h and M only share a dtype on the forward (both come from fused_gdr_h / the same
-    # aggregate). On the backward dh is fp32 against a bf16 cached M, so they cannot ride
-    # one cat-packed tensor and are gathered separately -- then each buffer is just
-    # [world*n_local, ...] and one map serves both.
+    # Mixed-dtype or rectangular states are gathered separately; then each buffer
+    # contains world*n_local rows and the same split map serves both operands.
     split_slot = torch.empty(D * NC, dtype=torch.int32)
     for d in range(D):
         for c in range(NC):
@@ -468,7 +479,7 @@ def _calc_inter_cp_seqs_zigzag(
         cu_seqlens=local_cu_gpu,
         cu_seqlens_cpu=local_cu_cpu,
         is_first_rank=(rank == 0),
-        is_last_rank=(rank == world_size - 1),
+        is_last_rank=(rank == 0), # is_last_rank is not used in zigzag, set to rank 0 for consistency
         num_docs=D,
         num_chunks=NC,
         chunk_to_gathered_slot=c2g.to(device=device, non_blocking=True),
@@ -609,8 +620,8 @@ def _calc_intra_cp_seqs(
     else:
         warnings.warn(
             "AUTOCP_MODEL is disabled; falling back to the heuristic intra-CP "
-            "rule instead of the calibrated autocp model. Enable AUTOCP_MODEL "
-            "for accurate CP decisions.",
+            "rule. Run tools.autocp.fit to calibrate the current correction kernels "
+            "before enabling the model; legacy coefficients do not apply.",
             RuntimeWarning, stacklevel=2,
         )
         use_cp, max_local_chunks = _heuristic_intra_cp(
@@ -654,6 +665,18 @@ def _create_scan_seq_map(num_ranks: int, device_idx: int) -> torch.Tensor:
 @tensor_cache
 def _create_scan_fb_mask(num_ranks: int, num_v_heads: int, device_idx: int) -> torch.Tensor:
     return torch.ones((num_ranks + 1, num_v_heads), dtype=torch.bool, device=f"cuda:{device_idx}")
+
+
+@tensor_cache
+def _create_inter_fold_tensors(n_ranks: int, reverse: bool, packed: bool, device: str):
+    """Map rank-ordered gathered rows directly to the current boundary output."""
+    rows = torch.arange(n_ranks, dtype=torch.int32)
+    h_slot = rows * 2 if packed else rows
+    m_slot = h_slot + 1 if packed else rows
+    out_slot = torch.full((n_ranks,), -1, dtype=torch.int32)
+    out_slot[0 if reverse else -1] = 0
+    seq_map = torch.tensor([0, n_ranks], dtype=torch.int32)
+    return tuple(t.to(device=device) for t in (seq_map, h_slot, m_slot, out_slot))
 
 
 @tensor_cache
