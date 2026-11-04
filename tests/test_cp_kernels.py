@@ -289,16 +289,33 @@ def test_correct_terminal_states(
 # ===========================================================================
 # aggregate_card_state (inter+intra only)
 # ===========================================================================
+_AGGREGATE_CASES = [
+    pytest.param(
+        *shape.values, fallback, use_raw, reverse, reverse, *dtypes.values,
+        id=f"{shape.id}-{fallback}-{'raw-h0' if use_raw else 'zero-seed'}-"
+           f"{'bwd' if reverse else 'fwd'}-{dtypes.id}",
+    )
+    for shape in _CORRECTION_SHAPES
+    for fallback in FALLBACK_PATTERNS
+    for use_raw in (False, True)
+    for reverse in (False, True)
+    for dtypes in _FWD_BUF_DTYPES
+] + [
+    pytest.param(
+        [256], 4, 2e-4, "all", True, False, False,
+        torch.float32, torch.float32, id="long256",
+    ),
+]
+
+
 @pytest.mark.gpu
 @pytest.mark.cp_inter_intra
-@pytest.mark.parametrize("segments, num_heads, fp32_rtol", _CORRECTION_SHAPES)
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
-@pytest.mark.parametrize("fallback_pattern", FALLBACK_PATTERNS)
-@pytest.mark.parametrize("use_raw_h0", [False, True], ids=["zero-seed", "raw-h0"])
 @pytest.mark.parametrize(
-    "reverse, transpose_m", [(False, False), (True, True)], ids=["fwd", "bwd"],
+    "segments, num_heads, fp32_rtol, fallback_pattern, use_raw_h0, "
+    "reverse, transpose_m, h_dtype, m_dtype",
+    _AGGREGATE_CASES,
 )
-@pytest.mark.parametrize("h_dtype, m_dtype", _FWD_BUF_DTYPES)
 def test_aggregate_card_state(
     segments, num_heads, fp32_rtol, state_v_first, fallback_pattern, use_raw_h0,
     reverse, transpose_m, h_dtype, m_dtype,
@@ -317,9 +334,12 @@ def test_aggregate_card_state(
     raw_shape = (len(segments), H, V, K) if state_v_first else (len(segments), H, K, V)
     raw_h0 = torch.randn(raw_shape, device=DEVICE, dtype=torch.float32) if use_raw_h0 else None
 
+    # Dual CP only aggregates dh in backward and reuses the forward M product.
+    # Hopper additionally retains its generic reverse-M aggregation interface.
+    compute_m = not reverse or ARCH == "SM90"
     h_card, m_card = aggregate_card_state(
         ht, mt, fallback, seq_map, raw_h0=raw_h0, state_v_first=state_v_first,
-        reverse=reverse, transpose_m=transpose_m, compute_m=True,
+        reverse=reverse, transpose_m=transpose_m, compute_m=compute_m,
     )
     _, ref_h, ref_m = ref_scan(
         ht, mt, fallback, seq_map, raw_h0=raw_h0, state_v_first=state_v_first,
@@ -327,6 +347,9 @@ def test_aggregate_card_state(
     )
     err_h = rel_max(h_card, ref_h)
     assert err_h <= scan_rtol, f"h_card rel_max={err_h:.2e} > {scan_rtol:g}"
+    if not compute_m:
+        assert m_card is None
+        return
     err_m = rel_max(m_card, ref_m)
     assert err_m <= scan_rtol, f"m_card rel_max={err_m:.2e} > {scan_rtol:g}"
 

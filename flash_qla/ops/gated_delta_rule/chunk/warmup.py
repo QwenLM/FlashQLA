@@ -126,7 +126,9 @@ def _warm_correction(cfg):
     if major == 9:
         from .hopper.cp_fwd import tilelang_correct_h0, select_correction_config
     elif major == 10:
-        from .blackwell.cp_fwd import tilelang_correct_h0, select_correction_config
+        from .blackwell.cp_fwd import (
+            tilelang_correct_h0, select_correction_config, tilelang_aggregate_hm,
+        )
     else:
         return  # SM120 keeps its existing correction kernels.
 
@@ -137,7 +139,16 @@ def _warm_correction(cfg):
     scan_seeds = {False, True} if combined else seeds
     modes = [(False, False, True, False, False, scan_seeds)]
     if combined:
-        modes.append((False, False, False, True, True, seeds))
+        if major == 10:
+            # Blackwell aggregates h and M in a dedicated paired-column scan.
+            for use_raw in sorted(seeds):
+                tilelang_aggregate_hm(
+                    H=cfg.H, h_dtype=torch.float32, m_dtype=torch.float32,
+                    seqlen_dtype=cfg.cu_seqlens_dtype, mask_dtype=torch.bool,
+                    state_v_first=cfg.state_v_first, use_raw_h0=use_raw,
+                )
+        else:
+            modes.append((False, False, False, True, True, seeds))
     if cfg.training:
         bwd_seeds = {False, True} if cfg.output_final_state else {False}
         bwd_scan_seeds = {False, True} if combined else bwd_seeds
@@ -146,10 +157,12 @@ def _warm_correction(cfg):
             modes.append((True, True, False, True, False, bwd_seeds))
 
     for reverse, transpose, store_intra, store_inter, compute_m, use_seeds in modes:
+        # Only Hopper's generic scan still supports a running M product.
+        aggregate_kw = {"compute_m": compute_m} if major == 9 else {}
         variants = {
             select_correction_config(
                 cfg.H, rb, cfg.V, num_sms=num_sms,
-                compute_m=compute_m,
+                **aggregate_kw,
             )
             for rb in range(1, num_sms + 1)
         }
@@ -165,7 +178,7 @@ def _warm_correction(cfg):
                         use_raw_h0=use_raw, state_v_first=cfg.state_v_first,
                         reverse=reverse, transpose_m=transpose,
                         store_intra_h0=store_intra, store_inter_h=store_inter,
-                        compute_m=compute_m, precision=precision,
+                        precision=precision, **aggregate_kw,
                         block_DV=block_dv, use_slots=use_slots,
                     )
 
