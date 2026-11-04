@@ -11,6 +11,10 @@ import warnings
 from collections import Counter
 from dataclasses import dataclass
 
+import torch
+
+from flash_qla.utils.copy import copy_to_host
+
 from .launch import BACKEND_OF, LaunchShape, coef_rows, launch_config
 
 #: Kernel -> the modes that price it -> the column measure.py times it in. The
@@ -143,7 +147,7 @@ def load_coefs(path: str | None = None, *, arch: str) -> dict:
 # Structural features
 # ---------------------------------------------------------------------------
 def seq_chunks(cu_seqlens, chunk: int) -> list[int]:
-    cu = list(cu_seqlens)
+    cu = copy_to_host(cu_seqlens).tolist() if isinstance(cu_seqlens, torch.Tensor) else list(cu_seqlens)
     return [math.ceil((cu[i + 1] - cu[i]) / chunk) for i in range(len(cu) - 1)]
 
 

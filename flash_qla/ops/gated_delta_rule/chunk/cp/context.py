@@ -12,6 +12,7 @@ import torch.distributed as dist
 import tilelang
 
 from flash_qla.utils import tensor_cache
+from flash_qla.utils.copy import copy_to_device, copy_to_host
 from flash_qla.ops.gated_delta_rule.chunk import CHUNK_SIZE
 
 from .autocp import current_arch, is_calibrated
@@ -333,7 +334,7 @@ def _calc_inter_cp_seqs(
         rank = dist.get_rank(group=group)
 
     if cu_seqlens_cpu is None:
-        cu_seqlens_cpu = cu_seqlens.cpu()
+        cu_seqlens_cpu = copy_to_host(cu_seqlens)
     cu_seqlens_cpu = cu_seqlens_cpu.to(dtype=torch.long)
 
     total_tokens = cu_seqlens_cpu[-1].item()
@@ -352,8 +353,8 @@ def _calc_inter_cp_seqs(
     local_cu_seqlens_cpu = (
         subset_cu_seqlens.clamp(min=rank_start, max=rank_end) - rank_start
     ).unique_consecutive().to(torch.int32)
-    local_cu_seqlens_gpu = local_cu_seqlens_cpu.to(
-        device=cu_seqlens.device, non_blocking=True)
+    local_cu_seqlens_gpu = copy_to_device(
+        local_cu_seqlens_cpu, cu_seqlens.device, non_blocking=True)
 
     first_seq_global_start = cu_seqlens_cpu[start_seq_idx].item()
     last_seq_global_end = cu_seqlens_cpu[end_seq_idx].item()
@@ -540,7 +541,7 @@ def _build_intra_cp_context(
 ) -> FlashQLACPContext:
     device = raw_cu_seqlens.device
     seqlen_dtype = raw_cu_seqlens.dtype
-    raw_cu_seqlens_list = raw_cu_seqlens.tolist()
+    raw_cu_seqlens_list = copy_to_host(raw_cu_seqlens).tolist()
 
     cp_cu_seqlens = []
     ht_mask = []
@@ -569,21 +570,21 @@ def _build_intra_cp_context(
         seq_map_r2c.append(len(cp_cu_seqlens))
     cp_cu_seqlens.append(raw_cu_seqlens_list[-1])
 
-    # kept so ``get_full_warmup`` can read the segmentation without a D2H on the GPU
-    # copy below; it is also the stable ``tensor_cache`` key for that warmup.
     cp_cu_seqlens_cpu = torch.tensor(cp_cu_seqlens, dtype=seqlen_dtype, device="cpu")
-    cp_cu_seqlens = torch.tensor(
-        cp_cu_seqlens, dtype=seqlen_dtype, device=device, requires_grad=False
+    cp_cu_seqlens = copy_to_device(
+        cp_cu_seqlens_cpu, device
     )
-    seq_map_c2r = torch.tensor(seq_map_c2r, dtype=seqlen_dtype, device=device)
-    seq_map_r2c = torch.tensor(
-        seq_map_r2c, dtype=seqlen_dtype, device=device, requires_grad=False
+    seq_map_c2r = copy_to_device(
+        torch.tensor(seq_map_c2r, dtype=seqlen_dtype, device="cpu"), device
     )
-    ht_mask = torch.tensor(
-        ht_mask, dtype=torch.bool, device=device, requires_grad=False
+    seq_map_r2c = copy_to_device(
+        torch.tensor(seq_map_r2c, dtype=seqlen_dtype, device="cpu"), device
     )
-    ht_mask_bwd = torch.tensor(
-        ht_mask_bwd, dtype=torch.bool, device=device, requires_grad=False
+    ht_mask = copy_to_device(
+        torch.tensor(ht_mask, dtype=torch.bool, device="cpu"), device
+    )
+    ht_mask_bwd = copy_to_device(
+        torch.tensor(ht_mask_bwd, dtype=torch.bool, device="cpu"), device
     )
 
     return FlashQLACPContext(
@@ -607,7 +608,7 @@ def _calc_intra_cp_seqs(
     is_train: bool = False,
     force_intra_cp: bool = False,
 ) -> FlashQLACPContext:
-    raw_cu_seqlens_list = raw_cu_seqlens.tolist()
+    raw_cu_seqlens_list = copy_to_host(raw_cu_seqlens).tolist()
     seqlens = [raw_cu_seqlens_list[i + 1] - raw_cu_seqlens_list[i]
                for i in range(len(raw_cu_seqlens_list) - 1)]
     num_chunks = [tilelang.cdiv(x, chunk_size) for x in seqlens]

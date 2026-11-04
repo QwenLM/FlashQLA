@@ -52,7 +52,7 @@ def chunk_gated_delta_rule_fwd_qla(
 ):
     if cp_context is None:
         cp_context = _auto_intra_cp_context(
-            k, v, cu_seqlens, auto_cp=auto_cp, is_train=is_train,
+            k, v, cu_seqlens, auto_cp, is_train,
             force_intra_cp=force_intra_cp,
         )
     return _chunk_gdr_fwd_impl(
@@ -69,7 +69,7 @@ def chunk_gated_delta_rule_bwd_qla(
 ):
     if cp_context is None:
         cp_context = _auto_intra_cp_context(
-            k, v, cu_seqlens, auto_cp=auto_cp, is_train=is_train,
+            k, v, cu_seqlens, auto_cp, is_train,
             force_intra_cp=force_intra_cp,
         )
     return _chunk_gdr_bwd_impl(
