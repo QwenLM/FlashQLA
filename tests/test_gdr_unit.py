@@ -25,20 +25,26 @@ from gdr_common import (
 # ---------------------------------------------------------------------------
 DETERMINISM_ITERS = 1000
 
-# (B, T, Hk, Hv, varlen, cu_seqlens, check_h)
+# (B, T, Hk, Hv, varlen, cu_seqlens, check_h, long_memory)
 CONFIGS = [
     # dense
-    pytest.param(1, 4096, 4, 4, False, None, True, id="dense-H4"),
-    pytest.param(1, 4096, 2, 8, False, None, True, id="dense-Hk2Hv8"),
-    pytest.param(1, 4096, 4, 16, False, None, True, id="dense-Hk4Hv16"),
+    pytest.param(1, 4096, 4, 4, False, None, True, False, id="dense-H4"),
+    pytest.param(1, 4096, 2, 8, False, None, True, False, id="dense-Hk2Hv8"),
+    pytest.param(1, 4096, 4, 16, False, None, True, False, id="dense-Hk4Hv16"),
     # varlen: explicit segments, chunk-unaligned boundaries, sub-chunk, padding, GQA
-    pytest.param(1, 128, 4, 4, True, [0, 47, 128], True, id="vl-subchunk"),
-    pytest.param(1, 4096, 4, 4, True, [0, 517, 883, 1010, 3767, 4096], True, id="vl-disparate"),
-    pytest.param(1, 4096, 16, 32, True, [0, 410, 841, 1135, 2126, 2512, 4096], True, id="vl-gqa"),
-    pytest.param(1, 256, 4, 4, True, [0, 73, 115, 209], True, id="vl-padded"),
+    pytest.param(1, 128, 4, 4, True, [0, 47, 128], True, False, id="vl-subchunk"),
+    pytest.param(1, 4096, 4, 4, True, [0, 517, 883, 1010, 3767, 4096], True, False, id="vl-disparate"),
+    pytest.param(1, 4096, 16, 32, True, [0, 410, 841, 1135, 2126, 2512, 4096], True, False, id="vl-gqa"),
+    pytest.param(1, 256, 4, 4, True, [0, 73, 115, 209], True, False, id="vl-padded"),
     # long stress: no h compare (o/s only)
-    pytest.param(1, 16384, 4, 4, True, [0, 4096, 6893, 7665, 8192, 12288, 16384], False, id="vl-long"),
-    pytest.param(1, 32768, 16, 16, False, None, False, id="dense-long"),
+    pytest.param(1, 16384, 4, 4, True, [0, 4096, 6893, 7665, 8192, 12288, 16384], False, False, id="vl-long"),
+    pytest.param(1, 32768, 16, 16, False, None, False, False, id="dense-long"),
+    # Long sequences with weak decay and weak beta, using normal AutoCP selection.
+    *[
+        pytest.param(1, T, 4, 4, True, [0, T], False, True,
+                     id=f"long-memory-{T // 1024}k", marks=pytest.mark.slow)
+        for T in (16384, 65536, 131072)
+    ],
 ]
 
 
@@ -116,14 +122,14 @@ def _run_bwd(q, k, v, g_ref, g_qla, beta, A_ref, A_qla, do,
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
-    "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list, check_h",
+    "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list, check_h, long_memory",
     CONFIGS,
 )
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 @pytest.mark.parametrize("use_h0", [False, True], ids=["no_h0", "h0"])
 def test_fwd(
     batch_size, num_tokens, num_k_heads, num_v_heads,
-    varlen, cu_seqlens_list, check_h, state_v_first, use_h0,
+    varlen, cu_seqlens_list, check_h, long_memory, state_v_first, use_h0,
 ):
     (
         q, k, v, g, beta, do,
@@ -132,6 +138,7 @@ def test_fwd(
     ) = make_inputs(
         batch_size, num_tokens, num_k_heads, num_v_heads,
         varlen, cu_seqlens_list, use_h0, state_v_first,
+        long_memory=long_memory,
     )
 
     (
@@ -144,7 +151,7 @@ def test_fwd(
     if check_h:
         h_qla_cmp = h_qla.transpose(-1, -2) if state_v_first else h_qla
         assert_relative(h_qla_cmp, h_ref, "h_qla")
-    if h0_ref is not None:
+    if h0_ref is not None or long_memory:
         s_qla_cmp = s_qla.transpose(-1, -2) if state_v_first else s_qla
         assert_relative(s_qla_cmp, s_ref, "s_qla")
 
@@ -155,14 +162,14 @@ def test_fwd(
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
-    "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list, check_h",
+    "batch_size, num_tokens, num_k_heads, num_v_heads, varlen, cu_seqlens_list, check_h, long_memory",
     CONFIGS,
 )
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 @pytest.mark.parametrize("use_h0", [False, True], ids=["no_h0", "h0"])
 def test_bwd(
     batch_size, num_tokens, num_k_heads, num_v_heads,
-    varlen, cu_seqlens_list, check_h, state_v_first, use_h0,
+    varlen, cu_seqlens_list, check_h, long_memory, state_v_first, use_h0,
 ):
     (
         q, k, v, g, beta, do,
@@ -171,6 +178,7 @@ def test_bwd(
     ) = make_inputs(
         batch_size, num_tokens, num_k_heads, num_v_heads,
         varlen, cu_seqlens_list, use_h0, state_v_first,
+        long_memory=long_memory,
     )
 
     (

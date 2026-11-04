@@ -10,8 +10,8 @@ One process per rank runs its token slice through the public autograd API under 
 CP context, then compares against the float64 reference (:mod:`ref_gdr`, the same oracle
 ``test_gdr_unit.py`` uses) restricted to what that rank owns.
 
-Single-card modes (``none`` / ``intra``) are *not* here: ``none`` is ``test_gdr_unit.py``
-and forced ``intra`` is ``test_cp_features.py``; this file is only about the cards talking
+Single-card modes (``none`` / ``intra``) live in ``test_gdr_unit.py``;
+this file is only about the cards talking
 to each other, so it needs >= 2 GPUs to run at all.
 
 Debug one config::
@@ -41,22 +41,27 @@ from gdr_common import (
 from flash_qla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule
 from flash_qla.ops.gated_delta_rule.chunk.cp import build_cp_context
 
-# (cu_seqlens, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht)
+# (cu_seqlens, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht, long_memory)
 # Interior boundaries are placed relative to the card edge at total/world_size.
 CONFIGS = [
-    pytest.param([0, 4096], 2, 8, 8, 1 / 16, False, False, id="single-ws2"),
-    pytest.param([0, 6144], 3, 8, 8, 1 / 16, False, False, id="single-ws3"),
-    pytest.param([0, 8192], 4, 8, 8, 1 / 16, False, False, id="single-ws4"),
-    pytest.param([0, 4096], 2, 8, 8, 0.0, True, True, id="single-h0-ws2"),
-    pytest.param([0, 6144], 3, 8, 8, 0.0, True, True, id="single-h0-ws3"),
-    pytest.param([0, 8192], 4, 8, 8, 0.0, True, True, id="single-h0-ws4"),
-    pytest.param([0, 2048, 4096, 6144], 3, 8, 8, 1 / 16, True, True, id="per-card-ws3"),
-    pytest.param([0, 1024, 4096], 2, 8, 8, 1 / 16, False, False, id="offset-ws2"),
-    pytest.param([0, 1024, 1536, 4096], 2, 8, 8, 1 / 16, True, True, id="three-ws2"),
-    pytest.param([0, 3072, 4096], 2, 8, 8, 1 / 16, False, False, id="tail-ws2"),
-    pytest.param([0, 1031, 4096], 2, 8, 8, 1.0, False, False, id="offset-ragged-ws2"),
-    pytest.param([0, 4096], 2, 8, 16, 1 / 16, False, False, id="gva-ws2"),
-    pytest.param([0, 519, 4096], 2, 4, 4, 1.0, True, True, id="allflags-ws2"),
+    pytest.param([0, 4096], 2, 8, 8, 1 / 16, False, False, False, id="single-ws2"),
+    pytest.param([0, 6144], 3, 8, 8, 1 / 16, False, False, False, id="single-ws3"),
+    pytest.param([0, 8192], 4, 8, 8, 1 / 16, False, False, False, id="single-ws4"),
+    pytest.param([0, 4096], 2, 8, 8, 0.0, True, True, False, id="single-h0-ws2"),
+    pytest.param([0, 6144], 3, 8, 8, 0.0, True, True, False, id="single-h0-ws3"),
+    pytest.param([0, 8192], 4, 8, 8, 0.0, True, True, False, id="single-h0-ws4"),
+    pytest.param([0, 2048, 4096, 6144], 3, 8, 8, 1 / 16, True, True, False, id="per-card-ws3"),
+    pytest.param([0, 1024, 4096], 2, 8, 8, 1 / 16, False, False, False, id="offset-ws2"),
+    pytest.param([0, 1024, 1536, 4096], 2, 8, 8, 1 / 16, True, True, False, id="three-ws2"),
+    pytest.param([0, 3072, 4096], 2, 8, 8, 1 / 16, False, False, False, id="tail-ws2"),
+    pytest.param([0, 1031, 4096], 2, 8, 8, 1.0, False, False, False, id="offset-ragged-ws2"),
+    pytest.param([0, 4096], 2, 8, 16, 1 / 16, False, False, False, id="gva-ws2"),
+    pytest.param([0, 519, 4096], 2, 4, 4, 1.0, True, True, False, id="allflags-ws2"),
+    *[
+        pytest.param([0, T], 2, 4, 4, 1.0, False, False, True,
+                     id=f"long-memory-{T // 1024}k-ws2")
+        for T in (16384, 65536, 131072)
+    ],
 ]
 
 # Both modes are inter-card; inter_intra additionally splits each card's local sequence
@@ -122,13 +127,14 @@ def _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht):
 
 
 def _run_and_check(rank, world_size, enable_intra, cfg, state_v_first, group):
-    cu_list, _, Hk, Hv, g_scale, use_h0, use_dht = cfg
+    cu_list, _, Hk, Hv, g_scale, use_h0, use_dht, long_memory = cfg
     T = cu_list[-1]
 
     # One deterministic global input set, shared by every rank and the oracle.
     (q, k, v, g, beta, _do, h0_ref, _dhtr, h0_qla, _dhtq, cu_g, scale) = make_inputs(
         1, T, Hk, Hv, varlen=True, cu_seqlens_list=cu_list,
         use_h0=use_h0, state_v_first=state_v_first,
+        long_memory=long_memory,
     )
     g = g * g_scale
     ref = _reference(q, k, v, g, beta, h0_ref, cu_g, scale, use_dht)
@@ -198,16 +204,16 @@ def _cp_worker(rank, world_size, enable_intra, cfg, state_v_first, port):
 @pytest.mark.needs_bwd
 @pytest.mark.multigpu
 @pytest.mark.parametrize(
-    "cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht", CONFIGS,
+    "cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht, long_memory", CONFIGS,
 )
 @pytest.mark.parametrize("enable_intra", MODES)
 @pytest.mark.parametrize("state_v_first", [False, True], ids=["kv", "vk"])
 def test_cp(cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht,
-            enable_intra, state_v_first):
+            long_memory, enable_intra, state_v_first):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs >= {world_size} GPUs, found {torch.cuda.device_count()}")
 
-    cfg = (cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht)
+    cfg = (cu_list, world_size, num_k_heads, num_v_heads, g_scale, use_h0, use_dht, long_memory)
     mp.start_processes(
         _cp_worker,
         args=(world_size, enable_intra, cfg, state_v_first, _free_port()),

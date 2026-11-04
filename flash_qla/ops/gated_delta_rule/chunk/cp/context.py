@@ -48,8 +48,28 @@ class FlashQLACPContext:
     conv1d_kernel_size: int | None = None
     pre_num_conv_tokens: int | None = None
 
+    # --- inter-card zigzag layout ---
+    # zigzag spreads a document's NC=2*cp chunks non-contiguously: rank r owns chunk r
+    # and chunk NC-1-r of every doc. The fold then runs per document in chunk order over
+    # the full all-gathered (h, M) buffer, reusing correct_initial_states. All tensors are
+    # built in build_cp_context(zigzag=True); the framework only feeds each rank its chunks
+    # in the agreed [early-halves d=0..D-1, late-halves d=0..D-1] layout.
+    is_zigzag: bool = False
+    num_docs: int = 0                                        # D documents in the pack
+    num_chunks: int = 0                                      # NC = 2 * cp_size
+    chunk_to_gathered_slot: torch.Tensor | None = None       # [D*NC] doc-chunk slot -> gather index
+    fold_seq_map: torch.Tensor | None = None                 # [D+1] per-doc groups for the fold
+    owned_fold_slot: torch.Tensor | None = None              # [n_local] local seg -> fold output slot
+    # fused fold (see _calc_inter_cp_seqs_zigzag): address the gathered cat([h, M])
+    # buffer directly, so no reindex is materialised before the scan.
+    fold_h_slot: torch.Tensor | None = None                  # [D*NC] -> gathered h row
+    fold_m_slot: torch.Tensor | None = None                  # [D*NC] -> gathered M row
+    fold_out_slot: torch.Tensor | None = None                # [D*NC] -> output row, -1 = skip
+    fold_split_slot: torch.Tensor | None = None              # [D*NC] -> row, h/M gathered apart
+
     # --- intra-card ---
     intra_cp_cu_seqlens: torch.Tensor | None = None
+    intra_cp_cu_seqlens_cpu: torch.Tensor | None = None
     seq_map_r2c: torch.Tensor | None = None
     seq_map_c2r: torch.Tensor | None = None
     ht_mask: torch.Tensor | None = None
@@ -68,12 +88,28 @@ class FlashQLACPContext:
             post_num_ranks=self.post_num_ranks,
             conv1d_kernel_size=self.conv1d_kernel_size,
             pre_num_conv_tokens=self.pre_num_conv_tokens,
+            is_zigzag=self.is_zigzag,
+            num_docs=self.num_docs,
+            num_chunks=self.num_chunks,
         )
+        # the fold reindex tensors are the same for fwd and bwd gathers; carry them.
+        if self.is_zigzag:
+            copied.chunk_to_gathered_slot = self.chunk_to_gathered_slot.clone()
+            copied.fold_seq_map = self.fold_seq_map.clone()
+            copied.owned_fold_slot = self.owned_fold_slot.clone()
+            copied.fold_h_slot = self.fold_h_slot
+            copied.fold_m_slot = self.fold_m_slot
+            copied.fold_out_slot = self.fold_out_slot
+            copied.fold_split_slot = self.fold_split_slot
+            # shared, not cloned: it is the ``tensor_cache`` key behind
+            # ``get_full_warmup``, so a fresh clone each step would miss every backward.
+            copied.cu_seqlens_cpu = self.cu_seqlens_cpu
         # carry the intra-level partition tensors whenever the intra split is active.
         if self.is_intra:
             copied.intra_cp_cu_seqlens = (
                 self.intra_cp_cu_seqlens.clone() if self.intra_cp_cu_seqlens is not None else None
             )
+            copied.intra_cp_cu_seqlens_cpu = self.intra_cp_cu_seqlens_cpu
             copied.seq_map_r2c = self.seq_map_r2c.clone() if self.seq_map_r2c is not None else None
             copied.seq_map_c2r = self.seq_map_c2r.clone() if self.seq_map_c2r is not None else None
             copied.ht_mask = self.ht_mask.clone() if self.ht_mask is not None else None
@@ -98,6 +134,35 @@ class FlashQLACPContext:
             _create_scan_fb_mask(self.post_num_ranks, num_v_heads, dev_idx),
         )
 
+    def get_inter_fold_tensors(self, reverse: bool, packed: bool):
+        """Slots for a contiguous rank slice of the default inter layout."""
+        n_ranks = 1 + (self.post_num_ranks if reverse else self.pre_num_ranks)
+        return _create_inter_fold_tensors(
+            n_ranks, reverse, packed, str(self.cu_seqlens.device),
+        )
+
+    def get_full_warmup(self, num_v_heads: int, chunk_size: int) -> torch.Tensor:
+        """The zigzag path's ``[nseg, Hv]`` warmup-chunk count, over whichever
+        segmentation the kernels are fed: the intra partitions when the intra split is
+        active, else the owned chunks.
+
+        Zigzag cannot use ``get_warmup_chunks_bidi``'s gate-decay pruning -- every owned
+        chunk is a document-interior piece folded across cards, so all of them need the
+        full per-segment M. The count is then a pure function of the segmentation, so
+        ``_create_full_warmup`` caches it on the CPU segment tensor the context already
+        holds. That keeps it off the per-step path, where it used to cost a blocking
+        ``.cpu()`` D2H plus one kernel launch per segment, twice per training step.
+        """
+        if self.is_intra:
+            cu, cu_cpu = self.intra_cp_cu_seqlens, self.intra_cp_cu_seqlens_cpu
+        else:
+            cu, cu_cpu = self.cu_seqlens, self.cu_seqlens_cpu
+        if cu_cpu is None:
+            cu_cpu = cu.cpu()
+        return _create_full_warmup(
+            cu_cpu, num_v_heads, chunk_size, cu.device.index, cu.dtype,
+        )
+
 def build_cp_context(
     cu_seqlens: torch.Tensor,
     group: "ProcessGroup | None" = None,
@@ -109,6 +174,7 @@ def build_cp_context(
     g: torch.Tensor | None = None,
     is_train: bool = True,
     force_intra_cp: bool = False,
+    zigzag: bool = False,
 ) -> FlashQLACPContext:
     """Unified CP-context builder over the canonical ``(cu_seqlens, num_v_heads)``.
     ``enable_inter``/``enable_intra`` select the mode: (T,F) pure inter | (F,T) pure
@@ -127,6 +193,11 @@ def build_cp_context(
       to read the gate, and no CUDA graph capture (a miss under capture asserts).
     - ``force_intra_cp`` bypasses the intra decision and always splits, for tests and
       profiling that need the intra path on configurations it would skip.
+    - KV and VK state layouts share the same partition decision and context cache.
+    - ``zigzag=True`` assigns rank r chunks r and 2*world_size-1-r of every global
+      document. Each document length must be divisible by 2*world_size. Inputs are
+      ordered as all documents' early chunks, then all documents' late chunks.
+      The default remains a contiguous token partition across ranks.
     """
 
     if enable_inter and group is None:
@@ -142,6 +213,49 @@ def build_cp_context(
             RuntimeWarning, stacklevel=2,
         )
         enable_intra = False
+
+    if zigzag:
+        # zigzag is an inter-card layout. Short-conv halo (contiguous previous card) does
+        # not hold under zigzag, so it is rejected for now.
+        assert enable_inter and group is not None, "zigzag requires inter-card CP with a group"
+        assert conv1d_kernel_size is None, "zigzag with short-conv halo is not implemented yet"
+        inter_ctx = _calc_inter_cp_seqs_zigzag(
+            cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, group=group,
+        )
+        if not (enable_intra and num_v_heads is not None):
+            return inter_ctx
+        # intra splits each owned chunk (its own local segment) for occupancy; the inter
+        # zigzag fold then runs at per-owned-chunk granularity on the aggregated states.
+        intra_ctx = _calc_intra_cp_seqs(
+            raw_cu_seqlens=inter_ctx.cu_seqlens, chunk_size=CHUNK_SIZE,
+            num_v_heads=num_v_heads, g=g if AUTOCP_MODEL else None,
+            is_train=is_train, force_intra_cp=force_intra_cp,
+        )
+        return FlashQLACPContext(
+            is_inter=True,
+            is_intra=intra_ctx.is_intra,
+            is_zigzag=True,
+            group=group,
+            cu_seqlens=inter_ctx.cu_seqlens,
+            cu_seqlens_cpu=inter_ctx.cu_seqlens_cpu,
+            is_first_rank=inter_ctx.is_first_rank,
+            is_last_rank=inter_ctx.is_last_rank,
+            num_docs=inter_ctx.num_docs,
+            num_chunks=inter_ctx.num_chunks,
+            chunk_to_gathered_slot=inter_ctx.chunk_to_gathered_slot,
+            fold_seq_map=inter_ctx.fold_seq_map,
+            owned_fold_slot=inter_ctx.owned_fold_slot,
+            fold_h_slot=inter_ctx.fold_h_slot,
+            fold_m_slot=inter_ctx.fold_m_slot,
+            fold_out_slot=inter_ctx.fold_out_slot,
+            fold_split_slot=inter_ctx.fold_split_slot,
+            intra_cp_cu_seqlens=intra_ctx.intra_cp_cu_seqlens,
+            intra_cp_cu_seqlens_cpu=intra_ctx.intra_cp_cu_seqlens_cpu,
+            seq_map_r2c=intra_ctx.seq_map_r2c,
+            seq_map_c2r=intra_ctx.seq_map_c2r,
+            ht_mask=intra_ctx.ht_mask,
+            ht_mask_bwd=intra_ctx.ht_mask_bwd,
+        )
 
     if enable_inter and enable_intra:
         assert group is not None and num_v_heads is not None
@@ -172,6 +286,7 @@ def build_cp_context(
             conv1d_kernel_size=inter_ctx.conv1d_kernel_size,
             pre_num_conv_tokens=inter_ctx.pre_num_conv_tokens,
             intra_cp_cu_seqlens=intra_ctx.intra_cp_cu_seqlens,
+            intra_cp_cu_seqlens_cpu=intra_ctx.intra_cp_cu_seqlens_cpu,
             seq_map_r2c=intra_ctx.seq_map_r2c,
             seq_map_c2r=intra_ctx.seq_map_c2r,
             ht_mask=intra_ctx.ht_mask,
@@ -268,6 +383,117 @@ def _calc_inter_cp_seqs(
     )
 
 # ---------------------------------------------------------------------------
+# build inter-card zigzag context
+# ---------------------------------------------------------------------------
+@tensor_cache
+def _calc_inter_cp_seqs_zigzag(
+    cu_seqlens: torch.LongTensor,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    world_size: int | None = None,
+    rank: int | None = None,
+    group: "dist.ProcessGroup | None" = None,
+) -> FlashQLACPContext:
+    """Inter-card context for the zigzag layout: rank ``r`` owns chunk ``r`` and chunk
+    ``NC-1-r`` (NC = 2*cp) of every document. Each owned chunk becomes its own local
+    varlen segment, laid out as ``[early halves d=0..D-1, late halves d=0..D-1]`` -- the
+    order the framework must feed this rank's tokens in. Builds the reindex that maps the
+    all-gathered per-chunk ``(h, M)`` into per-document chunk order plus the extraction
+    that reads each owned chunk's folded entering state back out."""
+    if world_size is None:
+        assert group is not None
+        world_size = dist.get_world_size(group=group)
+        rank = dist.get_rank(group=group)
+
+    if cu_seqlens_cpu is None:
+        cu_seqlens_cpu = cu_seqlens.cpu()
+    cu_seqlens_cpu = cu_seqlens_cpu.to(dtype=torch.long)
+
+    device = cu_seqlens.device
+    cp = world_size
+    NC = 2 * cp
+    D = len(cu_seqlens_cpu) - 1
+    doc_lens = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).tolist()
+    for d, L in enumerate(doc_lens):
+        assert L % NC == 0, (
+            f"zigzag requires every doc length divisible by num_chunks={NC}; doc {d} "
+            f"has length {L}. Pad the document to a multiple of 2*cp."
+        )
+
+    # local segments: early halves (chunk r) then late halves (chunk NC-1-r), each of
+    # length L_d / NC.
+    chunk_lens = [L // NC for L in doc_lens]
+    local_lens = chunk_lens + chunk_lens
+    local_cu = [0]
+    for cl in local_lens:
+        local_cu.append(local_cu[-1] + cl)
+    local_cu_cpu = torch.tensor(local_cu, dtype=cu_seqlens.dtype)
+    local_cu_gpu = local_cu_cpu.to(device=device, non_blocking=True)
+
+    n_local = 2 * D
+    # doc-chunk-order slot p = d*NC + c -> flat all-gather index rank_g*n_local + local_seg.
+    c2g = torch.empty(D * NC, dtype=torch.long)
+    for d in range(D):
+        for c in range(NC):
+            if c < cp:
+                rank_g, local_seg = c, d              # early half on rank c
+            else:
+                rank_g, local_seg = NC - 1 - c, D + d  # late half on rank NC-1-c
+            c2g[d * NC + c] = rank_g * n_local + local_seg
+
+    fold_seq_map = torch.arange(0, D * NC + 1, NC, dtype=torch.int32)
+
+    # local seg -> fold output slot (the doc-chunk position it owns).
+    owned = torch.empty(n_local, dtype=torch.long)
+    for d in range(D):
+        owned[d] = d * NC + rank
+        owned[D + d] = d * NC + (NC - 1 - rank)
+
+    # --- fused-fold slot maps ---
+    # The fused kernel scans straight out of the all-gather of `cat([h, M], dim=0)`, so
+    # each rank contributes 2*n_local rows: h first, then M. These three maps are what
+    # replace the physical reindex -- `h_slot`/`m_slot` address the two row ranges of the
+    # gathered buffer, and `out_slot` says where (or whether) a scanned chunk is written.
+    stride = 2 * n_local
+    h_slot = torch.empty(D * NC, dtype=torch.int32)
+    m_slot = torch.empty(D * NC, dtype=torch.int32)
+    out_slot = torch.empty(D * NC, dtype=torch.int32)
+    # Mixed-dtype or rectangular states are gathered separately; then each buffer
+    # contains world*n_local rows and the same split map serves both operands.
+    split_slot = torch.empty(D * NC, dtype=torch.int32)
+    for d in range(D):
+        for c in range(NC):
+            if c < cp:
+                rank_g, local_seg = c, d
+            else:
+                rank_g, local_seg = NC - 1 - c, D + d
+            p = d * NC + c
+            h_slot[p] = rank_g * stride + local_seg
+            m_slot[p] = rank_g * stride + n_local + local_seg
+            split_slot[p] = rank_g * n_local + local_seg
+            # every chunk is scanned, but only this rank's two per doc are stored.
+            out_slot[p] = local_seg if rank_g == rank else -1
+
+    return FlashQLACPContext(
+        is_inter=True,
+        is_zigzag=True,
+        group=group,
+        cu_seqlens=local_cu_gpu,
+        cu_seqlens_cpu=local_cu_cpu,
+        is_first_rank=(rank == 0),
+        is_last_rank=(rank == 0), # is_last_rank is not used in zigzag, set to rank 0 for consistency
+        num_docs=D,
+        num_chunks=NC,
+        chunk_to_gathered_slot=c2g.to(device=device, non_blocking=True),
+        fold_seq_map=fold_seq_map.to(device=device, non_blocking=True),
+        owned_fold_slot=owned.to(device=device, non_blocking=True),
+        fold_h_slot=h_slot.to(device=device, non_blocking=True),
+        fold_m_slot=m_slot.to(device=device, non_blocking=True),
+        fold_out_slot=out_slot.to(device=device, non_blocking=True),
+        fold_split_slot=split_slot.to(device=device, non_blocking=True),
+    )
+
+
+# ---------------------------------------------------------------------------
 # build intra-card context
 # ---------------------------------------------------------------------------
 AUTOCP_MODEL = is_calibrated(ARCH)
@@ -344,8 +570,9 @@ def _build_intra_cp_context(
         seq_map_r2c.append(len(cp_cu_seqlens))
     cp_cu_seqlens.append(raw_cu_seqlens_list[-1])
 
+    cp_cu_seqlens_cpu = torch.tensor(cp_cu_seqlens, dtype=seqlen_dtype, device="cpu")
     cp_cu_seqlens = copy_to_device(
-        torch.tensor(cp_cu_seqlens, dtype=seqlen_dtype, device="cpu"), device
+        cp_cu_seqlens_cpu, device
     )
     seq_map_c2r = copy_to_device(
         torch.tensor(seq_map_c2r, dtype=seqlen_dtype, device="cpu"), device
@@ -364,6 +591,7 @@ def _build_intra_cp_context(
         is_intra=True,
         cu_seqlens=raw_cu_seqlens,
         intra_cp_cu_seqlens=cp_cu_seqlens,
+        intra_cp_cu_seqlens_cpu=cp_cu_seqlens_cpu,
         seq_map_r2c=seq_map_r2c,
         seq_map_c2r=seq_map_c2r,
         ht_mask=ht_mask,
@@ -393,8 +621,8 @@ def _calc_intra_cp_seqs(
     else:
         warnings.warn(
             "AUTOCP_MODEL is disabled; falling back to the heuristic intra-CP "
-            "rule instead of the calibrated autocp model. Enable AUTOCP_MODEL "
-            "for accurate CP decisions.",
+            "rule. Run tools.autocp.fit to calibrate the current correction kernels "
+            "before enabling the model; legacy coefficients do not apply.",
             RuntimeWarning, stacklevel=2,
         )
         use_cp, max_local_chunks = _heuristic_intra_cp(
@@ -438,3 +666,36 @@ def _create_scan_seq_map(num_ranks: int, device_idx: int) -> torch.Tensor:
 @tensor_cache
 def _create_scan_fb_mask(num_ranks: int, num_v_heads: int, device_idx: int) -> torch.Tensor:
     return torch.ones((num_ranks + 1, num_v_heads), dtype=torch.bool, device=f"cuda:{device_idx}")
+
+
+@tensor_cache
+def _create_inter_fold_tensors(n_ranks: int, reverse: bool, packed: bool, device: str):
+    """Map rank-ordered gathered rows directly to the current boundary output."""
+    rows = torch.arange(n_ranks, dtype=torch.int32)
+    h_slot = rows * 2 if packed else rows
+    m_slot = h_slot + 1 if packed else rows
+    out_slot = torch.full((n_ranks,), -1, dtype=torch.int32)
+    out_slot[0 if reverse else -1] = 0
+    seq_map = torch.tensor([0, n_ranks], dtype=torch.int32)
+    return tuple(t.to(device=device) for t in (seq_map, h_slot, m_slot, out_slot))
+
+
+@tensor_cache
+def _create_full_warmup(
+    cu_seqlens_cpu: torch.Tensor,
+    num_v_heads: int,
+    chunk_size: int,
+    device_idx: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """``[nseg, Hv]`` warmup-chunk count with no pruning -- see ``get_full_warmup``.
+
+    ``cu_seqlens_cpu`` must be on the host: the whole point is to derive the counts
+    without a D2H, then ship the result in one H2D.
+    """
+    lens = cu_seqlens_cpu.tolist()
+    nw = torch.tensor(
+        [(lens[i + 1] - lens[i] + chunk_size - 1) // chunk_size for i in range(len(lens) - 1)],
+        dtype=dtype, device="cpu",
+    )
+    return nw.unsqueeze(1).expand(-1, num_v_heads).contiguous().to(f"cuda:{device_idx}")

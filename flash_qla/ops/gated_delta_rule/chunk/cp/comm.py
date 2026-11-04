@@ -24,6 +24,20 @@ def all_gather_into_tensor(
     return out, handle
 
 
+def pack_states(S_ext: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
+    """Pack equally shaped (h, M) states as two contiguous row ranges.
+
+    The gathered ``[world, 2n, ...]`` tensor flattens to ``[world*2n, ...]`` as a
+    view; slot maps address h and M directly in either inter-card layout. Callers
+    gather different shapes or dtypes separately.
+    """
+    assert S_ext.shape == M.shape, (S_ext.shape, M.shape)
+    assert S_ext.dtype == M.dtype, (S_ext.dtype, M.dtype)
+    # TODO: Have prepare_h / aggregate_card_state write gather-ready hm storage:
+    # all owned chunks for zigzag, only the boundary chunk for contiguous CP.
+    return torch.cat([S_ext, M], dim=0)
+
+
 def pack_hm(S_ext: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
     assert S_ext.shape[:1] == M.shape[:1], (S_ext.shape, M.shape)
     return torch.cat([

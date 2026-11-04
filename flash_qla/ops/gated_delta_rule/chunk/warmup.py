@@ -60,8 +60,12 @@ def _layout(cfg, rb, S, is_varlen):
     else:
         # dense [rb, S, ...]; cu=None makes the dispatcher build an int32 cu.
         cu = None
-        q = q.view(rb, S, Hg, K); k = k.view(rb, S, Hg, K); v = v.view(rb, S, H, V)
-        a = a.view(rb, S, H, cs); g = g.view(rb, S, H); b = b.view(rb, S, H)
+        q = q.view(rb, S, Hg, K)
+        k = k.view(rb, S, Hg, K)
+        v = v.view(rb, S, H, V)
+        a = a.view(rb, S, H, cs)
+        g = g.view(rb, S, H)
+        b = b.view(rb, S, H)
         do = do.view(rb, S, H, V)
     return q, k, v, a, g, b, do, cu, h0
 
@@ -116,6 +120,68 @@ def _warm_bwd_main(fused_gdr_bwd, q, k, v, a, g, b, do, h, cu, cs, svf, cfg):
 # CP path (intra / inter / combined). is_cp=True main kernel comes from intra only;
 # inter contributes preprocessing-kernel variants.
 # ---------------------------------------------------------------------------
+def _warm_correction(cfg):
+    """Compile reachable choices for the independent grid and each scan mode."""
+    major, _ = torch.cuda.get_device_capability(cfg.device)
+    if major == 9:
+        from .hopper.cp_fwd import (
+            tilelang_correct_h0, select_correction_config, tilelang_aggregate_hm,
+        )
+    elif major == 10:
+        from .blackwell.cp_fwd import (
+            tilelang_correct_h0, select_correction_config, tilelang_aggregate_hm,
+        )
+    else:
+        return  # SM120 keeps its existing correction kernels.
+
+    num_sms = torch.cuda.get_device_properties(cfg.device).multi_processor_count
+    combined = cfg.enable_intra and cfg.enable_inter
+    seeds = {False, True} if cfg.use_initial_state else {False}
+    # The second-level scan receives a card state even without a user seed.
+    scan_seeds = {False, True} if combined else seeds
+    modes = [(False, False, True, False, False, scan_seeds)]
+    if combined:
+        # Both Hopper and Blackwell pair h/M columns in a dedicated scan.
+        for use_raw in sorted(seeds):
+            tilelang_aggregate_hm(
+                H=cfg.H, h_dtype=torch.float32, m_dtype=torch.float32,
+                seqlen_dtype=cfg.cu_seqlens_dtype, mask_dtype=torch.bool,
+                state_v_first=cfg.state_v_first, use_raw_h0=use_raw,
+            )
+    if cfg.training:
+        bwd_seeds = {False, True} if cfg.output_final_state else {False}
+        bwd_scan_seeds = {False, True} if combined else bwd_seeds
+        modes.append((True, True, True, False, False, bwd_scan_seeds))
+        if combined:
+            modes.append((True, True, False, True, False, bwd_seeds))
+
+    for reverse, transpose, store_intra, store_inter, compute_m, use_seeds in modes:
+        # Only Hopper's generic scan still supports a running M product.
+        aggregate_kw = {"compute_m": compute_m} if major == 9 else {}
+        variants = {
+            select_correction_config(
+                cfg.H, rb, cfg.V, num_sms=num_sms,
+                **aggregate_kw,
+            )
+            for rb in range(1, num_sms + 1)
+        }
+        for use_raw in sorted(use_seeds):
+            for precision, block_dv in sorted(variants):
+                for use_slots in ((False, True) if cfg.enable_inter and store_intra else (False,)):
+                    tilelang_correct_h0(
+                        H=cfg.H, DK=cfg.K, DV=cfg.V,
+                        res_dtype=torch.float32, accum_dtype="float32",
+                        h_buffer_dtype=torch.float32, m_buffer_dtype=torch.float32,
+                        seqlen_dtype=torch.int32 if use_slots else cfg.cu_seqlens_dtype,
+                        mask_dtype=torch.bool,
+                        use_raw_h0=use_raw, state_v_first=cfg.state_v_first,
+                        reverse=reverse, transpose_m=transpose,
+                        store_intra_h0=store_intra, store_inter_h=store_inter,
+                        precision=precision, **aggregate_kw,
+                        block_DV=block_dv, use_slots=use_slots,
+                    )
+
+
 def _warm_cp(cfg):
     from flash_qla.ops.gated_delta_rule.chunk import (
         fused_gdr_fwd, fused_gdr_h, fused_gdr_bwd, fused_gdr_dh, correct_initial_states,
@@ -130,11 +196,13 @@ def _warm_cp(cfg):
     cs, dtype, device, svf = cfg.chunk_size, cfg.dtype, cfg.device, cfg.state_v_first
     combined = cfg.enable_intra and cfg.enable_inter and aggregate_card_state is not None
 
+    _warm_correction(cfg)
+
     def io(P, S):
         return _io(P, S, H, cfg.Hg, K, V, cs, dtype, cfg.gate_dtype, cfg.beta_dtype, device)
 
-    # (1) Preprocessing / correction / dh / main-backward: all block_DV-independent,
-    #     so run once per S (for has_incomplete_tile) at a 2-partition representative.
+    # (1) Exercise preprocessing / correction / dh / main-backward at a
+    # two-partition representative; other correction widths were compiled above.
     P = 2
     for S in cfg.S_list:
         q, k, v, a, g, b, do = io(P, S)

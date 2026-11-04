@@ -6,6 +6,7 @@ Holds the direct-call wrappers, input construction and relative-error assertion
 used by the pure-kernel correctness suite (``test_gdr_unit.py``) and the multi-card
 CP end-to-end tests (``test_cp_e2e.py``).
 """
+import math
 import os
 import sys
 
@@ -84,6 +85,7 @@ def chunk_gated_delta_rule_bwd_qla(
 def make_inputs(
     batch_size, num_tokens, num_k_heads, num_v_heads,
     varlen, cu_seqlens_list, use_h0, state_v_first, seed=42,
+    *, long_memory=False,
 ):
     torch.manual_seed(seed)
 
@@ -114,6 +116,11 @@ def make_inputs(
         batch_size, num_tokens, num_v_heads,
         device=DEVICE, dtype=torch.float32,
     ).sigmoid()
+
+    if long_memory:
+        # Weak decay and weak updates preserve history across many CP partitions.
+        g.fill_(math.log1p(-2 ** -20))
+        beta.fill_(2 ** -16)
 
     # h0 / dht in reference layout [B, Hv, K, V]
     h0_ref = None

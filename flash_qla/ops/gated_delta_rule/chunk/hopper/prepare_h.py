@@ -24,7 +24,6 @@ def tilelang_prepare_h(
     g_dtype,
     b_dtype,
     h0_dtype,
-    ht_dtype,
     h_dtype,
     seqlen_dtype,
     use_initial_state,
@@ -86,8 +85,8 @@ def tilelang_prepare_h(
         chunk_offsets: T.Tensor([batch_size + 1], dtype=seqlen_dtype),
         num_warmup_chunks: T.Tensor([batch_size, H], dtype=seqlen_dtype),
         h: T.Tensor(h_shape, dtype=h_dtype),
-        ht: T.Tensor(ht_shape, dtype=ht_dtype),
-        mt: T.Tensor(m_shape, dtype=ht_dtype),
+        ht: T.Tensor(ht_shape, dtype="float32"),
+        mt: T.Tensor(m_shape, dtype="float32"),
     ):
         with T.Kernel(batch_size * H, threads=512) as (bbh,):
             bb, bh = bbh // H, bbh % H
@@ -627,16 +626,16 @@ def fused_gdr_h(
         dtype=k.dtype,
         device=k.device,
     )
-    ht_dtype = k.dtype if is_cp else torch.float32
+    # Keep ht/mt in fp32 to preserve long-memory CP correction precision.
     final_state = torch.empty(
         (real_batch_size, H, V, K)
         if state_v_first
         else (real_batch_size, H, K, V),
-        dtype=ht_dtype,
+        dtype=torch.float32,
         device=k.device,
     )
     final_correction = torch.empty(
-        (real_batch_size, H, K, K), dtype=ht_dtype, device=k.device
+        (real_batch_size, H, K, K), dtype=torch.float32, device=k.device
     )
 
     tilelang_prepare_h_kernel = tilelang_prepare_h(
@@ -649,7 +648,6 @@ def fused_gdr_h(
         g_dtype=g.dtype,
         b_dtype=b.dtype,
         h0_dtype=initial_state.dtype,
-        ht_dtype=final_state.dtype,
         h_dtype=h.dtype,
         seqlen_dtype=cu_seqlens.dtype,
         accum_dtype="float32",

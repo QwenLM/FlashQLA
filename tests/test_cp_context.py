@@ -14,8 +14,9 @@ from flash_qla.ops.gated_delta_rule.chunk.cp import build_cp_context
 from flash_qla.ops.gated_delta_rule.chunk.cp.context import (
     _build_intra_cp_context,
     _calc_inter_cp_seqs,
+    _calc_inter_cp_seqs_zigzag,
 )
-from flash_qla.ops.gated_delta_rule.chunk.cp.comm import pack_hm, unpack_hm
+from flash_qla.ops.gated_delta_rule.chunk.cp.comm import pack_hm, pack_states, unpack_hm
 
 from ref_context import ref_intra_context, ref_inter_context
 
@@ -200,3 +201,43 @@ def test_pack_unpack_hm(h_dtype, m_dtype, state_v_first):
     for i in range(n_cards):
         assert torch.equal(h_buf[i], h)
         assert torch.equal(m_buf[i], m)
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 3, 4])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_zigzag_fold_slots_on_cpu(world_size, dtype):
+    num_docs, nc = 3, 2 * world_size
+    cu = torch.tensor([0, nc * 3, nc * 8, nc * 15], dtype=dtype)
+
+    # Start in document/time order, with a unique value for every chunk.
+    chronological = torch.arange(num_docs * nc).reshape(num_docs, nc)
+    expected_h = chronological.flatten()
+    expected_m = expected_h + expected_h.numel()
+
+    # Zigzag assigns columns from opposite ends to each rank; local storage is
+    # all documents' early chunks followed by all documents' late chunks.
+    h_by_rank = [torch.cat((chronological[:, rank], chronological[:, -1 - rank]))
+                 for rank in range(world_size)]
+    m_by_rank = [h + expected_h.numel() for h in h_by_rank]
+
+    # Simulate rank-ordered all-gather, using the real packer for packed storage.
+    h_split = torch.cat(h_by_rank)
+    m_split = torch.cat(m_by_rank)
+    packed = torch.cat([pack_states(h, m) for h, m in zip(h_by_rank, m_by_rank)])
+
+    for rank in range(world_size):
+        ctx = _calc_inter_cp_seqs_zigzag.__wrapped__(
+            cu, world_size=world_size, rank=rank,
+        )
+        # Both storage layouts must recover the original document/time order.
+        assert torch.equal(packed[ctx.fold_h_slot.long()], expected_h)
+        assert torch.equal(packed[ctx.fold_m_slot.long()], expected_m)
+        assert torch.equal(h_split[ctx.fold_split_slot.long()], expected_h)
+        assert torch.equal(m_split[ctx.fold_split_slot.long()], expected_m)
+
+        # Output slots must select this rank's chunks and restore local order.
+        local = torch.full_like(h_by_rank[rank], -1)
+        owned = ctx.fold_out_slot >= 0
+        assert owned.sum().item() == local.numel()
+        local[ctx.fold_out_slot[owned].long()] = expected_h[owned]
+        assert torch.equal(local, h_by_rank[rank])

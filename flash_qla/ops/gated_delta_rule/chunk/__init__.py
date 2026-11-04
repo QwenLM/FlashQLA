@@ -7,25 +7,32 @@ import tilelang
 from flash_qla.utils import l2norm_fwd, l2norm_bwd, prepare_chunk_offsets
 from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 
-# `aggregate_card_state` is only needed by combined inter+intra CP. It relies on the
-# `store_inter_h` / `compute_m` modes of `tilelang_correct_h0`, which exist in the
-# SM90/SM100/SM103 kernels; where it is `None` (e.g. SM120), pure inter and pure intra
+# `aggregate_card_state` is only needed by combined inter+intra CP. SM90/SM100/SM103
+# use a dedicated forward h/M aggregation kernel
+# and the generic scan for h/dh. Where it is `None` (e.g. SM120), pure inter and pure intra
 # still work and `cp_preprocess_fwd/bwd` reject inter+intra with an explicit error.
+# Correction kernels read gathered buffers via slots for either inter-card layout.
+# The selected architecture determines slot-scan support; SM120/SM121 retain
+# their unpack/reindex fallback.
 if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .hopper import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
     from .hopper.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 64
+    _CP_SUPPORTS_SLOT_SCAN = True
 elif tilelang.contrib.nvcc.get_target_compute_version() in ["10.0", "10.3"]:
     from .blackwell import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
     from .blackwell.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 64
+    _CP_SUPPORTS_SLOT_SCAN = True
 elif tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"]:
     from .blackwell_sm120 import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
     from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states
+    aggregate_card_state = None
     from .blackwell_sm120.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 32
+    _CP_SUPPORTS_SLOT_SCAN = False
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100, sm103, sm120 and sm121 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 from .cp import (
@@ -178,6 +185,11 @@ def chunk_gated_delta_rule_bwd(
     # CP dh0 post-process: intra remaps per-chunk dh0 back to per-raw-seq; inter zeroes
     # the first local seq's grad (it belongs to the previous card).
     if dh0 is None or initial_state is None:
+        dh0 = None
+    elif cp_context.is_zigzag:
+        # zigzag fwd seeds the per-document fold with initial_state, but the per-segment
+        # (n_local) -> per-doc initial-state gradient reduction is not implemented; these
+        # GDN layers train with h0=None, so drop it rather than return a mismatched grad.
         dh0 = None
     else:
         if cp_context.is_intra:
