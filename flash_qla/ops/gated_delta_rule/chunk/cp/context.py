@@ -114,6 +114,14 @@ def build_cp_context(
     ``enable_inter``/``enable_intra`` select the mode: (T,F) pure inter | (F,T) pure
     intra | (T,T) inter+intra | (F,F) no CP.
 
+    Fast path: when ``cu_seqlens`` carries varlen metadata precomputed by
+    :func:`flash_qla.utils.index.prepare_varlen_metadata` (attribute
+    ``_flash_qla_prepared_varlen``) whose ``cp_context`` is populated, that context is
+    returned verbatim and ``_calc_inter_cp_seqs`` / ``_calc_intra_cp_seqs`` are skipped.
+    The stored context wins regardless of the arguments passed here, so it must have been
+    prepared with the CP parameters you intend (this also keeps the fast path safe under
+    CUDA graph capture, where a ``tensor_cache`` miss would assert).
+
     - inter needs ``group``.
     - intra needs ``cu_seqlens`` (varlen) and ``num_v_heads``.
     - ``is_train`` picks the intra decision's cost regime. It keys off the *step*, not
@@ -128,6 +136,43 @@ def build_cp_context(
     - ``force_intra_cp`` bypasses the intra decision and always splits, for tests and
       profiling that need the intra path on configurations it would skip.
     """
+    prepared = getattr(cu_seqlens, "_flash_qla_prepared_varlen", None)
+    if (
+        prepared is not None
+        and prepared.chunk_size == CHUNK_SIZE
+        and prepared.cp_context is not None
+    ):
+        assert g is None, (
+            "build_cp_context is reusing the cp_context precomputed by "
+            "prepare_varlen_metadata, which is always built without the gate `g`. "
+            "A gate-aware intra decision cannot be served from the prepared fast "
+            "path; call build_cp_context on a cu_seqlens without "
+            "_flash_qla_prepared_varlen, or drop `g`."
+        )
+        return prepared.cp_context
+    return _build_cp_context_impl(
+        cu_seqlens, group=group,
+        enable_inter=enable_inter, enable_intra=enable_intra,
+        num_v_heads=num_v_heads, conv1d_kernel_size=conv1d_kernel_size,
+        cu_seqlens_cpu=cu_seqlens_cpu, g=g, is_train=is_train,
+        force_intra_cp=force_intra_cp,
+    )
+
+
+def _build_cp_context_impl(
+    cu_seqlens: torch.Tensor,
+    group: "ProcessGroup | None" = None,
+    enable_inter: bool = True,
+    enable_intra: bool = True,
+    num_v_heads: int | None = None,
+    conv1d_kernel_size: int | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    g: torch.Tensor | None = None,
+    is_train: bool = True,
+    force_intra_cp: bool = False,
+) -> FlashQLACPContext:
+    """Actual CP-context construction, bypassing the ``prepare_varlen_metadata`` fast path.
+    See :func:`build_cp_context` for the full contract of each argument."""
 
     if enable_inter and group is None:
         warnings.warn(
