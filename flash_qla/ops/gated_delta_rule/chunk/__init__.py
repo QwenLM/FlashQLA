@@ -7,8 +7,8 @@ import tilelang
 from flash_qla.utils import l2norm_fwd, l2norm_bwd, prepare_chunk_offsets
 from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
 
-# `aggregate_card_state` is only needed by combined inter+intra CP. SM90 uses the
-# generic scan for h/M; SM100/SM103 use a dedicated forward h/M aggregation kernel
+# `aggregate_card_state` is only needed by combined inter+intra CP. SM90/SM100/SM103
+# use a dedicated forward h/M aggregation kernel
 # and the generic scan for h/dh. Where it is `None` (e.g. SM120), pure inter and pure intra
 # still work and `cp_preprocess_fwd/bwd` reject inter+intra with an explicit error.
 # Correction kernels read gathered buffers via slots for either inter-card layout.

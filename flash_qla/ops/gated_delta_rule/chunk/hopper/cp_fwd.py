@@ -287,13 +287,14 @@ def get_warmup_chunks_bidi(
 
 def select_correction_config(
     H, raw_batch_size, DV, device=None, *, num_sms=None,
-    compute_m=False,
+    compute_m=False, state_v_first=False, reverse=False,
 ):
     """Select Hopper correction precision and DV width from the independent grid.
 
-    Both layouts retain Hopper's grid policy, with DV capped at 64 for running-M
-    aggregation. Supplying num_sms allows AutoCP to use this same policy
-    without querying the device. There is no scan-length fallback.
+    Calibrated on a 132-SM Hopper. DV16/32/64/128 launch 8/4/2/1 CTAs per
+    head and raw sequence. Both directions and external layouts share this
+    policy after tuning their math views and shared conversion layouts.
+    AutoCP supplies num_sms to use the same launch policy.
     """
     if min(H, raw_batch_size, DV) <= 0:
         raise ValueError("Correction dimensions must be positive")
@@ -302,9 +303,25 @@ def select_correction_config(
     if num_sms <= 0:
         raise ValueError("num_sms must be positive")
     n_core = H * raw_batch_size * ((DV + 127) // 128)
-    if n_core * 4 < num_sms:
+    if compute_m:
+        # Legacy reverse/transposed-M scans only; forward h/M uses the
+        # dedicated paired-column kernel and does not consult this selector.
+        # The full DK x DK running-M product dominates SIMT even at low
+        # occupancy. DV32 wins through one wave; DV64 amortizes extra waves.
+        return "tf32x3", 32 if n_core * 4 <= num_sms else 64
+
+    if n_core * 8 <= num_sms:
         return "fp32", 16
-    if n_core * 2 <= num_sms or compute_m:
+    if n_core * 4 <= num_sms:
+        return "tf32x3", 32
+    if n_core * 2 <= num_sms:
+        return "tf32x3", 64
+
+    # A partially filled last DV128 wave can favor DV64 (e.g. 192 heads
+    # on 132 SMs: three narrower waves instead of two wide waves).
+    waves_64 = (2 * n_core + num_sms - 1) // num_sms
+    waves_128 = (n_core + num_sms - 1) // num_sms
+    if 3 * waves_64 < 5 * waves_128:
         return "tf32x3", 64
     return "tf32x3", 128
 
@@ -374,11 +391,25 @@ def tilelang_correct_h0(
         num_stages = 1
 
     tile_shape = (block_DV, DK) if state_v_first else (DK, block_DV)
-    # A 64-column scan can fit a 64-wide K tile; the 128-column scan and
-    # running-M chain need smaller conversion scratch to fit shared memory.
+    # As on SM100, keep the math view independent of the native TMA layout.
+    # Hopper's DV32 prefers K-by-V; wider KV tiles use V-by-K.
+    transpose_h = (
+        precision == "tf32x3" and not state_v_first and block_DV >= 64
+        and not compute_m and store_intra_h0
+    )
+    stage_transposed_m = transpose_m and not compute_m and store_intra_h0
+    fragment_shape = (block_DV, DK) if transpose_h else tile_shape
+    # Give VK SIMT a K-by-V compute stage without changing its TMA layout.
+    separate_h = (
+        precision == "fp32" and DK == 128 and block_DV == 16
+        and state_v_first and not compute_m
+    )
+    # SM90 prefers vector2 forward (SM100 uses vector1/4), vector8 backward.
+    fp32_vec = 8 if reverse else 2
+    # Bound shared conversion scratch; wide states and running-M need smaller K.
     block_K = 64 if not compute_m and block_DV <= 64 else 16
-    scratch_M = DK if compute_m or not state_v_first else block_DV
-    scratch_N = DK if compute_m or state_v_first else block_DV
+    scratch_M = DK if compute_m or not (state_v_first or transpose_h) else block_DV
+    scratch_N = DK if compute_m or state_v_first or transpose_h else block_DV
 
     if num_stages < 1 or block_DV < 1:
         raise ValueError("Correction stages and DV width must be positive")
@@ -402,32 +433,56 @@ def tilelang_correct_h0(
                     C[i, j] += av * bv
         else:
             A_hi, A_lo, B_hi, B_lo = scratch
-            # Both operands are K-major, as required by Hopper TF32 WGMMA.
-            # TileLang 0.1.12 does not support TF32 in its TCGEN5 dispatcher;
-            # on Blackwell T.gemm with a fragment emits TF32 MMA.sync instead.
-            # K tiling bounds scratch space independently of the state width.
+            # Both directions keep hi/lo operands in shared memory, permitting
+            # WGMMA on eligible tiles. Transposed M needs different load and
+            # store vectorization: gather into a temporary first, then split
+            # into shared scratch with contiguous K-vector stores. Fusing these
+            # loops forces scalar scratch stores and costly bank conflicts.
             for kb in T.serial(T.ceildiv(DK, block_K)):
+                if stage_transposed_m and trans_A:
+                    a_convert = T.alloc_fragment((M, block_K), "float32")
+                    T.annotate_layout({
+                        a_convert: _m_transpose_source_layout(M, block_K),
+                    })
+                    for i, k in T.Parallel(M, block_K):
+                        a_convert[i, k] = T.cast(A[sa, kb * block_K + k, i], "float32")
                 # Only row-major M needs this source-contiguous mapping. The
                 # running h and M states have compiler-selected shared layouts.
                 for i, k in T.Parallel(
                     M, block_K,
-                    loop_layout=_m_transpose_source_layout(M, block_K) if trans_A else None,
+                    loop_layout=(
+                        _m_transpose_source_layout(M, block_K)
+                        if trans_A and not stage_transposed_m else None
+                    ),
                 ):
-                    av = T.cast(A[sa, kb * block_K + k, i] if trans_A else A[sa, i, kb * block_K + k], "float32")
+                    av = (
+                        a_convert[i, k] if stage_transposed_m and trans_A else
+                        T.cast(A[sa, kb * block_K + k, i] if trans_A else A[sa, i, kb * block_K + k], "float32")
+                    )
                     # Keep hi/lo local: rereading hi from shared scratch inserts
                     # unnecessary synchronization inside the conversion loop.
                     av_hi = T.cast(av, T.tfloat32)
                     av_lo = T.cast(av - T.cast(av_hi, "float32"), T.tfloat32)
                     A_hi[i, k] = av_hi
                     A_lo[i, k] = av_lo
+                if stage_transposed_m and b_is_m and not trans_B:
+                    b_convert = T.alloc_fragment((N, block_K), "float32")
+                    T.annotate_layout({
+                        b_convert: _m_transpose_source_layout(N, block_K),
+                    })
+                    for j, k in T.Parallel(N, block_K):
+                        b_convert[j, k] = T.cast(B[sb, kb * block_K + k, j], "float32")
                 for j, k in T.Parallel(
                     N, block_K,
                     loop_layout=(
                         _m_transpose_source_layout(N, block_K)
-                        if b_is_m and not trans_B else None
+                        if b_is_m and not trans_B and not stage_transposed_m else None
                     ),
                 ):
-                    bv = T.cast(B[sb, j, kb * block_K + k] if trans_B else B[sb, kb * block_K + k, j], "float32")
+                    bv = (
+                        b_convert[j, k] if stage_transposed_m and b_is_m and not trans_B else
+                        T.cast(B[sb, j, kb * block_K + k] if trans_B else B[sb, kb * block_K + k, j], "float32")
+                    )
                     bv_hi = T.cast(bv, T.tfloat32)
                     bv_lo = T.cast(bv - T.cast(bv_hi, "float32"), T.tfloat32)
                     B_hi[j, k] = bv_hi
@@ -452,13 +507,17 @@ def tilelang_correct_h0(
         h_stage = T.alloc_shared((num_stages,) + tile_shape, dtype=h_buffer_dtype)
         m_stage = T.alloc_shared((num_stages, DK, DK), dtype=m_buffer_dtype)
         hp_stage = T.alloc_shared((num_stages,) + tile_shape, dtype=accum_dtype)
+        if transpose_h:
+            hp_compute = T.reshape(hp_stage, (num_stages, block_DV, DK))
+        if separate_h:
+            h_compute = T.alloc_shared((1,) + tile_shape, dtype=accum_dtype)
 
         if not store_intra_h0:
             hd_shared = T.alloc_shared((1,) + tile_shape, dtype=accum_dtype)
         mrun_shared = T.alloc_shared((1, DK, DK), dtype=accum_dtype)
 
         if precision == "tf32x3":
-            # Reuse conversion scratch for h and running-M products.
+            # Reuse shared conversion scratch for h and running-M products.
             gemm_a_hi = T.alloc_shared((scratch_M, block_K), T.tfloat32)
             gemm_a_lo = T.alloc_shared((scratch_M, block_K), T.tfloat32)
             gemm_b_hi = T.alloc_shared((scratch_N, block_K), T.tfloat32)
@@ -467,8 +526,31 @@ def tilelang_correct_h0(
         else:
             gemm_scratch = ()
 
-        h_fragment = T.alloc_fragment(tile_shape, dtype=accum_dtype)
+        h_fragment = T.alloc_fragment(fragment_shape, dtype=accum_dtype)
         mrun_frag = T.alloc_fragment((DK, DK), dtype=accum_dtype)
+        if separate_h:
+            T.annotate_layout({
+                h_compute: T.Layout((1, block_DV, DK), lambda s, row, col: (s, col, row)),
+                h_fragment: T.Fragment(
+                    tile_shape,
+                    forward_thread_fn=lambda row, col: ((col * block_DV + row) // fp32_vec) % 128,
+                    forward_index_fn=lambda row, col: ((col * block_DV + row) // (fp32_vec * 128)) * fp32_vec + row % fp32_vec,
+                ),
+            })
+        if (precision == "fp32" and DK == 128 and block_DV == 16
+                and not state_v_first and not compute_m and store_intra_h0
+                and reverse == transpose_m):
+            # Make the accumulator independent of seed-copy layout inference.
+            # Backward also needs a plain compute stage to avoid bank conflicts.
+            T.annotate_layout({h_fragment: T.Fragment(
+                tile_shape,
+                forward_thread_fn=lambda row, col: ((row * block_DV + col) // fp32_vec) % 128,
+                forward_index_fn=lambda row, col: ((row * block_DV + col) // (fp32_vec * 128)) * fp32_vec + col % fp32_vec,
+            )})
+            if reverse:
+                T.annotate_layout({
+                    hp_stage: T.Layout((num_stages, DK, block_DV), lambda s, row, col: (s, row, col)),
+                })
 
         data_is_ready = T.alloc_barrier(arrive_count=[32] * num_stages)    # load -> math
         data_is_free = T.alloc_barrier(arrive_count=[128] * num_stages)    # math -> load
@@ -485,7 +567,11 @@ def tilelang_correct_h0(
                 if state_v_first:
                     T.copy(raw_h0[bb, bh, lo:lo + block_DV, 0:DK], h_fragment)
                 else:
-                    T.copy(raw_h0[bb, bh, 0:DK, lo:lo + block_DV], h_fragment)
+                    if transpose_h:
+                        for vi, ki in T.Parallel(block_DV, DK):
+                            h_fragment[vi, ki] = raw_h0[bb, bh, ki, lo + vi]
+                    else:
+                        T.copy(raw_h0[bb, bh, 0:DK, lo:lo + block_DV], h_fragment)
             else:
                 T.clear(h_fragment)
 
@@ -503,9 +589,18 @@ def tilelang_correct_h0(
                 h_idx = T.Cast("int32", h_slot[p]) if use_slots else p
                 s = i_s % num_stages
 
+                if separate_h:
+                    T.sync_threads(BAR_CONSUMER, 128)
+                    if fallback_mask[h_idx, bh]:
+                        T.copy(h_fragment, h_compute[0, :, :])
+
                 if store_intra_h0:
                     T.barrier_wait(hprev_free[s], (i_s // num_stages + 1) % 2)
-                    T.copy(h_fragment, hp_stage[s, :, :])
+                    if transpose_h:
+                        for vi, ki in T.Parallel(block_DV, DK):
+                            hp_stage[s, ki, vi] = h_fragment[vi, ki]
+                    else:
+                        T.copy(h_fragment, hp_stage[s, :, :])
                     T.fence_proxy_async()
                     T.barrier_arrive(hprev_ready[s])
 
@@ -517,9 +612,27 @@ def tilelang_correct_h0(
                 T.sync_threads(BAR_CONSUMER, 128)
 
                 T.barrier_wait(data_is_ready[s], (i_s // num_stages + 0) % 2)
-                T.copy(h_stage[s, :, :], h_fragment)          # h_fragment = h[h_idx]
+                if transpose_h:
+                    # Reuse hp_stage for math only after the store warp has
+                    # consumed its native-layout payload.
+                    if fallback_mask[h_idx, bh]:
+                        T.barrier_wait(hprev_free[s], (i_s // num_stages) % 2)
+                        T.copy(h_fragment, hp_compute[s, :, :])
+                        T.sync_threads(BAR_CONSUMER, 128)
+                    for vi, ki in T.Parallel(block_DV, DK):
+                        h_fragment[vi, ki] = h_stage[s, ki, vi]
+                else:
+                    T.copy(h_stage[s, :, :], h_fragment)      # h_fragment = h[h_idx]
                 if fallback_mask[h_idx, bh]:
-                    if store_intra_h0:
+                    if transpose_h:
+                        precise_gemm(hp_compute, m_stage, h_fragment,
+                                     gemm_scratch, s, s,
+                                     block_DV, DK, False, not transpose_m, True)
+                    elif separate_h:
+                        precise_gemm(h_compute, m_stage, h_fragment,
+                                     gemm_scratch, 0, s,
+                                     block_DV, DK, False, not transpose_m, True)
+                    elif store_intra_h0:
                         if state_v_first:
                             precise_gemm(hp_stage, m_stage, h_fragment,
                                          gemm_scratch, s, s,
@@ -551,13 +664,18 @@ def tilelang_correct_h0(
                         T.clear(mrun_shared)
                     T.sync_threads(BAR_CONSUMER, 128)   # the next iteration reads it
 
+                T.evaluate(T.call_extern("handle", "__threadfence_block"))
                 T.barrier_arrive(data_is_free[s])
 
             if store_inter_h:   # post-last-chunk exiting state = card-level h
                 if state_v_first:
                     T.copy(h_fragment, h_card[bb, bh, lo:lo + block_DV, 0:DK])
                 else:
-                    T.copy(h_fragment, h_card[bb, bh, 0:DK, lo:lo + block_DV])
+                    if transpose_h:
+                        for vi, ki in T.Parallel(block_DV, DK):
+                            h_card[bb, bh, ki, lo + vi] = h_fragment[vi, ki]
+                    else:
+                        T.copy(h_fragment, h_card[bb, bh, 0:DK, lo:lo + block_DV])
             if compute_m and bv == 0:
                 T.copy(mrun_shared[0, :, :], m_card[bb, bh, 0:DK, 0:DK])
 
@@ -771,6 +889,7 @@ def _correct_states(
     res_dtype = raw_state.dtype if use_raw_h0 else torch.float32
     precision, block_DV = select_correction_config(
         num_heads, seq_map_r2c.numel() - 1, v_head_dim, h_buffer.device,
+        state_v_first=state_v_first, reverse=reverse,
     )
     kernel = tilelang_correct_h0(
         precision=precision, block_DV=block_DV,
@@ -858,6 +977,98 @@ def correct_terminal_states(
 # ---------------------------------------------------------------------------
 # card-level (h, M) aggregation for inter+intra CP
 # ---------------------------------------------------------------------------
+@tilelang.jit()
+def tilelang_aggregate_hm(
+    H, h_dtype, m_dtype, seqlen_dtype, mask_dtype, state_v_first, use_raw_h0,
+):
+    """Forward scan of paired h/M columns, following the SM100 aggregate kernel.
+
+    Both recurrences left-multiply by M in canonical K-by-V math. Pairing their
+    columns shares the TF32x3 operand conversion and distributes the running-M
+    product across eight CTAs per head, rather than one full-matrix CTA.
+    """
+    cp_batch_size = T.dynamic("cp_batch_size")
+    raw_batch_size = T.dynamic("raw_batch_size")
+    DK, block_DV, block_K = 128, 16, 64
+    state_shape = (raw_batch_size, H, DK, DK)
+    buffer_shape = (cp_batch_size, H, DK, DK)
+    prev_layout = T.Layout((DK, 2 * block_DV), lambda row, col: (row, col))
+    state_load_layout = _m_transpose_source_layout(2 * block_DV, block_K)
+
+    @T.prim_func
+    def tilelang_aggregate_hm_kernel(
+        raw_h0: T.Tensor(state_shape, h_dtype),
+        ht_buffer: T.Tensor(buffer_shape, h_dtype),
+        mt_buffer: T.Tensor(buffer_shape, m_dtype),
+        fallback_mask: T.Tensor((cp_batch_size, H), mask_dtype),
+        seq_map: T.Tensor((raw_batch_size + 1,), seqlen_dtype),
+        h_card: T.Tensor(state_shape, h_dtype),
+        m_card: T.Tensor(state_shape, h_dtype),
+    ):
+        with T.Kernel(raw_batch_size * H, DK // block_DV, threads=128) as (bbh, block_col):
+            bb, bh = bbh // H, bbh % H
+            lo = block_col * block_DV
+            start = T.cast(seq_map[bb], "int32")
+            end = T.cast(seq_map[bb + 1], "int32")
+            prev = T.alloc_shared((DK, 2 * block_DV), "float32")
+            acc = T.alloc_fragment((DK, 2 * block_DV), "float32")
+            a_hi = T.alloc_shared((DK, block_K), T.tfloat32)
+            a_lo = T.alloc_shared((DK, block_K), T.tfloat32)
+            b_hi = T.alloc_shared((2 * block_DV, block_K), T.tfloat32)
+            b_lo = T.alloc_shared((2 * block_DV, block_K), T.tfloat32)
+            T.annotate_layout({prev: prev_layout})
+
+            for i, j in T.Parallel(DK, 2 * block_DV):
+                if j < block_DV:
+                    if use_raw_h0:
+                        acc[i, j] = (raw_h0[bb, bh, lo + j, i] if state_v_first
+                                     else raw_h0[bb, bh, i, lo + j])
+                    else:
+                        acc[i, j] = 0.0
+                else:
+                    acc[i, j] = T.if_then_else(i == lo + j - block_DV, 1.0, 0.0)
+
+            for p in T.serial(start, end):
+                if fallback_mask[p, bh]:
+                    T.copy(acc, prev)
+                for i, j in T.Parallel(DK, 2 * block_DV):
+                    if j < block_DV:
+                        acc[i, j] = (ht_buffer[p, bh, lo + j, i] if state_v_first
+                                     else ht_buffer[p, bh, i, lo + j])
+                    else:
+                        acc[i, j] = 0.0
+                if fallback_mask[p, bh]:
+                    if p == start and not use_raw_h0:
+                        # h=0 and M=I: the first transfer needs only a copy.
+                        for i, j in T.Parallel(DK, block_DV):
+                            acc[i, block_DV + j] = T.cast(mt_buffer[p, bh, i, lo + j], "float32")
+                    else:
+                        for kb in T.serial(DK // block_K):
+                            for i, k in T.Parallel(DK, block_K):
+                                av = T.cast(mt_buffer[p, bh, i, kb * block_K + k], "float32")
+                                av_hi = T.cast(av, T.tfloat32)
+                                a_hi[i, k] = av_hi
+                                a_lo[i, k] = T.cast(av - T.cast(av_hi, "float32"), T.tfloat32)
+                            for j, k in T.Parallel(2 * block_DV, block_K, loop_layout=state_load_layout):
+                                bv = prev[kb * block_K + k, j]
+                                bv_hi = T.cast(bv, T.tfloat32)
+                                b_hi[j, k] = bv_hi
+                                b_lo[j, k] = T.cast(bv - T.cast(bv_hi, "float32"), T.tfloat32)
+                            T.gemm(a_hi, b_lo, acc, transpose_B=True, clear_accum=False)
+                            T.gemm(a_lo, b_hi, acc, transpose_B=True, clear_accum=False)
+                            T.gemm(a_hi, b_hi, acc, transpose_B=True, clear_accum=False)
+
+            for i, j in T.Parallel(DK, block_DV):
+                if state_v_first:
+                    h_card[bb, bh, lo + j, i] = acc[i, j]
+                else:
+                    h_card[bb, bh, i, lo + j] = acc[i, j]
+            for i, j in T.Parallel(DK, block_DV):
+                m_card[bb, bh, i, lo + j] = acc[i, block_DV + j]
+
+    return tilelang_aggregate_hm_kernel
+
+
 def aggregate_card_state(
     ht_buffer: torch.Tensor,   # [cp_batch_size, H, K, V] (or [.., V, K])
     mt_buffer: torch.Tensor,   # [cp_batch_size, H, K, K]
@@ -869,6 +1080,7 @@ def aggregate_card_state(
     transpose_m: bool = False,
     compute_m: bool = True,
 ):
+    """Use the paired-column kernel for forward h/M; retain other scan modes."""
     raw_batch_size = seq_map_r2c.shape[0] - 1
     _, num_heads, dim_2, dim_3 = ht_buffer.shape
     if state_v_first:
@@ -882,9 +1094,31 @@ def aggregate_card_state(
     if use_raw_h0:
         raw_h0 = raw_h0.to(res_dtype)
 
+    raw_state_shape = (
+        (raw_batch_size, num_heads, v_head_dim, k_head_dim)
+        if state_v_first
+        else (raw_batch_size, num_heads, k_head_dim, v_head_dim)
+    )
+    if compute_m and not reverse and not transpose_m:
+        state_kernel = tilelang_aggregate_hm(
+            num_heads, ht_buffer.dtype, mt_buffer.dtype, seq_map_r2c.dtype,
+            fallback_mask.dtype, state_v_first, use_raw_h0,
+        )
+        h_card = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)
+        m_card = torch.empty(
+            (raw_batch_size, num_heads, k_head_dim, k_head_dim),
+            dtype=res_dtype, device=mt_buffer.device,
+        )
+        if not use_raw_h0:
+            raw_h0 = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)
+        state_kernel(raw_h0, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, h_card, m_card)
+        return h_card, m_card
+
+    # Backward inter+intra CP only needs dh (compute_m=False). Keep the generic
+    # reverse/transposed running-M interface for existing direct callers.
     precision, block_DV = select_correction_config(
         num_heads, raw_batch_size, v_head_dim, ht_buffer.device,
-        compute_m=compute_m,
+        compute_m=compute_m, state_v_first=state_v_first, reverse=reverse,
     )
     state_kernel = tilelang_correct_h0(
         precision=precision, block_DV=block_DV,
@@ -904,12 +1138,6 @@ def aggregate_card_state(
         store_intra_h0=False,
         store_inter_h=True,
         compute_m=compute_m,
-    )
-
-    raw_state_shape = (
-        (raw_batch_size, num_heads, v_head_dim, k_head_dim)
-        if state_v_first
-        else (raw_batch_size, num_heads, k_head_dim, v_head_dim)
     )
 
     h_card = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)

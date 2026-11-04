@@ -93,7 +93,7 @@ def _correction_pick(shape: LaunchShape, *, backend: str) -> int:
 # Both layouts, seeded/unseeded scans and both directions share these choices.
 # Each direction still has independently fitted latency coefficients.
 _CORRECTION_CONFIGS = {
-    "hopper": (("fp32", 16), ("tf32x3", 64), ("tf32x3", 128)),
+    "hopper": (("fp32", 16), ("tf32x3", 32), ("tf32x3", 64), ("tf32x3", 128)),
     "blackwell": (("fp32", 16), ("tf32x3", 32), ("tf32x3", 64), ("tf32x3", 128)),
 }
 

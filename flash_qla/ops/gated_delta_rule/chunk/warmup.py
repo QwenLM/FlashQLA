@@ -124,7 +124,9 @@ def _warm_correction(cfg):
     """Compile reachable choices for the independent grid and each scan mode."""
     major, _ = torch.cuda.get_device_capability(cfg.device)
     if major == 9:
-        from .hopper.cp_fwd import tilelang_correct_h0, select_correction_config
+        from .hopper.cp_fwd import (
+            tilelang_correct_h0, select_correction_config, tilelang_aggregate_hm,
+        )
     elif major == 10:
         from .blackwell.cp_fwd import (
             tilelang_correct_h0, select_correction_config, tilelang_aggregate_hm,
@@ -139,16 +141,13 @@ def _warm_correction(cfg):
     scan_seeds = {False, True} if combined else seeds
     modes = [(False, False, True, False, False, scan_seeds)]
     if combined:
-        if major == 10:
-            # Blackwell aggregates h and M in a dedicated paired-column scan.
-            for use_raw in sorted(seeds):
-                tilelang_aggregate_hm(
-                    H=cfg.H, h_dtype=torch.float32, m_dtype=torch.float32,
-                    seqlen_dtype=cfg.cu_seqlens_dtype, mask_dtype=torch.bool,
-                    state_v_first=cfg.state_v_first, use_raw_h0=use_raw,
-                )
-        else:
-            modes.append((False, False, False, True, True, seeds))
+        # Both Hopper and Blackwell pair h/M columns in a dedicated scan.
+        for use_raw in sorted(seeds):
+            tilelang_aggregate_hm(
+                H=cfg.H, h_dtype=torch.float32, m_dtype=torch.float32,
+                seqlen_dtype=cfg.cu_seqlens_dtype, mask_dtype=torch.bool,
+                state_v_first=cfg.state_v_first, use_raw_h0=use_raw,
+            )
     if cfg.training:
         bwd_seeds = {False, True} if cfg.output_final_state else {False}
         bwd_scan_seeds = {False, True} if combined else bwd_seeds
