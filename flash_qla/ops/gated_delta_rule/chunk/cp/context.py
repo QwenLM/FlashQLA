@@ -227,6 +227,7 @@ def build_cp_context(
         num_v_heads=num_v_heads, conv1d_kernel_size=conv1d_kernel_size,
         cu_seqlens_cpu=cu_seqlens_cpu, g=g, is_train=is_train,
         force_intra_cp=force_intra_cp,
+        zigzag=zigzag,
     )
 
 
@@ -241,6 +242,7 @@ def _build_cp_context_impl(
     g: torch.Tensor | None = None,
     is_train: bool = True,
     force_intra_cp: bool = False,
+    zigzag: bool = False,
 ) -> FlashQLACPContext:
     """Actual CP-context construction, bypassing the ``prepare_varlen_metadata`` fast path.
     See :func:`build_cp_context` for the full contract of each argument."""
