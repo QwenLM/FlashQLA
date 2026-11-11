@@ -1,6 +1,7 @@
 # Copyright (c) 2026 The Qwen team, Alibaba Group.
 # Licensed under The MIT License [see LICENSE for details]
 import importlib.util
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ import tilelang.contrib.nvcc
 import torch
 
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.decision import decide
-from flash_qla.ops.gated_delta_rule.chunk.cp.autocp import launch
+from flash_qla.ops.gated_delta_rule.chunk.cp.autocp import launch, utils
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.launch import current_arch
 from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.utils import (
     AutocpInfo,
@@ -65,7 +66,9 @@ def test_context_initializes_on_sm121(monkeypatch):
 
 
 @pytest.mark.parametrize("is_train", [False, True])
-def test_sm121_autocp_uses_sm120_coefficients(is_train):
+def test_sm121_autocp_uses_sm120_coefficients(is_train, tmp_path, monkeypatch):
+    shutil.copyfile(Path(utils.COEFS_DIR) / "sm120.csv", tmp_path / "sm120.csv")
+    monkeypatch.setattr(utils, "COEFS_DIR", str(tmp_path))
     assert is_calibrated("sm121")
     with pytest.warns(AutocpInfo, match="no sm121.csv; using sm120's coefficients"):
         coefs = load_coefs(arch="sm121")
