@@ -10,10 +10,10 @@ DV = 128
 FWD_TARGET_FRAC = 0.7  # blackwell/fused_fwd.py:12
 
 COMPUTE_VERSION_ARCH = {"9.0": "sm90", "10.0": "sm100",
-                        "10.3": "sm103", "12.0": "sm120"}
+                        "10.3": "sm103", "12.0": "sm120", "12.1": "sm121"}
 
 BACKEND_OF = {"sm90": "hopper", "sm100": "blackwell",
-              "sm103": "blackwell", "sm120": "blackwell_sm120"}
+              "sm103": "blackwell", "sm120": "blackwell_sm120", "sm121": "blackwell_sm120"}
 
 
 @dataclass(frozen=True)
@@ -130,6 +130,6 @@ def current_arch() -> str:
     version = tilelang.contrib.nvcc.get_target_compute_version()
     if version not in COMPUTE_VERSION_ARCH:
         raise ValueError(
-            f"FlashQLA supports sm90, sm100, sm103 and sm120 only. "
+            f"FlashQLA supports sm90, sm100, sm103, sm120 and sm121 only. "
             f"Found compute version: {version}")
     return COMPUTE_VERSION_ARCH[version]

@@ -10,18 +10,18 @@ import os
 import sys
 
 import torch
-import tilelang
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flash_qla.ops.gated_delta_rule.chunk import (
+    CHUNK_SIZE,
     chunk_gated_delta_rule_fwd as _chunk_gdr_fwd_impl,
     chunk_gated_delta_rule_bwd as _chunk_gdr_bwd_impl,
     _auto_intra_cp_context,
 )
 from flash_qla.utils import l2norm, pack
-from ref_gdr import chunk_gated_delta_rule_fwd as chunk_gated_delta_rule_fwd_ref
-from ref_gdr import chunk_gated_delta_rule_bwd as chunk_gated_delta_rule_bwd_ref
+from ref_gdr import chunk_gated_delta_rule_fwd as chunk_gated_delta_rule_fwd_ref  # noqa: F401
+from ref_gdr import chunk_gated_delta_rule_bwd as chunk_gated_delta_rule_bwd_ref  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -29,7 +29,6 @@ from ref_gdr import chunk_gated_delta_rule_bwd as chunk_gated_delta_rule_bwd_ref
 RTOL = 0.02
 HEAD_DIM_K = 128
 HEAD_DIM_V = 128
-CHUNK_SIZE = 32 if tilelang.contrib.nvcc.get_target_compute_version() == "12.0" else 64
 REF_DTYPE = torch.float64
 DATA_DTYPE = torch.bfloat16
 DEVICE = "cuda"
