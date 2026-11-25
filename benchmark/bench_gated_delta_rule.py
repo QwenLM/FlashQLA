@@ -71,14 +71,14 @@ def generate_rand_seqlens(batch_size, num_tokens, seed=42):
 
 
 FWD_MODEL_CONFIGS = [
-    ModelConfig("397B/122B TP8", 2, 8),
-    ModelConfig("397B/122B TP4", 4, 16),
-    ModelConfig("397B/122B TP2", 8, 32),
-    ModelConfig("397B/122B TP1", 16, 64),
-    ModelConfig("35B/9B/4B TP1", 16, 32),
-    ModelConfig("27B TP2", 8, 24),
-    ModelConfig("27B TP1", 16, 48),
-    ModelConfig("2B/0.8B TP1", 16, 16),
+    ModelConfig("Qwen3.5 397B TP8", 2, 8),
+    ModelConfig("Qwen3.8 Max / Qwen3.5 397B TP4", 4, 16),
+    ModelConfig("Qwen3.8 Max / Qwen3.5 397B TP2", 8, 32),
+    ModelConfig("Qwen3.8 Max / Qwen3.5 397B TP1", 16, 64),
+    ModelConfig("Qwen3.5 35B/9B/4B TP1", 16, 32),
+    ModelConfig("Qwen3.8 27B TP2", 8, 24),
+    ModelConfig("Qwen3.8 27B TP1", 16, 48),
+    ModelConfig("Qwen3.5 2B/0.8B TP1", 16, 16),
     ModelConfig("Sym h32", 32, 32),
 ]
 
@@ -474,7 +474,7 @@ def bench_bwd(
 
 
 FWD_HDR = (
-    f"{'Model Config':<16} {'Seqlens':<17} {'h_qk':>5} {'h_v':>5}    "
+    f"{'Model Config':<30} {'Seqlens':<17} {'h_qk':>5} {'h_v':>5}    "
     f"{'flash_qla [fwd]':>10}  {'FI [fwd]':>10}  {'FLA [fwd]':>10}   "
     f"{'vs FLA':>7}  {'vs FI':>7}"
 )
@@ -525,7 +525,7 @@ def main():
 
     gpu_name = torch.cuda.get_device_properties(0).name
     print(f"GPU: {gpu_name}")
-    print("Models: Qwen3.5 family (397B, 122B, 35B, 27B, 9B, 4B, 2B, 0.8B), d=128")
+    print("Models: Qwen3.8 (Max, 27B) + Qwen3.5 (397B, 35B, 9B, 4B, 2B, 0.8B), d=128")
     print(f"Config: Warmup={args.warmup}, Repeats={args.repeats}, Backend={args.backend}")
 
     libs = get_lib_versions()
@@ -533,7 +533,7 @@ def main():
     ver_str = " | ".join([f"{k}: {v}" for k, v in libs.items()])
     print(f"  {ver_str}")
 
-    print("=" * 110)
+    print("=" * len(FWD_HDR))
 
     # Forward
     if args.mode in ("fwd", "all"):
@@ -567,7 +567,7 @@ def main():
                     ratio_fi = fmt_ratio(qla_ms, fi_ms)
 
                     print(
-                        f"{cfg.label:<16} {sl_cfg.label:<17} {cfg.h_qk:>5} {cfg.h_v:>5}    "
+                        f"{cfg.label:<30} {sl_cfg.label:<17} {cfg.h_qk:>5} {cfg.h_v:>5}    "
                         f"{fmt_time(qla_ms)}  {fmt_time(fi_ms)}  {fmt_time(fla_ms)}   "
                         f"{ratio_fla}  {ratio_fi}",
                         flush=True,
@@ -584,7 +584,7 @@ def main():
 
     # Backward
     if args.mode in ("bwd", "all"):
-        print("\n" + "=" * 110)
+        print("\n" + "=" * len(FWD_HDR))
         print(f"\n>>> BACKWARD BENCHMARKS")
         print(BWD_HDR)
         print("-" * len(BWD_HDR))
