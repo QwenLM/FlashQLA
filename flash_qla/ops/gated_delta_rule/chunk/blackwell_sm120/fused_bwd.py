@@ -251,7 +251,8 @@ def tilelang_fused_chunk_gdr_bwd(
             bar_04 = T.alloc_barrier(arrive_count=416)
             bar_05 = T.alloc_barrier(arrive_count=288)
             bar_06 = T.alloc_barrier(arrive_count=256)
-            bar_07 = T.alloc_barrier(arrive_count=256)
+            # Include P1: dV must be stored before K reuses dqkv_shared at stage 7.
+            bar_07 = T.alloc_barrier(arrive_count=288)
             # when barrier 8_1 arrivee,all consumer complete the left part
             bar_08_1 = T.alloc_barrier(arrive_count=256)
             bar_08_2 = T.alloc_barrier(arrive_count=384) #all right windows has been cosnumed
@@ -1300,6 +1301,7 @@ def tilelang_fused_chunk_gdr_bwd(
                                     ]
                         else:
                             T.copy(dqkv_shared, dv[batch_idx, left:right, bh, 0:DV])
+                        T.barrier_arrive(bar_07)
                         T.barrier_arrive(bar_10)
                         T.barrier_wait(bar_10, (i_s + 0) % 2)
 

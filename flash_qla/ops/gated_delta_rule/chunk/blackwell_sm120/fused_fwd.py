@@ -42,7 +42,7 @@ def tilelang_fused_chunk_gdr_fwd(
     is_varlen,
     is_cp,
     state_v_first,
-    block_DV=128,
+    block_DV=64,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
@@ -224,6 +224,9 @@ def tilelang_fused_chunk_gdr_fwd(
 
                     # [STAGE 0] 2, 3, 4
                     T.barrier_wait(bar_1, i_s % 2)
+                    # Prevent nvcc/cicc from hoisting g_exp_shared[block_S - 1] before the loop
+                    # (TileLang mbarrier_wait lacks a "memory" clobber).
+                    T.call_extern("void", "__threadfence_block")
                     # S = g_last * S
                     g_last_local[0] = g_exp_shared[block_S - 1]
                     if state_v_first:
@@ -396,6 +399,8 @@ def tilelang_fused_chunk_gdr_fwd(
 
                     # [STAGE 0] 2
                     T.barrier_wait(bar_1, i_s % 2)
+                    # Prevent nvcc/cicc from hoisting read-only g_exp_shared loads out of the loop.
+                    T.call_extern("void", "__threadfence_block")
                     # O = Q @ S
                     if state_v_first:
                         T.gemm(
@@ -730,8 +735,8 @@ def fused_gdr_fwd(
     # avoiding a redundant full-output memset on every forward pass.
     o = torch.empty_like(v)
 
-
-    block_DV = 128
+    
+    block_DV = 64
     
     tilelang_fused_chunk_gdr_fwd_kernel = tilelang_fused_chunk_gdr_fwd(
         H,
