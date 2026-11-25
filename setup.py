@@ -17,7 +17,7 @@ if not rev:
 
 setup(
     name="flash_qla",
-    version="0.1.3" + rev,
+    version="0.1.4" + rev,
     description="FlashQLA: Fused TileLang kernels for Linear Attention",
     long_description=open("README.md", encoding="utf8").read(),
     long_description_content_type="text/markdown",
