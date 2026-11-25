@@ -194,4 +194,11 @@ FlashQLA is released under the MIT License.
     publisher={GitHub},
     howpublished={\url{https://github.com/QwenLM/FlashQLA}},
 }
+
+@article{lin2026flashqla,
+      title={FlashQLA: Efficient Context Parallelism for Gated DeltaNet}, 
+      author={Lin, Xi and Zhang, Chengruidong and Jiang, Huiqiang and Li, Xiao and Wang, Zekun and Feng, Junda and Mao, Yunfei and Zhang, Siqi and Wang, Siyu and Yuan, Man and Men, Rui and Zheng, Bo and Liu, Dayiheng and Zhuang, Bohan and Zhang, Jianwei},
+      journal={arXiv preprint arXiv:2611.32039},
+      year={2026}
+}
 ```
