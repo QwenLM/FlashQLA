@@ -77,6 +77,11 @@ def _hopper_fwd_pick(shape: LaunchShape) -> int:
 
 _HOPPER_FWD = Rule((32, 64, 128), _hopper_fwd_pick)
 
+# Closed-form wave-work heuristics for SM120 DV tiling:
+# Smaller block_DV multiplies CTA count by (DV // width) to fill all P SMs at
+# low concurrency (reducing wave quantization), at the cost of repeating
+# K/Q/A-side work across DV tiles. Each helper picks the width minimizing
+# `waves * (fixed_tile_work + dv_proportional_work)`.
 _SM120_FWD_WIDTHS = (128, 64, 32)
 _SM120_RECOMPUTE_WIDTHS = (128, 64)
 _SM120_PREP_DH_WIDTHS = (128, 64, 32)

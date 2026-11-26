@@ -430,6 +430,18 @@ def tilelang_correct_h0(
                 h_fragment: _fp32_frag_layout(DK, block_DV, state_v_first),
             })
 
+        # 3-role warp-specialized pipeline (256 threads):
+        #   - Consumer math warps (tx   0..127, 240 regs): pure-FP32 MAC over K tiles
+        #     using bank-conflict-free 8-col `_fp32_frag_layout`, plus direct coalesced
+        #     reads of `ht_buffer` (no separate h_stage SMEM needed).
+        #   - Producer load warp  (tx 128..159, 24 regs): TMA-prefetches K tiles of
+        #     `mt_buffer` into 2-stage `m_stage`, skipping the entire segment when
+        #     `fallback_mask == 0`. Handshakes with math via `m_ready` (32) / `m_free` (128).
+        #   - Producer store warp (tx 160..191, 24 regs): asynchronously writes `hp_stage`
+        #     to `cp_h0` via `hp_ready` (128) / `hp_free` (32).
+        #   - In standard intra-card entry-state scan (`skip_last_gemm=True`), the last
+        #     segment's exit state has no downstream consumer, so `gemm_iters = num_iters - 1`
+        #     skips the redundant final 128x128 M load and multiply.
         m_ready = T.alloc_barrier(arrive_count=[32] * m_stages)
         m_free = T.alloc_barrier(arrive_count=[128] * m_stages)
         hp_ready = T.alloc_barrier(arrive_count=[128])

@@ -36,6 +36,15 @@ def tilelang_kkt_solve(
     a_shape = (data_batch_size, num_tokens, H, chunk_size)
     b_shape = (data_batch_size, num_tokens, H)
 
+    # Algorithm overview (32x32 unit lower-triangular inverse (I + L)^-1):
+    # Instead of row-by-row forward substitution through shared memory (which
+    # stalls on MIO queue and per-row barriers), we partition the 32 rows into
+    # 4 horizontal 8x32 panels (one panel per warp, one column per lane):
+    #   1. Each warp solves D_p * X_p = [-L_left | I | 0] for its 8x8 diagonal
+    #      block D_p entirely in private FP32 registers (`column[8]`), with zero
+    #      shared-memory writes or barriers during the 8-step elimination.
+    #   2. Two hierarchical `merge_panels` passes (width 8 -> 16 -> 32) substitute
+    #      upper panel solutions into lower panels, requiring only 5 barriers total.
     # Each warp owns all 32 columns of its row panel.
     threads = 128
     panel_rows = block_S // (threads // 32)

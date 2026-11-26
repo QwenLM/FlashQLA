@@ -139,6 +139,15 @@ def tilelang_fused_chunk_gdr_fwd(
             num_iters = T.ceildiv(seq_end_idx - seq_start_idx, block_S)
             num_unmasked_iters = (seq_end_idx - seq_start_idx) // block_S
 
+            # SM120 shared-memory budget (99 KiB/SM hard limit):
+            # To enable 2-stage TMA input pipelining (input_stages=2) even at full
+            # width block_DV=128, we eliminate the separate vd_shared (8 KiB) and
+            # o_shared (8 KiB) staging buffers:
+            #   1. v_shared[stage] is reused in-place across three phases per chunk:
+            #      raw V -> correction W -> decayed V_d, guarded by `w_consumed`
+            #      (128 threads) before Consumer V overwrites it with V_d.
+            #   2. Consumer O writes o_fragment directly from registers to global O.
+            # Total dynamic SMEM at block_DV=128 stays at ~96 KiB < 99 KiB.
             q_shared = T.alloc_shared((input_stages, block_S, DK), dtype=qkva_dtype)
             k_shared = T.alloc_shared((input_stages, block_S, DK), dtype=qkva_dtype)
             v_shared = T.alloc_shared((input_stages, block_S, block_DV), dtype=qkva_dtype)

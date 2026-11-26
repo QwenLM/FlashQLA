@@ -239,6 +239,45 @@ def tilelang_fused_chunk_gdr_bwd(
             dg_last_local_3 = T.alloc_fragment((1), dtype=accum_dtype)
             g_last_local_3 = T.alloc_local((1), dtype=accum_dtype)
 
+            # ------------------------------------------------------------------
+            # Warp-group roles (480 threads = 3x128 consumers + 3x32 producers):
+            #   - Consumer S  (tx   0..127): backward state (dH) & H recurrence.
+            #   - Consumer K  (tx 128..255): dK / dQ / dV / dG computation.
+            #   - Consumer A  (tx 256..383): intra-chunk attention & dA / dG.
+            #   - Producer W0 (tx 384..415): TMA loads for Q, K, g.
+            #   - Producer W1 (tx 416..447): global stores for dV, dQ, dK.
+            #   - Producer W2 (tx 448..479): TMA loads for A, dO, H, and async V.
+            #
+            # Summary of SM120 barrier protocol changes vs stock v0.1.4:
+            # 1. Replace the 384-thread bar_08_2 stall with 128-thread S <-> K
+            #    handoffs over tmp_shared_4_1 (16 KiB):
+            #      - S stages dH left-half into tmp_shared_4_1 -> bar_dhtmp_ready.
+            #      - K consumes left-half -> bar_k_left_ready (or
+            #        bar_dh_initial_left_free on i_s == 0) so S can overwrite
+            #        tmp_shared_4_1 with dH right-half -> bar_dh_right_ready
+            #        (or bar_dh_initial_right_ready on i_s == 0).
+            #      - Once K finishes all dH reads from tmp_shared_4_1, K signals
+            #        bar_dhtmp_free so S can reuse tmp_shared_4_1 for the next
+            #        chunk's H left-half while K/A finish right-half math.
+            # 2. Async TMA V prefetch on Producer W2 via tmp_shared_2_2 (8 KiB):
+            #      - K signals bar_tmp2_2_free after its last read of tmp_shared_2_2.
+            #      - W2 waits on bar_tmp2_2_free, issues TMA copy of next chunk's V
+            #        into tmp_shared_2_2 with barrier=bar_v_ready, and arrives (32).
+            #      - Consumer A (128) arrives/waits on bar_v_ready (160 = 32 + 128)
+            #        instead of synchronously loading V from global memory.
+            # 3. Fine-grained dqkv_shared output mailbox release (W1 -> K):
+            #      - W1 signals bar_dqkv_dv_free (32) right after storing dV and
+            #        bar_dqkv_dq_free (32) right after storing dQ.
+            #      - K waits on bar_dqkv_dv_free / bar_dqkv_dq_free before writing
+            #        the next tile into dqkv_shared. This replaces the coarse
+            #        bar_07=288 W1 arrival for dV protection, so bar_07 remains 256
+            #        (Consumer K + Consumer A -> Producer W0).
+            # 4. Intra-group dg_shared / dqkv_shared staging synchronization:
+            #      - bar_s4_dot_a (128): WAR fence inside Consumer A when staging
+            #        the dg dot-product reduction through dqkv_shared.
+            #      - bar_dg_k_rows (128) / bar_dg_a_first (128): order row-scatter
+            #        writes into dg_shared between Consumer K and Consumer A.
+            # ------------------------------------------------------------------
             # 16 stages
             bar_00 = T.alloc_barrier(arrive_count=448)
             bar_01 = T.alloc_barrier(arrive_count=384)
