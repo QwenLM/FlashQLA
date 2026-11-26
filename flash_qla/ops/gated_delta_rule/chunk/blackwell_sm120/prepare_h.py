@@ -627,7 +627,8 @@ def fused_gdr_h(
         dtype=k.dtype,
         device=k.device,
     )
-    ht_dtype = k.dtype if is_cp else torch.float32
+    # Keep ht/mt in fp32 to preserve long-memory CP correction precision.
+    ht_dtype = torch.float32
     final_state = torch.empty(
         (real_batch_size, H, V, K)
         if state_v_first

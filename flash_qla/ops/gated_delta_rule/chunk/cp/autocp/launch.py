@@ -95,6 +95,7 @@ def _correction_pick(shape: LaunchShape, *, backend: str) -> int:
 _CORRECTION_CONFIGS = {
     "hopper": (("fp32", 16), ("tf32x3", 32), ("tf32x3", 64), ("tf32x3", 128)),
     "blackwell": (("fp32", 16), ("tf32x3", 32), ("tf32x3", 64), ("tf32x3", 128)),
+    "blackwell_sm120": (("fp32", 16), ("fp32", 32), ("fp32", 64)),
 }
 
 
@@ -119,7 +120,8 @@ BLOCK_DV = {
     },
     "blackwell_sm120": {
         "fused_fwd": 128,                            # blackwell_sm120/fused_fwd.py:726
-        "correct_h0": 32, "correct_dht": 32,         # blackwell_sm120/cp_fwd.py:282
+        "correct_h0": _CORRECTION_RULES["blackwell_sm120"],
+        "correct_dht": _CORRECTION_RULES["blackwell_sm120"],
     },
 }
 
