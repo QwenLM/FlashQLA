@@ -31,7 +31,7 @@ elif tilelang.contrib.nvcc.get_target_compute_version() in ["12.0", "12.1"]:
     from .blackwell_sm120 import get_warmup_chunks, get_warmup_chunks_bidi, correct_initial_states, correct_terminal_states, aggregate_card_state
     from .blackwell_sm120.cp_bwd import fused_gdr_dh_ws as fused_gdr_dh
     CHUNK_SIZE = 32
-    _CP_SUPPORTS_SLOT_SCAN = False
+    _CP_SUPPORTS_SLOT_SCAN = True
 else:
     raise ValueError(f"FlashQLA now support sm90, sm100, sm103, sm120 and sm121 only. Found compute version: {tilelang.contrib.nvcc.get_target_compute_version()}")
 from .cp import (
