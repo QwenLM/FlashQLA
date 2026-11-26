@@ -10,8 +10,6 @@ import tilelang.language as T
 from flash_qla.utils import prepare_chunk_indices
 
 
-
-
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
@@ -38,8 +36,31 @@ def tilelang_kkt_solve(
     a_shape = (data_batch_size, num_tokens, H, chunk_size)
     b_shape = (data_batch_size, num_tokens, H)
 
-        
-        
+    # Each warp owns all 32 columns of its row panel.
+    threads = 128
+    panel_rows = block_S // (threads // 32)
+
+    @T.macro
+    def merge_panels(panels, width):
+        # Each diagonal block holds its inverse. Columns to its left hold
+        # -inverse @ L_left. Substitute the upper block into the lower one.
+        pairs = block_S // (2 * width)
+        cols = block_S - width
+        merged = T.alloc_fragment((pairs, width, cols), dtype=accum_dtype)
+        for p, i, j in T.Parallel(pairs, width, cols):
+            top = 2 * p * width
+            merged[p, i, j] = T.if_then_else(j < top, panels[top + width + i, j], 0.0)
+        for r in T.unroll(width):
+            for p, i, j in T.Parallel(pairs, width, cols):
+                top = 2 * p * width
+                if j < top + width:
+                    merged[p, i, j] += panels[top + width + i, top + r] * panels[top + r, j]
+        # All reads of the coupling block must finish before overwriting it.
+        T.sync_threads()
+        for p, i, j in T.Parallel(pairs, width, cols):
+            if j < (2 * p + 1) * width:
+                panels[(2 * p + 1) * width + i, j] = merged[p, i, j]
+        T.sync_threads()
 
     @T.macro
     def kernel_body_32(
@@ -62,25 +83,9 @@ def tilelang_kkt_solve(
         b_shared = T.alloc_shared((block_S), dtype=accum_dtype, scope="shared")
         a32_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
 
-        # Diagonal 16x16 inversion workspaces (2 blocks)
-        a16i_row = T.alloc_fragment((2, 16), dtype=accum_dtype)
-        a16i_sum = T.alloc_fragment((2, 16), dtype=accum_dtype)
-
-        # 2 diagonal 16x16 blocks (padded to 17 for alignment)
-        a16i_shared = T.alloc_shared((2, 17, 16), dtype=accum_dtype)
-        # 1 sub-diagonal 16x16 coupling (blocks 0->1)
-        a16o_shared = T.alloc_shared((1, 17, 16), dtype=accum_dtype)
-        a16o_fragment = T.alloc_fragment((1, 16, 16), dtype=accum_dtype)
-
-
+        neg_gram = T.alloc_shared((block_S, block_S), dtype=accum_dtype)
         a32_shared = T.alloc_shared((block_S, block_S), dtype=accum_dtype)
-
-        T.annotate_layout(
-            {
-                a16i_shared: tilelang.layout.make_linear_layout(a16i_shared),
-                a16o_shared: tilelang.layout.make_linear_layout(a16o_shared),
-            }
-        )
+        column = T.alloc_local((panel_rows,), dtype=accum_dtype)
 
         # Load K (async)
         if right <= seq_end_idx:
@@ -101,98 +106,40 @@ def tilelang_kkt_solve(
                     b_shared[j_s] = b[bb, left + j_s, bh]
                 else:
                     b_shared[j_s] = 0
-        # A = K @ K^T 
+        # A = K @ K^T
         if right <= seq_end_idx:
             T.ptx_wait_group(0)
-        T.gemm(k_shared,k_shared,a32_fragment,transpose_B=True,clear_accum=True)
+        T.gemm(k_shared, k_shared, a32_fragment, transpose_B=True, clear_accum=True)
+        for i, j in T.Parallel(block_S, block_S):
+            neg_gram[i, j] = -b_shared[i] * a32_fragment[i, j]
+        T.sync_threads()
 
-        # A = b * A
-        for j_s, j_t in T.Parallel(block_S, block_S):
-            a32_fragment[j_s, j_t] *= b_shared[j_s]
+        # Solve D X = [-L_left | I | 0] for each diagonal panel D.
+        # Each lane owns one RHS. The warp broadcasts each shared coefficient
+        # while previous entries of the solution column stay in registers.
+        tx = T.get_thread_binding()
+        panel = (tx // block_S) * panel_rows
+        j = tx % block_S
+        for i in T.unroll(panel_rows):
+            row = panel + i
+            column[i] = T.if_then_else(
+                j < panel, neg_gram[row, j], T.if_then_else(j == row, 1.0, 0.0)
+            )
+            for r in T.unroll(i):
+                column[i] += neg_gram[row, panel + r] * column[r]
+        for i in T.unroll(panel_rows):
+            a32_shared[panel + i, j] = column[i]
+        T.sync_threads()
 
-            # A = I + StrictLower(A)
-        for j_s, j_t in T.Parallel(block_S, block_S):
-            if j_s < j_t:
-                a32_fragment[j_s, j_t] = 0
-            elif j_s == j_t:
-                a32_fragment[j_s, j_t] = 1
+        merge_panels(a32_shared, panel_rows)
+        merge_panels(a32_shared, 2 * panel_rows)
 
-        # Prepare inversion input: extract diagonal and sub-diagonal 16x16 blocks
-        for j_s, j_t in T.Parallel(block_S, block_S):
-            if (j_s // 16) == (j_t // 16) + 1:
-                    # Sub-diagonal block: L10
-                a16o_shared[j_s // 32, j_s % 16, j_t % 16] = -a32_fragment[
-                        j_s, j_t
-                    ]
-            elif (j_s // 16) == (j_t // 16):
-                    # Diagonal blocks: L00, L11
-                a16i_shared[j_s // 16, j_s % 16, j_t % 16] = a32_fragment[
-                        j_s, j_t
-                    ]
-
-        # Invert diagonal 16x16 blocks (2 blocks in parallel)
-        # Forward substitution for lower triangular L with unit diagonal
-        for k_s in T.unroll(1, 16):
-            for j_s, k_t in T.Parallel(2, 16):
-                if k_t < k_s:
-                    a16i_row[j_s, k_t] = a16i_shared[j_s, k_s, k_t]
-            T.clear(a16i_sum)
-            for k_r in T.unroll(k_s):
-                for j_s, k_t in T.Parallel(2, 16):
-                    a16i_sum[j_s, k_t] -= (
-                            a16i_shared[j_s, k_r, k_t] * a16i_row[j_s, k_r]
-                        )
-            for j_s, k_t in T.Parallel(2, 16):
-                if k_t < k_s:
-                    a16i_shared[j_s, k_s, k_t] = a16i_sum[j_s, k_t]
-
-            # Compute coupling between blocks 0 and 1 (single pair)
-            # Step 1: temp = L11^{-1} @ (-L10)  [16x16]
-        T.clear(a16o_fragment)
-        for k_r in T.unroll(16):
-            for j_s, k_s, k_t in T.Parallel(1, 16, 16):
-                    a16o_fragment[j_s, k_s, k_t] += (
-                        a16i_shared[j_s * 2 + 1, k_s, k_r]
-                        * a16o_shared[j_s, k_r, k_t]
-                    )
-            # Transpose for the second multiply
-        for j_s, k_s, k_t in T.Parallel(1, 16, 16):
-            a16o_shared[j_s, k_t, k_s] = a16o_fragment[j_s, k_s, k_t]
-            # Step 2: result = temp @ L00^{-1}  [16x16]
-        T.clear(a16o_fragment)
-        for k_r in T.unroll(16):
-            for j_s, k_s, k_t in T.Parallel(1, 16, 16):
-                    a16o_fragment[j_s, k_s, k_t] += (
-                        a16o_shared[j_s, k_r, k_s]
-                        * a16i_shared[j_s * 2, k_r, k_t]
-                    )
-        T.copy(a16o_fragment, a16o_shared[:, 0:16, 0:16])
-
-            # Assemble 32x32 result
-            # Top-left: L00^{-1}
-        for k_s, k_t in T.Parallel(16, 16):
-            a32_shared[k_s, k_t] = a16i_shared[0, k_s, k_t]
-            # Top-right: 0
-        for k_s, k_t in T.Parallel(16, 16):
-            a32_shared[k_s, 16 + k_t] = 0
-            # Bottom-left: coupling (-L11^{-1} @ L10 @ L00^{-1})
-        for k_s, k_t in T.Parallel(16, 16):
-            a32_shared[16 + k_s, k_t] = a16o_fragment[0, k_s, k_t]
-            # Bottom-right: L11^{-1}
-        for k_s, k_t in T.Parallel(16, 16):
-            a32_shared[16 + k_s, 16 + k_t] = a16i_shared[1, k_s, k_t]
-
-            
-
-        # Save A (unmasked)
         if right <= seq_end_idx:
             T.copy(a32_shared, a[bb, left:right, bh, 0:block_S])
         else:
             for j_s, j_t in T.Parallel(block_S, block_S):
                 if left + j_s < seq_end_idx:
                     a[bb, left + j_s, bh, j_t] = a32_shared[j_s, j_t]
-
-   
 
     if is_varlen:
 
@@ -204,7 +151,7 @@ def tilelang_kkt_solve(
             chunk_indices: T.Tensor([num_chunks, 2], dtype=seqlen_dtype),
             a: T.Tensor(a_shape, dtype=qkva_dtype),
         ):
-            with T.Kernel(num_chunks * H, threads=128) as (bch,):
+            with T.Kernel(num_chunks * H, threads=threads) as (bch,):
                 bc, bh = bch // H, bch % H
                 bhg = bh // (H // Hg)
 
@@ -243,7 +190,7 @@ def tilelang_kkt_solve(
             a: T.Tensor(a_shape, dtype=qkva_dtype),
             num_chunks: T.int32,
         ):
-            with T.Kernel(num_chunks * H, threads=128) as (bch,):
+            with T.Kernel(num_chunks * H, threads=threads) as (bch,):
                 bc, bh = bch // H, bch % H
                 bhg = bh // (H // Hg)
 

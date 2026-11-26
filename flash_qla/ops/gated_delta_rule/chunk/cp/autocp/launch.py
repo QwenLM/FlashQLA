@@ -48,6 +48,8 @@ class LaunchConfig:
 def coef_row(kernel: str, block_DV: int, precision: str | None = None) -> str:
     if precision is not None:
         return f"{kernel}_{precision}_dv{int(block_DV)}"
+    if kernel in ("recompute_h", "prepare_dh") and block_DV == DV:
+        return kernel
     return f"{kernel}_dv{int(block_DV)}" if kernel in DV_TILED else kernel
 
 
@@ -75,10 +77,49 @@ def _hopper_fwd_pick(shape: LaunchShape) -> int:
 
 _HOPPER_FWD = Rule((32, 64, 128), _hopper_fwd_pick)
 
+_SM120_FWD_WIDTHS = (128, 64, 32)
+_SM120_RECOMPUTE_WIDTHS = (128, 64)
+_SM120_PREP_DH_WIDTHS = (128, 64, 32)
+
+
+def sm120_fwd_width(shape: LaunchShape) -> int:
+    chunk_size, dk = 32, 128
+
+    def wave_work(width: int) -> int:
+        ctas = shape.grid * (DV // width)
+        waves = (ctas + shape.P - 1) // shape.P
+        return waves * (chunk_size * dk + width * (3 * dk + 2 * chunk_size))
+
+    return min(_SM120_FWD_WIDTHS, key=wave_work)
+
+
+def sm120_recompute_width(shape: LaunchShape) -> int:
+    chunk_size = 32
+
+    def wave_work(width: int) -> int:
+        ctas = shape.grid * (DV // width)
+        waves = (ctas + shape.P - 1) // shape.P
+        return waves * (chunk_size + 2 * width)
+
+    return min(_SM120_RECOMPUTE_WIDTHS, key=wave_work)
+
+
+def sm120_prepare_dh_width(shape: LaunchShape) -> int:
+    chunk_size, dk = 32, 128
+    fixed_work = 3 * chunk_size * chunk_size * dk
+    value_work = 3 * chunk_size * dk * DV
+
+    def wave_work(width: int) -> float:
+        ways = -(-DV // width)
+        ctas = shape.grid * ways
+        waves = -(-ctas // shape.P)
+        return waves * (fixed_work + value_work * width / DV)
+
+    return min(_SM120_PREP_DH_WIDTHS, key=wave_work)
+
 
 @functools.lru_cache(maxsize=2)
 def _correction_selector(backend: str):
-    # Resolve the policy owned by the same architecture as the measured kernel.
     return importlib.import_module(
         f"flash_qla.ops.gated_delta_rule.chunk.{backend}.cp_fwd"
     ).select_correction_config
@@ -90,11 +131,10 @@ def _correction_pick(shape: LaunchShape, *, backend: str) -> int:
     )[1]
 
 
-# Both layouts, seeded/unseeded scans and both directions share these choices.
-# Each direction still has independently fitted latency coefficients.
 _CORRECTION_CONFIGS = {
     "hopper": (("fp32", 16), ("tf32x3", 32), ("tf32x3", 64), ("tf32x3", 128)),
     "blackwell": (("fp32", 16), ("tf32x3", 32), ("tf32x3", 64), ("tf32x3", 128)),
+    "blackwell_sm120": (("fp32", 16), ("fp32", 32), ("fp32", 64)),
 }
 
 
@@ -110,7 +150,7 @@ _CORRECTION_RULES = {
 
 BLOCK_DV = {
     "hopper": {
-        "fused_fwd": _HOPPER_FWD,                    # hopper/fused_fwd.py:730-736
+        "fused_fwd": _HOPPER_FWD,
         "correct_h0": _CORRECTION_RULES["hopper"], "correct_dht": _CORRECTION_RULES["hopper"],
     },
     "blackwell": {
@@ -118,8 +158,11 @@ BLOCK_DV = {
         "correct_h0": _CORRECTION_RULES["blackwell"], "correct_dht": _CORRECTION_RULES["blackwell"],
     },
     "blackwell_sm120": {
-        "fused_fwd": 128,                            # blackwell_sm120/fused_fwd.py:726
-        "correct_h0": 32, "correct_dht": 32,         # blackwell_sm120/cp_fwd.py:282
+        "fused_fwd": Rule(_SM120_FWD_WIDTHS, sm120_fwd_width),
+        "recompute_h": Rule(_SM120_RECOMPUTE_WIDTHS, sm120_recompute_width),
+        "prepare_dh": Rule(_SM120_PREP_DH_WIDTHS, sm120_prepare_dh_width),
+        "correct_h0": _CORRECTION_RULES["blackwell_sm120"],
+        "correct_dht": _CORRECTION_RULES["blackwell_sm120"],
     },
 }
 
@@ -151,6 +194,10 @@ def launch_config(backend: str, kernel: str, shape: LaunchShape) -> LaunchConfig
     if not isinstance(rule, Rule):
         return LaunchConfig(kernel, rule)
     block_DV = rule.pick(shape)
+    if block_DV <= 0 or DV % block_DV:
+        raise ValueError(
+            f"{backend}/{kernel} picked unaligned block_DV={block_DV}; "
+            f"DV={DV} requires a positive divisor")
     if block_DV not in rule.widths:
         raise ValueError(
             f"{backend}/{kernel} picked block_DV={block_DV} for {shape}, which is "

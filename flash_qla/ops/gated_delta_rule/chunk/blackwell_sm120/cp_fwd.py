@@ -285,6 +285,61 @@ def get_warmup_chunks_bidi(
     return num_warmup_h, num_warmup_bwd, fallback_fwd, fallback_bwd
 
 
+def select_correction_config(
+    H, raw_batch_size, DV, device=None, *, num_sms=None,
+):
+    """Select precision and DV width for SM120 (RTX 5090, 99 KiB SMEM, 1:1 TF32:FP32).
+
+    On GeForce Blackwell (SM120), dense TF32 Tensor Core throughput matches FP32 CUDA Core
+    throughput (~105 TFLOPS, 1:1 vs ~14:1 on SM100), so K-tiled double-buffered TMA pure-FP32
+    beats TF32x3 across all grid sizes while delivering ~4x higher precision (~6.9e-7 vs 2.5e-6).
+    AutoCP supplies num_sms to use the kernel policy without a device query.
+    """
+    if min(H, raw_batch_size, DV) <= 0:
+        raise ValueError("Correction dimensions must be positive")
+    if num_sms is None:
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if num_sms <= 0:
+        raise ValueError("num_sms must be positive")
+    n_core = H * raw_batch_size * ((DV + 127) // 128)
+    if n_core * 8 <= num_sms:
+        return "fp32", 16
+    if n_core * 4 <= num_sms:
+        return "fp32", 32
+    return "fp32", 64
+
+
+def _fp32_frag_layout(DK, block_DV, state_v_first):
+    """128-thread vectorized (8-col) strided-row FP32 fragment layout for block_DV in {16, 32, 64}."""
+    if not state_v_first:
+        tn = 8
+        tm = {16: 2, 32: 4, 64: 8}[block_DV]
+        n_col_tiles = block_DV // tn
+        n_row_tiles = DK // tm
+        return T.Fragment(
+            (DK, block_DV),
+            forward_thread_fn=lambda r, c: (r % n_row_tiles) * n_col_tiles + (c // tn),
+            forward_index_fn=lambda r, c: (r // n_row_tiles) * tn + (c % tn),
+        )
+    tn = 8
+    n_col_tiles = DK // tn  # 16
+    n_row_tiles = 128 // n_col_tiles  # 8
+    return T.Fragment(
+        (block_DV, DK),
+        forward_thread_fn=lambda r, c: (c // tn) * n_row_tiles + (r % n_row_tiles),
+        forward_index_fn=lambda r, c: (r // n_row_tiles) * tn + (c % tn),
+    )
+
+
+def _m_transpose_source_layout(rows, cols):
+    """Assign adjacent threads to contiguous M[col, row] source elements."""
+    return T.Fragment(
+        (rows, cols),
+        forward_thread_fn=lambda row, col: (col * rows + row) % 128,
+        forward_index_fn=lambda row, col: (col * rows + row) // 128,
+    )
+
+
 @tilelang.jit()
 def tilelang_correct_h0(
     H,
@@ -300,11 +355,21 @@ def tilelang_correct_h0(
     state_v_first,
     reverse: bool = False,
     transpose_m: bool = False,
-    block_DV: int = 32,
+    store_intra_h0: bool = True,
     store_inter_h: bool = False,
+    use_slots: bool = False,
+    precision: str = "fp32",
+    block_DV: int | None = None,
 ):
     cp_batch_size = T.dynamic("cp_batch_size")
     raw_batch_size = T.dynamic("raw_batch_size")
+    out_batch_size = T.dynamic("out_batch_size")
+    slot_size = T.dynamic("slot_size")
+    out_state_shape = (
+        (out_batch_size, H, DV, DK)
+        if state_v_first
+        else (out_batch_size, H, DK, DV)
+    )
     state_shape = (
         (cp_batch_size, H, DV, DK)
         if state_v_first
@@ -316,99 +381,227 @@ def tilelang_correct_h0(
         else (raw_batch_size, H, DK, DV)
     )
 
-    output_shape = raw_state_shape if store_inter_h else state_shape
+    if precision != "fp32":
+        raise ValueError(f"Unsupported SM120 correction precision: {precision}")
+    if block_DV is None:
+        block_DV = 16
+    block_DV = min(block_DV, DV)
+
+    tile_shape = (block_DV, DK) if state_v_first else (DK, block_DV)
+
+    # SM120 has 99 KiB shared memory per SM (vs 227 KiB on SM100) and 1:1 dense TF32:FP32 peak:
+    # 256-thread warp-specialized TMA scan with K-tiled double-buffered m_stage (m_stages=2)
+    # and direct coalesced ht_buffer loads into h_fragment (40-48 KiB SMEM -> >=2 CTAs/SM):
+    #   * dv16 (bk=32, s=2): 32 + 8 = 40 KiB -> 2 CTAs/SM + 128B TMA swizzle
+    #   * dv32 (bk=16 fwd / 32 bwd, s=2): 32 KiB (fwd) / 48 KiB (bwd) -> 2-3 CTAs/SM
+    #   * dv64 (bk=16, s=2): 16 + 32 = 48 KiB -> 2 CTAs/SM + 8x8 FP32 register tile
+    if block_DV <= 16:
+        block_K = 32
+    elif block_DV <= 32:
+        block_K = 32 if transpose_m else 16
+    else:
+        block_K = 16
+    m_stages = 2
+
+    THREADS = 256
+    CONSUMER_NREG = 240
+    PRODUCER_NREG = 24
+    BAR_CONSUMER = 3
 
     @T.macro
-    def kernel_body(
-        bb,
-        bh,
-        bv,
-        seq_start_idx,
-        seq_end_idx,
-        num_iters,
-        ht_buffer,
-        mt_buffer,
-        fallback_mask,
-        seq_map_r2c,
-        cp_h0,
-        h_fragment,
+    def scan_body(
+        bb, bh, bv, seq_start_idx, seq_end_idx, num_iters,
+        raw_h0, ht_buffer, mt_buffer, fallback_mask,
+        cp_h0, h_card,
+        h_slot, m_slot, out_slot,
     ):
-        h_shared = T.alloc_shared(
-            (block_DV, DK) if state_v_first else (DK, block_DV),
-            dtype=h_buffer_dtype,
-        )
-        # `hd_shared` and `m_shared` are the two operands of the M gemm, so both
-        # take *M*'s dtype, not h's: the backward feeds an fp32 `dht_buffer`
-        # alongside a bf16 `mt_buffer`, and `T.gemm` needs its operands to agree.
-        hd_shared = T.alloc_shared(
-            (block_DV, DK) if state_v_first else (DK, block_DV),
-            dtype=m_buffer_dtype,
-        )
-        m_shared = T.alloc_shared((DK, DK), dtype=m_buffer_dtype)
+        lo = bv * block_DV
+        num_kb = DK // block_K
+        skip_last_gemm = store_intra_h0 and (not store_inter_h) and (not use_slots)
 
-        DV_start = bv * block_DV
-        DV_end = (bv + 1) * block_DV
+        hp_stage = T.alloc_shared((1,) + tile_shape, dtype=accum_dtype)
+        m_shape = (m_stages, block_K, DK) if transpose_m else (m_stages, DK, block_K)
+        m_stage = T.alloc_shared(m_shape, dtype=m_buffer_dtype)
+        h_fragment = T.alloc_fragment(tile_shape, dtype=accum_dtype)
 
-        # Correct mode stores segment entrances; aggregate mode consumes the last
-        # segment too, then stores only the exiting card state.
-        for i_s in T.Pipelined(
-            num_iters if store_inter_h else num_iters - 1, num_stages=1
-        ):
-            idx = seq_start_idx + num_iters - 1 - i_s if reverse else seq_start_idx + i_s
-            if not store_inter_h:
+        if DK == 128 and block_DV in (16, 32, 64):
+            T.annotate_layout({
+                hp_stage: T.Layout((1,) + tile_shape, lambda s, r, c: (s, r, c)),
+                h_fragment: _fp32_frag_layout(DK, block_DV, state_v_first),
+            })
+
+        m_ready = T.alloc_barrier(arrive_count=[32] * m_stages)
+        m_free = T.alloc_barrier(arrive_count=[128] * m_stages)
+        hp_ready = T.alloc_barrier(arrive_count=[128])
+        hp_free = T.alloc_barrier(arrive_count=[32])
+
+        tx = T.get_thread_binding()
+
+        if tx < 128:
+            T.set_max_nreg(CONSUMER_NREG, 1)
+
+            if use_raw_h0:
                 if state_v_first:
-                    T.copy(
-                        h_fragment,
-                        cp_h0[idx, bh, DV_start:DV_end, 0:DK],
-                    )
+                    T.copy(raw_h0[bb, bh, lo:lo + block_DV, 0:DK], h_fragment)
                 else:
-                    T.copy(
-                        h_fragment,
-                        cp_h0[idx, bh, 0:DK, DV_start:DV_end],
-                    )
-            if state_v_first:
-                T.copy(
-                    ht_buffer[idx, bh, DV_start:DV_end, 0:DK],
-                    h_shared,
-                )
+                    T.copy(raw_h0[bb, bh, 0:DK, lo:lo + block_DV], h_fragment)
             else:
-                T.copy(
-                    ht_buffer[idx, bh, 0:DK, DV_start:DV_end],
-                    h_shared,
-                )
-            if fallback_mask[idx, bh]:
-                T.copy(mt_buffer[idx, bh, 0:DK, 0:DK], m_shared)
-                T.copy(h_fragment, hd_shared)
-            T.copy(h_shared, h_fragment)
-            if fallback_mask[idx, bh]:
-                if state_v_first:
-                    if transpose_m:
-                        T.gemm(hd_shared, m_shared, h_fragment, clear_accum=False)
-                    else:
-                        T.gemm(hd_shared, m_shared, h_fragment, transpose_B=True, clear_accum=False)
+                T.clear(h_fragment)
+
+            m_step = T.alloc_var("int32")
+            m_step = 0
+            gemm_iters = T.alloc_var("int32")
+            gemm_iters = T.max(num_iters - 1, 0) if skip_last_gemm else num_iters
+
+            for i_s in T.serial(gemm_iters):
+                p = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+                h_idx = T.Cast("int32", h_slot[p]) if use_slots else p
+                do_fb = fallback_mask[h_idx, bh]
+
+                T.sync_threads(BAR_CONSUMER, 128)
+                if store_intra_h0:
+                    T.barrier_wait(hp_free[0], (i_s + 1) % 2)
+                    T.copy(h_fragment, hp_stage[0, :, :])
+                    T.fence_proxy_async()
+                    T.barrier_arrive(hp_ready[0])
                 else:
-                    if transpose_m:
-                        T.gemm(m_shared, hd_shared, h_fragment, transpose_A=True, clear_accum=False)
-                    else:
-                        T.gemm(m_shared, hd_shared, h_fragment, clear_accum=False)
+                    T.copy(h_fragment, hp_stage[0, :, :])
+                    T.fence_proxy_async()
 
-        last_idx = (
-            bb if store_inter_h
-            else (seq_start_idx if reverse else seq_start_idx + num_iters - 1)
-        )
-        if state_v_first:
-            T.copy(
-                h_fragment,
-                cp_h0[last_idx, bh, DV_start:DV_end, 0:DK],
-            )
+                T.sync_threads(BAR_CONSUMER, 128)
+                if state_v_first:
+                    T.copy(ht_buffer[h_idx, bh, lo:lo + block_DV, 0:DK], h_fragment)
+                else:
+                    T.copy(ht_buffer[h_idx, bh, 0:DK, lo:lo + block_DV], h_fragment)
+
+                if do_fb:
+                    for kb in T.serial(num_kb):
+                        ms = m_step % m_stages
+                        mp = (m_step // m_stages) % 2
+                        T.barrier_wait(m_ready[ms], mp)
+                        for kk in T.serial(block_K):
+                            if state_v_first:
+                                for i, j in T.Parallel(block_DV, DK):
+                                    av = T.cast(hp_stage[0, i, kb * block_K + kk], "float32")
+                                    bv_m = T.cast(
+                                        m_stage[ms, kk, j] if transpose_m else m_stage[ms, j, kk],
+                                        "float32",
+                                    )
+                                    h_fragment[i, j] += av * bv_m
+                            else:
+                                for i, j in T.Parallel(DK, block_DV):
+                                    av = T.cast(
+                                        m_stage[ms, kk, i] if transpose_m else m_stage[ms, i, kk],
+                                        "float32",
+                                    )
+                                    bv_h = T.cast(hp_stage[0, kb * block_K + kk, j], "float32")
+                                    h_fragment[i, j] += av * bv_h
+                        T.barrier_arrive(m_free[ms])
+                        m_step += 1
+
+            if skip_last_gemm:
+                if num_iters > 0:
+                    T.sync_threads(BAR_CONSUMER, 128)
+                    T.barrier_wait(hp_free[0], (gemm_iters + 1) % 2)
+                    T.copy(h_fragment, hp_stage[0, :, :])
+                    T.fence_proxy_async()
+                    T.barrier_arrive(hp_ready[0])
+
+            if store_inter_h:
+                if state_v_first:
+                    T.copy(h_fragment, h_card[bb, bh, lo:lo + block_DV, 0:DK])
+                else:
+                    T.copy(h_fragment, h_card[bb, bh, 0:DK, lo:lo + block_DV])
+
         else:
-            T.copy(
-                h_fragment,
-                cp_h0[last_idx, bh, 0:DK, DV_start:DV_end],
-            )
+            T.set_max_nreg(PRODUCER_NREG, 0)
 
-    if use_raw_h0:
+            if tx < 160:
+                m_step = T.alloc_var("int32")
+                m_step = 0
+                gemm_iters = T.alloc_var("int32")
+                gemm_iters = T.max(num_iters - 1, 0) if skip_last_gemm else num_iters
+                for i_s in T.serial(gemm_iters):
+                    p = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+                    h_idx = T.Cast("int32", h_slot[p]) if use_slots else p
+                    m_idx = T.Cast("int32", m_slot[p]) if use_slots else p
+                    if fallback_mask[h_idx, bh]:
+                        for kb in T.serial(num_kb):
+                            ms = m_step % m_stages
+                            mp = (m_step // m_stages + 1) % 2
+                            T.barrier_wait(m_free[ms], mp)
+                            if transpose_m:
+                                T.tma_copy(mt_buffer[m_idx, bh, kb * block_K:(kb + 1) * block_K, 0:DK],
+                                           m_stage[ms, :, :], barrier=m_ready[ms])
+                            else:
+                                T.tma_copy(mt_buffer[m_idx, bh, 0:DK, kb * block_K:(kb + 1) * block_K],
+                                           m_stage[ms, :, :], barrier=m_ready[ms])
+                            T.barrier_arrive(m_ready[ms])
+                            m_step += 1
 
+            elif tx < 192:
+                if store_intra_h0:
+                    for i_s in T.serial(num_iters):
+                        p = seq_end_idx - 1 - i_s if reverse else seq_start_idx + i_s
+                        w_idx = T.Cast("int32", out_slot[p]) if use_slots else p
+                        T.barrier_wait(hp_ready[0], i_s % 2)
+                        if w_idx >= 0:
+                            if state_v_first:
+                                T.copy(hp_stage[0, :, :],
+                                       cp_h0[w_idx, bh, lo:lo + block_DV, 0:DK])
+                            else:
+                                T.copy(hp_stage[0, :, :],
+                                       cp_h0[w_idx, bh, 0:DK, lo:lo + block_DV])
+                        T.barrier_arrive(hp_free[0])
+
+    def _grid_prologue(bbhv, seq_map_r2c):
+        bbh, bv = bbhv // T.ceildiv(DV, block_DV), bbhv % T.ceildiv(DV, block_DV)
+        bb, bh = bbh // H, bbh % H
+        seq_start_idx = T.Cast("int32", seq_map_r2c[bb])
+        seq_end_idx = T.Cast("int32", seq_map_r2c[bb + 1])
+        num_iters = seq_end_idx - seq_start_idx
+        return bb, bh, bv, seq_start_idx, seq_end_idx, num_iters
+
+    grid = T.ceildiv(DV, block_DV) * H * raw_batch_size
+
+    if use_slots:
+        if use_raw_h0:
+            @T.prim_func
+            def tilelang_correct_h0_kernel(
+                raw_h0: T.Tensor(raw_state_shape, dtype=res_dtype),
+                ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
+                mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
+                fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
+                seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
+                h_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                m_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                out_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                cp_h0: T.Tensor(out_state_shape, dtype=res_dtype),
+            ):
+                with T.Kernel(grid, threads=THREADS) as (bbhv,):
+                    bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                    scan_body(bb, bh, bv, s0, s1, ni, raw_h0, ht_buffer, mt_buffer,
+                              fallback_mask, cp_h0, ht_buffer,
+                              h_slot, m_slot, out_slot)
+        else:
+            @T.prim_func
+            def tilelang_correct_h0_kernel(
+                ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
+                mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
+                fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
+                seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
+                h_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                m_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                out_slot: T.Tensor([slot_size], dtype=seqlen_dtype),
+                cp_h0: T.Tensor(out_state_shape, dtype=res_dtype),
+            ):
+                with T.Kernel(grid, threads=THREADS) as (bbhv,):
+                    bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                    scan_body(bb, bh, bv, s0, s1, ni, cp_h0, ht_buffer, mt_buffer,
+                              fallback_mask, cp_h0, ht_buffer,
+                              h_slot, m_slot, out_slot)
+
+    elif store_inter_h:
         @T.prim_func
         def tilelang_correct_h0_kernel(
             raw_h0: T.Tensor(raw_state_shape, dtype=res_dtype),
@@ -416,315 +609,274 @@ def tilelang_correct_h0(
             mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
             fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
             seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
-            cp_h0: T.Tensor(output_shape, dtype=res_dtype),
+            h_card: T.Tensor(raw_state_shape, dtype=res_dtype),
         ):
-            with T.Kernel(
-                T.ceildiv(DV, block_DV) * H * raw_batch_size, threads=128
-            ) as (bbhv,):
-                bbh, bv = (
-                    bbhv // T.ceildiv(DV, block_DV),
-                    bbhv % T.ceildiv(DV, block_DV),
-                )
-                bb, bh = bbh // H, bbh % H
+            with T.Kernel(grid, threads=THREADS) as (bbhv,):
+                bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                scan_body(bb, bh, bv, s0, s1, ni, raw_h0, ht_buffer, mt_buffer,
+                          fallback_mask, ht_buffer, h_card,
+                          seq_map_r2c, seq_map_r2c, seq_map_r2c)
 
-                seq_start_idx = T.alloc_var("int32")
-                seq_end_idx = T.alloc_var("int32")
-                num_iters = T.alloc_var("int32")
-                seq_start_idx = seq_map_r2c[bb]
-                seq_end_idx = seq_map_r2c[bb + 1]
-                num_iters = seq_end_idx - seq_start_idx
-
-                h_fragment = T.alloc_fragment(
-                    (block_DV, DK) if state_v_first else (DK, block_DV),
-                    dtype=accum_dtype,
-                )
-                if state_v_first:
-                    T.copy(
-                        raw_h0[bb, bh, bv * block_DV : (bv + 1) * block_DV, 0:DK],
-                        h_fragment,
-                    )
-                else:
-                    T.copy(
-                        raw_h0[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV],
-                        h_fragment,
-                    )
-
-                kernel_body(
-                    bb,
-                    bh,
-                    bv,
-                    seq_start_idx,
-                    seq_end_idx,
-                    num_iters,
-                    ht_buffer,
-                    mt_buffer,
-                    fallback_mask,
-                    seq_map_r2c,
-                    cp_h0,
-                    h_fragment,
-                )
+    elif use_raw_h0:
+        @T.prim_func
+        def tilelang_correct_h0_kernel(
+            raw_h0: T.Tensor(raw_state_shape, dtype=res_dtype),
+            ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
+            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
+            fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
+            seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
+            cp_h0: T.Tensor(state_shape, dtype=res_dtype),
+        ):
+            with T.Kernel(grid, threads=THREADS) as (bbhv,):
+                bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                scan_body(bb, bh, bv, s0, s1, ni, raw_h0, ht_buffer, mt_buffer,
+                          fallback_mask, cp_h0, ht_buffer,
+                          seq_map_r2c, seq_map_r2c, seq_map_r2c)
 
     else:
-
         @T.prim_func
         def tilelang_correct_h0_kernel(
             ht_buffer: T.Tensor(state_shape, dtype=h_buffer_dtype),
             mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_buffer_dtype),
             fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
             seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
-            cp_h0: T.Tensor(output_shape, dtype=res_dtype),
+            cp_h0: T.Tensor(state_shape, dtype=res_dtype),
         ):
-            with T.Kernel(
-                T.ceildiv(DV, block_DV) * H * raw_batch_size, threads=128
-            ) as (bbhv,):
-                bbh, bv = (
-                    bbhv // T.ceildiv(DV, block_DV),
-                    bbhv % T.ceildiv(DV, block_DV),
-                )
-                bb, bh = bbh // H, bbh % H
-
-                seq_start_idx = T.alloc_var("int32")
-                seq_end_idx = T.alloc_var("int32")
-                num_iters = T.alloc_var("int32")
-                seq_start_idx = seq_map_r2c[bb]
-                seq_end_idx = seq_map_r2c[bb + 1]
-                num_iters = seq_end_idx - seq_start_idx
-
-                h_fragment = T.alloc_fragment(
-                    (block_DV, DK) if state_v_first else (DK, block_DV),
-                    dtype=accum_dtype,
-                )
-                T.clear(h_fragment)
-
-                kernel_body(
-                    bb,
-                    bh,
-                    bv,
-                    seq_start_idx,
-                    seq_end_idx,
-                    num_iters,
-                    ht_buffer,
-                    mt_buffer,
-                    fallback_mask,
-                    seq_map_r2c,
-                    cp_h0,
-                    h_fragment,
-                )
+            with T.Kernel(grid, threads=THREADS) as (bbhv,):
+                bb, bh, bv, s0, s1, ni = _grid_prologue(bbhv, seq_map_r2c)
+                scan_body(bb, bh, bv, s0, s1, ni, cp_h0, ht_buffer, mt_buffer,
+                          fallback_mask, cp_h0, ht_buffer,
+                          seq_map_r2c, seq_map_r2c, seq_map_r2c)
 
     return tilelang_correct_h0_kernel
 
 
-def correct_initial_states(
-    raw_h0: torch.Tensor
-    | None,  # [raw_batch_size, num_v_heads, k_head_dim, v_head_dim]
-    ht_buffer: torch.Tensor,  # [cp_batch_size, num_v_heads, k_head_dim, v_head_dim]
-    mt_buffer: torch.Tensor,  # [cp_batch_size, num_v_heads, k_head_dim, k_head_dim]
-    fallback_mask: torch.Tensor,  # [cp_batch_size, num_v_heads]
-    seq_map_r2c: torch.Tensor,  # [raw_batch_size + 1]
-    state_v_first: bool = False,
+def _correct_states(
+    raw_state: torch.Tensor | None,
+    h_buffer: torch.Tensor,
+    m_buffer: torch.Tensor,
+    fallback_mask: torch.Tensor | None,
+    seq_map_r2c: torch.Tensor,
+    state_v_first: bool,
+    reverse: bool,
+    *,
+    h_slot: torch.Tensor | None,
+    m_slot: torch.Tensor | None,
+    out_slot: torch.Tensor | None,
+    is_zigzag: bool,
 ):
-    cp_batch_size = fallback_mask.shape[0]
-    _, num_heads, dim_2, dim_3 = ht_buffer.shape
+    n_rows, num_heads, dim_2, dim_3 = h_buffer.shape
     if state_v_first:
         v_head_dim, k_head_dim = dim_2, dim_3
     else:
         k_head_dim, v_head_dim = dim_2, dim_3
     assert k_head_dim == v_head_dim == 128
+    assert m_buffer.shape == (n_rows, num_heads, k_head_dim, k_head_dim)
 
-    if raw_h0 is None:
-        res_dtype = torch.float32
-        use_raw_h0 = False
+    slots = (h_slot, m_slot, out_slot)
+    use_slots = any(slot is not None for slot in slots)
+    if use_slots:
+        if not all(slot is not None for slot in slots):
+            raise ValueError("h_slot, m_slot and out_slot must be supplied together")
+        for slot in slots:
+            assert slot.ndim == 1 and slot.shape == h_slot.shape
+            assert slot.dtype == seq_map_r2c.dtype and slot.device == h_buffer.device
+        output_rows = 2 * (seq_map_r2c.numel() - 1) if is_zigzag else 1
     else:
-        res_dtype = raw_h0.dtype
-        use_raw_h0 = True
+        output_rows = n_rows
 
-    tilelang_correct_h0_kernel = tilelang_correct_h0(
+    if fallback_mask is None:
+        fallback_mask = torch.ones(
+            (n_rows, num_heads), dtype=torch.bool, device=h_buffer.device,
+        )
+    else:
+        assert fallback_mask.shape == (n_rows, num_heads)
+
+    use_raw_h0 = raw_state is not None
+    res_dtype = raw_state.dtype if use_raw_h0 else torch.float32
+    precision, block_DV = select_correction_config(
+        num_heads, seq_map_r2c.numel() - 1, v_head_dim, h_buffer.device,
+    )
+    kernel = tilelang_correct_h0(
+        precision=precision,
+        block_DV=block_DV,
         H=num_heads,
         DK=k_head_dim,
         DV=v_head_dim,
         res_dtype=res_dtype,
         accum_dtype="float32",
-        h_buffer_dtype=ht_buffer.dtype,
-        m_buffer_dtype=mt_buffer.dtype,
+        h_buffer_dtype=h_buffer.dtype,
+        m_buffer_dtype=m_buffer.dtype,
         seqlen_dtype=seq_map_r2c.dtype,
         mask_dtype=fallback_mask.dtype,
         use_raw_h0=use_raw_h0,
         state_v_first=state_v_first,
+        reverse=reverse,
+        transpose_m=reverse,
+        use_slots=use_slots,
     )
-    cp_h0 = torch.empty(
-        (cp_batch_size, num_heads, v_head_dim, k_head_dim)
-        if state_v_first
-        else (cp_batch_size, num_heads, k_head_dim, v_head_dim),
-        dtype=res_dtype,
-        device=ht_buffer.device,
+    out = torch.empty(
+        (output_rows, num_heads, dim_2, dim_3),
+        dtype=res_dtype, device=h_buffer.device,
     )
+    args = [h_buffer, m_buffer, fallback_mask, seq_map_r2c]
+    if use_slots:
+        args.extend(slots)
+    args.append(out)
     if use_raw_h0:
-        tilelang_correct_h0_kernel(
-            raw_h0,
-            ht_buffer,
-            mt_buffer,
-            fallback_mask,
-            seq_map_r2c,
-            cp_h0,
-        )
-    else:
-        tilelang_correct_h0_kernel(
-            ht_buffer,
-            mt_buffer,
-            fallback_mask,
-            seq_map_r2c,
-            cp_h0,
-        )
+        args.insert(0, raw_state)
+    kernel(*args)
+    return out[0] if use_slots and not is_zigzag else out
 
-    return cp_h0
+
+def correct_initial_states(
+    raw_h0: torch.Tensor | None,
+    ht_buffer: torch.Tensor,
+    mt_buffer: torch.Tensor,
+    fallback_mask: torch.Tensor | None,
+    seq_map_r2c: torch.Tensor,
+    state_v_first: bool = False,
+    *,
+    h_slot: torch.Tensor | None = None,
+    m_slot: torch.Tensor | None = None,
+    out_slot: torch.Tensor | None = None,
+    is_zigzag: bool = False,
+):
+    return _correct_states(
+        raw_h0, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c,
+        state_v_first=state_v_first, reverse=False,
+        h_slot=h_slot, m_slot=m_slot, out_slot=out_slot, is_zigzag=is_zigzag,
+    )
 
 
 def correct_terminal_states(
-    raw_dht: torch.Tensor
-    | None,  # [raw_batch_size, num_v_heads, k_head_dim, v_head_dim]
-    dht_buffer: torch.Tensor,  # [cp_batch_size, num_v_heads, k_head_dim, v_head_dim]
-    mt_buffer: torch.Tensor,  # [cp_batch_size, num_v_heads, k_head_dim, k_head_dim]
-    fallback_mask: torch.Tensor,  # [cp_batch_size, num_v_heads]
-    seq_map_r2c: torch.Tensor,  # [raw_batch_size + 1]
+    raw_dht: torch.Tensor | None,
+    dht_buffer: torch.Tensor,
+    mt_buffer: torch.Tensor,
+    fallback_mask: torch.Tensor | None,
+    seq_map_r2c: torch.Tensor,
     state_v_first: bool = False,
+    *,
+    h_slot: torch.Tensor | None = None,
+    m_slot: torch.Tensor | None = None,
+    out_slot: torch.Tensor | None = None,
+    is_zigzag: bool = False,
 ):
-    cp_batch_size = fallback_mask.shape[0]
-    _, num_heads, dim_2, dim_3 = dht_buffer.shape
-    if state_v_first:
-        v_head_dim, k_head_dim = dim_2, dim_3
-    else:
-        k_head_dim, v_head_dim = dim_2, dim_3
-    assert k_head_dim == v_head_dim == 128
-
-    if raw_dht is None:
-        res_dtype = torch.float32
-        use_raw_h0 = False
-    else:
-        res_dtype = raw_dht.dtype
-        use_raw_h0 = True
-
-    tilelang_correct_ht_kernel = tilelang_correct_h0(
-        H=num_heads,
-        DK=k_head_dim,
-        DV=v_head_dim,
-        res_dtype=res_dtype,
-        accum_dtype="float32",
-        h_buffer_dtype=dht_buffer.dtype,
-        m_buffer_dtype=mt_buffer.dtype,
-        seqlen_dtype=seq_map_r2c.dtype,
-        mask_dtype=fallback_mask.dtype,
-        use_raw_h0=use_raw_h0,
-        state_v_first=state_v_first,
-        reverse=True,
-        transpose_m=True,
+    return _correct_states(
+        raw_dht, dht_buffer, mt_buffer, fallback_mask, seq_map_r2c,
+        state_v_first=state_v_first, reverse=True,
+        h_slot=h_slot, m_slot=m_slot, out_slot=out_slot, is_zigzag=is_zigzag,
     )
-    cp_dht = torch.empty(
-        (cp_batch_size, num_heads, v_head_dim, k_head_dim)
-        if state_v_first
-        else (cp_batch_size, num_heads, k_head_dim, v_head_dim),
-        dtype=res_dtype,
-        device=dht_buffer.device,
-    )
-    if use_raw_h0:
-        tilelang_correct_ht_kernel(
-            raw_dht,
-            dht_buffer,
-            mt_buffer,
-            fallback_mask,
-            seq_map_r2c,
-            cp_dht,
-        )
-    else:
-        tilelang_correct_ht_kernel(
-            dht_buffer,
-            mt_buffer,
-            fallback_mask,
-            seq_map_r2c,
-            cp_dht,
-        )
-
-    return cp_dht
 
 
+# ---------------------------------------------------------------------------
+# card-level (h, M) aggregation for inter+intra CP (SM120 99 KiB-safe)
+# ---------------------------------------------------------------------------
 @tilelang.jit()
-def tilelang_aggregate_m(
-    H,
-    DK,
-    m_dtype,
-    res_dtype,
-    seqlen_dtype,
-    mask_dtype,
-    block_cols: int = 32,
-    reverse: bool = False,
+def tilelang_aggregate_hm(
+    H, h_dtype, m_dtype, seqlen_dtype, mask_dtype, state_v_first, use_raw_h0,
 ):
-    """Ordered product in scan order, tiled to fit SM120 shared memory.
+    """Scan independent columns of [h, M] with FP32 state and TF32x3 products.
 
-    M is always K x K, independent of the state layout. A non-fallback
-    segment discards its incoming history, so its effective transition is zero.
-    Keep this separate from the h scan: a full running M plus h would exceed
-    SM120's shared-memory budget for fp32 buffers.
+    Uses block_K=32 (56 KiB total SMEM) to fit comfortably inside SM120's 99 KiB budget.
     """
     cp_batch_size = T.dynamic("cp_batch_size")
     raw_batch_size = T.dynamic("raw_batch_size")
+    DK, block_DV, block_K = 128, 16, 32
+    state_shape = (raw_batch_size, H, DK, DK)
+    buffer_shape = (cp_batch_size, H, DK, DK)
+    prev_layout = T.Layout((DK, 2 * block_DV), lambda row, col: (row, col))
+    state_load_layout = _m_transpose_source_layout(2 * block_DV, block_K)
 
     @T.prim_func
-    def tilelang_aggregate_m_kernel(
-        mt: T.Tensor([cp_batch_size, H, DK, DK], dtype=m_dtype),
-        fallback: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
-        seq_map: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
-        out: T.Tensor([raw_batch_size, H, DK, DK], dtype=res_dtype),
+    def tilelang_aggregate_hm_kernel(
+        raw_h0: T.Tensor(state_shape, h_dtype),
+        ht_buffer: T.Tensor(buffer_shape, h_dtype),
+        mt_buffer: T.Tensor(buffer_shape, m_dtype),
+        fallback_mask: T.Tensor((cp_batch_size, H), mask_dtype),
+        seq_map: T.Tensor((raw_batch_size + 1,), seqlen_dtype),
+        h_card: T.Tensor(state_shape, h_dtype),
+        m_card: T.Tensor(state_shape, h_dtype),
     ):
-        with T.Kernel(
-            raw_batch_size * H, T.ceildiv(DK, block_cols), threads=128
-        ) as (bbh, bc):
+        with T.Kernel(raw_batch_size * H, DK // block_DV, threads=128) as (bbh, block_col):
             bb, bh = bbh // H, bbh % H
-            m_shared = T.alloc_shared((DK, DK), dtype=m_dtype)
-            running = T.alloc_shared((DK, block_cols), dtype=m_dtype)
-            product = T.alloc_fragment((DK, block_cols), dtype="float32")
-            for i, j in T.Parallel(DK, block_cols):
-                running[i, j] = T.if_then_else(i == bc * block_cols + j, 1, 0)
-            has_history = T.alloc_var("bool")
-            has_history = True
-            for i_s in T.serial(seq_map[bb + 1] - seq_map[bb]):
-                if has_history:
-                    idx = seq_map[bb + 1] - 1 - i_s if reverse else seq_map[bb] + i_s
-                    if fallback[idx, bh]:
-                        T.copy(mt[idx, bh, :, :], m_shared)
-                        T.gemm(m_shared, running, product, clear_accum=True)
-                        T.copy(product, running)
+            lo = block_col * block_DV
+            start = T.cast(seq_map[bb], "int32")
+            end = T.cast(seq_map[bb + 1], "int32")
+            prev = T.alloc_shared((DK, 2 * block_DV), "float32")
+            acc = T.alloc_fragment((DK, 2 * block_DV), "float32")
+            a_hi = T.alloc_shared((DK, block_K), T.tfloat32)
+            a_lo = T.alloc_shared((DK, block_K), T.tfloat32)
+            b_hi = T.alloc_shared((2 * block_DV, block_K), T.tfloat32)
+            b_lo = T.alloc_shared((2 * block_DV, block_K), T.tfloat32)
+            T.annotate_layout({prev: prev_layout})
+
+            for i, j in T.Parallel(DK, 2 * block_DV):
+                if j < block_DV:
+                    if use_raw_h0:
+                        acc[i, j] = (raw_h0[bb, bh, lo + j, i] if state_v_first
+                                     else raw_h0[bb, bh, i, lo + j])
                     else:
-                        # A non-fallback segment overwrites the incoming state;
-                        # its effective transition is zero for the remaining scan.
-                        T.clear(running)
-                        has_history = False
-            T.copy(running, out[bb, bh, :, bc * block_cols:(bc + 1) * block_cols])
+                        acc[i, j] = 0.0
+                else:
+                    acc[i, j] = T.if_then_else(i == lo + j - block_DV, 1.0, 0.0)
 
-    return tilelang_aggregate_m_kernel
+            for p in T.serial(start, end):
+                T.copy(acc, prev)
+                for i, j in T.Parallel(DK, 2 * block_DV):
+                    if j < block_DV:
+                        acc[i, j] = (ht_buffer[p, bh, lo + j, i] if state_v_first
+                                     else ht_buffer[p, bh, i, lo + j])
+                    else:
+                        acc[i, j] = 0.0
+                if fallback_mask[p, bh]:
+                    if p == start and not use_raw_h0:
+                        for i, j in T.Parallel(DK, block_DV):
+                            acc[i, block_DV + j] = T.cast(mt_buffer[p, bh, i, lo + j], "float32")
+                    else:
+                        for kb in T.serial(DK // block_K):
+                            for i, k in T.Parallel(DK, block_K):
+                                av = T.cast(mt_buffer[p, bh, i, kb * block_K + k], "float32")
+                                av_hi = T.cast(av, T.tfloat32)
+                                a_hi[i, k] = av_hi
+                                a_lo[i, k] = T.cast(av - T.cast(av_hi, "float32"), T.tfloat32)
+                            for j, k in T.Parallel(2 * block_DV, block_K, loop_layout=state_load_layout):
+                                bv = prev[kb * block_K + k, j]
+                                bv_hi = T.cast(bv, T.tfloat32)
+                                b_hi[j, k] = bv_hi
+                                b_lo[j, k] = T.cast(bv - T.cast(bv_hi, "float32"), T.tfloat32)
+                            T.gemm(a_hi, b_lo, acc, transpose_B=True, clear_accum=False)
+                            T.gemm(a_lo, b_hi, acc, transpose_B=True, clear_accum=False)
+                            T.gemm(a_hi, b_hi, acc, transpose_B=True, clear_accum=False)
+
+            for i, j in T.Parallel(DK, block_DV):
+                if state_v_first:
+                    h_card[bb, bh, lo + j, i] = acc[i, j]
+                else:
+                    h_card[bb, bh, i, lo + j] = acc[i, j]
+            for i, j in T.Parallel(DK, block_DV):
+                m_card[bb, bh, i, lo + j] = acc[i, block_DV + j]
+
+    return tilelang_aggregate_hm_kernel
 
 
-# ---------------------------------------------------------------------------
-# card-level (h, M) aggregation for inter+intra CP
-# ---------------------------------------------------------------------------
 def aggregate_card_state(
-    ht_buffer: torch.Tensor,   # [cp_batch_size, H, K, V] (or [.., V, K])
-    mt_buffer: torch.Tensor,   # [cp_batch_size, H, K, K]
-    fallback_mask: torch.Tensor,  # [cp_batch_size, H]
-    seq_map_r2c: torch.Tensor,  # [raw_batch_size + 1]
-    raw_h0: torch.Tensor | None = None,  # [raw_batch_size, H, K, V] (or [.., V, K])
+    ht_buffer: torch.Tensor,
+    mt_buffer: torch.Tensor,
+    fallback_mask: torch.Tensor,
+    seq_map_r2c: torch.Tensor,
+    raw_h0: torch.Tensor | None = None,
     state_v_first: bool = False,
     reverse: bool = False,
     transpose_m: bool = False,
     compute_m: bool = True,
 ):
-    """Compose per-segment affine states into each local sequence's (h, M).
+    """Aggregate h/dh; computing M is supported only for a forward scan."""
+    if compute_m and (reverse or transpose_m):
+        raise ValueError(
+            "Blackwell SM120 M aggregation requires reverse=False and transpose_m=False"
+        )
 
-    raw_h0 is rounded to ht_buffer.dtype, matching the communication payload.
-    h is accumulated in fp32, with GEMM operands rounded to mt_buffer.dtype;
-    M is rounded to that operand dtype between segments. Both outputs use h's
-    dtype. reverse selects the segment order; transpose_m applies M.T to h.
-    Like the other backends, m_card multiplies untransposed M in scan order;
-    backward uses compute_m=False and the cached forward M for communication.
-    """
     raw_batch_size = seq_map_r2c.shape[0] - 1
     _, num_heads, dim_2, dim_3 = ht_buffer.shape
     if state_v_first:
@@ -738,7 +890,32 @@ def aggregate_card_state(
     if use_raw_h0:
         raw_h0 = raw_h0.to(res_dtype)
 
+    raw_state_shape = (
+        (raw_batch_size, num_heads, v_head_dim, k_head_dim)
+        if state_v_first
+        else (raw_batch_size, num_heads, k_head_dim, v_head_dim)
+    )
+    if compute_m:
+        state_kernel = tilelang_aggregate_hm(
+            num_heads, ht_buffer.dtype, mt_buffer.dtype, seq_map_r2c.dtype,
+            fallback_mask.dtype, state_v_first, use_raw_h0,
+        )
+        h_card = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)
+        m_card = torch.empty(
+            (raw_batch_size, num_heads, k_head_dim, k_head_dim),
+            dtype=res_dtype, device=mt_buffer.device,
+        )
+        if not use_raw_h0:
+            raw_h0 = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)
+        state_kernel(raw_h0, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, h_card, m_card)
+        return h_card, m_card
+
+    precision, block_DV = select_correction_config(
+        num_heads, raw_batch_size, v_head_dim, ht_buffer.device,
+    )
     state_kernel = tilelang_correct_h0(
+        precision=precision,
+        block_DV=block_DV,
         H=num_heads,
         DK=k_head_dim,
         DV=v_head_dim,
@@ -752,36 +929,12 @@ def aggregate_card_state(
         state_v_first=state_v_first,
         reverse=reverse,
         transpose_m=transpose_m,
+        store_intra_h0=False,
         store_inter_h=True,
     )
-    
-    raw_state_shape = (
-        (raw_batch_size, num_heads, v_head_dim, k_head_dim)
-        if state_v_first
-        else (raw_batch_size, num_heads, k_head_dim, v_head_dim)
-    )
-    
-    h_card = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)
-    args = (ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, h_card)
-    if use_raw_h0:
-        state_kernel(raw_h0, *args)
-    else:
-        state_kernel(*args)
-    if not compute_m:
-        return h_card, None
 
-    m_card = torch.empty(
-        (raw_batch_size, num_heads, k_head_dim, k_head_dim),
-        dtype=res_dtype, device=mt_buffer.device,
-    )
-    m_kernel = tilelang_aggregate_m(
-        H=num_heads,
-        DK=k_head_dim,
-        m_dtype=mt_buffer.dtype,
-        res_dtype=res_dtype,
-        seqlen_dtype=seq_map_r2c.dtype,
-        mask_dtype=fallback_mask.dtype,
-        reverse=reverse,
-    )
-    m_kernel(mt_buffer, fallback_mask, seq_map_r2c, m_card)
-    return h_card, m_card
+    h_card = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)
+    if not use_raw_h0:
+        raw_h0 = torch.empty(raw_state_shape, dtype=res_dtype, device=ht_buffer.device)
+    state_kernel(raw_h0, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, h_card)
+    return h_card, None

@@ -216,7 +216,7 @@ def test_correct_initial_states(
     segments, num_heads, fp32_rtol, state_v_first, use_raw_h0, fallback_pattern, h_dtype, m_dtype,
 ):
     scan_rtol = (fp32_rtol if h_dtype == m_dtype == torch.float32
-                 and ARCH in ("SM90", "SM100", "SM103") else LEGACY_SCAN_RTOL)
+                 and ARCH in ("SM90", "SM100", "SM103", "SM120") else LEGACY_SCAN_RTOL)
     H = num_heads
     cu, seq_map, _, _ = _build_layout(segments, ragged_tail=False)
     n_cp = cu.shape[0] - 1
@@ -260,7 +260,7 @@ def test_correct_terminal_states(
 ):
     """The backward twin: same scan, walked in reverse, with M transposed."""
     scan_rtol = (fp32_rtol if h_dtype == m_dtype == torch.float32
-                 and ARCH in ("SM90", "SM100", "SM103") else LEGACY_SCAN_RTOL)
+                 and ARCH in ("SM90", "SM100", "SM103", "SM120") else LEGACY_SCAN_RTOL)
     H = num_heads
     cu, seq_map, _, _ = _build_layout(segments, ragged_tail=False)
     n_cp = cu.shape[0] - 1
@@ -321,7 +321,7 @@ def test_aggregate_card_state(
     reverse, transpose_m, h_dtype, m_dtype,
 ):
     scan_rtol = (fp32_rtol if h_dtype == m_dtype == torch.float32
-                 and ARCH in ("SM90", "SM100", "SM103") else LEGACY_SCAN_RTOL)
+                 and ARCH in ("SM90", "SM100", "SM103", "SM120") else LEGACY_SCAN_RTOL)
     H = num_heads
     cu, seq_map, _, _ = _build_layout(segments, ragged_tail=False)
     n_cp = cu.shape[0] - 1
