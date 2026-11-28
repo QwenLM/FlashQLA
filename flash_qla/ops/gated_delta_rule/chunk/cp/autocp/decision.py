@@ -24,7 +24,7 @@ from .utils import (
     warmup_from_gate_avg,
 )
 
-MAX_EVALS = 12
+MAX_EVALS = 3
 
 
 @functools.lru_cache(maxsize=4)
