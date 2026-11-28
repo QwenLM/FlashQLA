@@ -6,6 +6,10 @@ import tilelang
 import tilelang.language as T
 
 from flash_qla.utils import prepare_chunk_offsets
+from flash_qla.ops.gated_delta_rule.chunk.cp.autocp.launch import (
+    LaunchShape,
+    launch_config,
+)
 
 
 @tilelang.jit(
@@ -35,7 +39,10 @@ def tilelang_prepare_dh_ws(
     is_cp,
     state_v_first,
     num_stages=2,
+    block_DV=128,
 ):
+    assert block_DV > 0 and DV % block_DV == 0
+    ways = DV // block_DV
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
     num_chunks = T.dynamic("num_chunks")
@@ -91,8 +98,11 @@ def tilelang_prepare_dh_ws(
         dh: T.Tensor(dh_shape, dtype=dh_dtype),
         dh0: T.Tensor(dh0_shape, dtype=accum_dtype),
     ):
-        with T.Kernel(batch_size * H, threads=512) as (bbh,):
+        with T.Kernel(batch_size * H * ways, threads=512) as (bbhv,):
+            bbh = bbhv // ways
+            bv = bbhv % ways
             bb, bh = bbh // H, bbh % H
+            dv_start = bv * block_DV
             bhg = bh // (H // Hg)
 
             batch_idx = T.alloc_var("int32")
@@ -124,7 +134,7 @@ def tilelang_prepare_dh_ws(
             )
             # sm120 smem opt-in cap is 101376B: do_shared is single-buffered
             # (saves 8KB vs staging); its reuse is guarded by bar_do_free.
-            do_shared = T.alloc_shared((block_S, DV), dtype=o_dtype)
+            do_shared = T.alloc_shared((block_S, block_DV), dtype=o_dtype)
             g_shared = T.alloc_shared(
                 (num_stages, block_S), dtype=accum_dtype, scope="shared"
             )
@@ -134,19 +144,20 @@ def tilelang_prepare_dh_ws(
 
             # ===== Communication buffers =====
             dh_shared = T.alloc_shared(
-                (DV, DK) if state_v_first else (DK, DV),
+                (block_DV, DK) if state_v_first else (DK, block_DV),
                 dtype=qkva_dtype,
             )
             x_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
-            y_shared = T.alloc_shared((block_S, DV), dtype=qkva_dtype)
+            y_shared = T.alloc_shared((block_S, block_DV), dtype=qkva_dtype)
             p_shared = T.alloc_shared((block_S, block_S), dtype=qkva_dtype)
 
             # ===== Fragments =====
             dh_fragment = T.alloc_fragment(
-                (DV, DK) if state_v_first else (DK, DV),
+                (block_DV, DK) if state_v_first else (DK, block_DV),
                 dtype=accum_dtype,
             )
             xy_fragment = T.alloc_fragment((block_S, DK), dtype=accum_dtype)
+            y_fragment = T.alloc_fragment((block_S, block_DV), dtype=accum_dtype)
             p_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
             r_fragment = T.alloc_fragment((block_S, DK), dtype=accum_dtype)
             g_last_local_dh = T.alloc_local((1), dtype=accum_dtype)
@@ -191,9 +202,9 @@ def tilelang_prepare_dh_ws(
 
                 if use_dht:
                     if state_v_first:
-                        T.copy(dht[bb, bh, 0:DV, 0:DK], dh_fragment)
+                        T.copy(dht[bb, bh, dv_start:dv_start + block_DV, 0:DK], dh_fragment)
                     else:
-                        T.copy(dht[bb, bh, 0:DK, 0:DV], dh_fragment)
+                        T.copy(dht[bb, bh, 0:DK, dv_start:dv_start + block_DV], dh_fragment)
                 else:
                     T.clear(dh_fragment)
 
@@ -225,10 +236,10 @@ def tilelang_prepare_dh_ws(
                     # dh = g_last * dh  (g_shared already holds exp(g))
                     g_last_local_dh[0] = g_shared[i_s % num_stages, block_S - 1]
                     if state_v_first:
-                        for j_v, j_k in T.Parallel(DV, DK):
+                        for j_v, j_k in T.Parallel(block_DV, DK):
                             dh_fragment[j_v, j_k] *= g_last_local_dh[0]
                     else:
-                        for j_k, j_v in T.Parallel(DK, DV):
+                        for j_k, j_v in T.Parallel(DK, block_DV):
                             dh_fragment[j_k, j_v] *= g_last_local_dh[0]
                         
                     T.barrier_arrive(bar_4)
@@ -280,9 +291,9 @@ def tilelang_prepare_dh_ws(
 
                 if store_dh0:
                     if state_v_first:
-                        T.copy(dh_fragment, dh0[bb, bh, 0:DV, 0:DK])
+                        T.copy(dh_fragment, dh0[bb, bh, dv_start:dv_start + block_DV, 0:DK])
                     else:
-                        T.copy(dh_fragment, dh0[bb, bh, 0:DK, 0:DV])
+                        T.copy(dh_fragment, dh0[bb, bh, 0:DK, dv_start:dv_start + block_DV])
 
             elif tx < 256:
                 # ============ Consumer_PR ============
@@ -393,7 +404,7 @@ def tilelang_prepare_dh_ws(
                         T.gemm(
                             k_shared[i_s % num_stages, :, :],
                             dh_shared,
-                            xy_fragment,
+                            y_fragment,
                             transpose_B=True,
                             clear_accum=True,
                         )
@@ -401,7 +412,7 @@ def tilelang_prepare_dh_ws(
                         T.gemm(
                             k_shared[i_s % num_stages, :, :],
                             dh_shared,
-                            xy_fragment,
+                            y_fragment,
                             clear_accum=True,
                         )
                     
@@ -412,10 +423,10 @@ def tilelang_prepare_dh_ws(
                     # Step 4: Yg = -g_last * Y  (g_shared already holds exp(g))
                     g_last_local_y[0] = g_shared[i_s % num_stages, block_S - 1]
                     
-                    for j_s, j_v in T.Parallel(block_S, DV):
-                        xy_fragment[j_s, j_v] *= -g_last_local_y[0]
+                    for j_s, j_v in T.Parallel(block_S, block_DV):
+                        y_fragment[j_s, j_v] *= -g_last_local_y[0]
                         
-                    T.copy(xy_fragment, y_shared)
+                    T.copy(y_fragment, y_shared)
 
                     T.barrier_arrive(bar_5)
 
@@ -482,14 +493,14 @@ def tilelang_prepare_dh_ws(
 
                         if right <= seq_end_idx:
                             T.tma_copy(
-                                do[batch_idx, left:right, bh, 0:DV],
+                                do[batch_idx, left:right, bh, dv_start:dv_start + block_DV],
                                 do_shared,
                                 barrier=data_is_ready[i_s % num_stages],
                             )
                         else:
-                            for j_s, j_v in T.Parallel(block_S, DV):
+                            for j_s, j_v in T.Parallel(block_S, block_DV):
                                 if left + j_s < seq_end_idx:
-                                    do_shared[j_s, j_v] = do[batch_idx, left + j_s, bh, j_v]
+                                    do_shared[j_s, j_v] = do[batch_idx, left + j_s, bh, dv_start + j_v]
                                 else:
                                     do_shared[j_s, j_v] = 0
                         if right <= seq_end_idx:
@@ -571,7 +582,7 @@ def tilelang_prepare_dh_ws(
                                         batch_idx,
                                         chunk_start_idx + chunk_idx,
                                         bh,
-                                        0:DV,
+                                        dv_start:dv_start + block_DV,
                                         0:DK,
                                     ],
                                 )
@@ -583,7 +594,7 @@ def tilelang_prepare_dh_ws(
                                         chunk_start_idx + chunk_idx,
                                         bh,
                                         0:DK,
-                                        0:DV,
+                                        dv_start:dv_start + block_DV,
                                     ],
                                 )
 
@@ -667,6 +678,14 @@ def fused_gdr_dh_ws(
         device=k.device,
     )
 
+    sm_count = torch.cuda.get_device_properties(k.device).multi_processor_count
+    launch = launch_config(
+        "blackwell_sm120",
+        "prepare_dh",
+        LaunchShape(H=H, n_part=real_batch_size, P=sm_count),
+    )
+    block_DV = launch.block_DV
+
     tilelang_prepare_dh_ws_kernel = tilelang_prepare_dh_ws(
         H,
         Hg,
@@ -688,6 +707,7 @@ def fused_gdr_dh_ws(
         is_varlen=is_varlen,
         is_cp=is_cp,
         state_v_first=state_v_first,
+        block_DV=block_DV,
     )
     tilelang_prepare_dh_ws_kernel(
         q, k, a, g, b, do, dht, cu_seqlens, chunk_offsets,

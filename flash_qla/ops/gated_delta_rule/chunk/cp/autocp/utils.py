@@ -260,8 +260,8 @@ def struct_features(chunks, S: int, H: int, P: int, warmup_per_head,
         if family == "bwd" and not is_train:
             depths[kernel] = 0.0
             continue
-        copies = (1 if family in ("prep", "bwd")
-                  else launch_config(backend, kernel, shape).ways * H)
+        ways = launch_config(backend, kernel, shape).ways
+        copies = ways if family in ("prep", "bwd") else ways * H
         key = (family, copies)
         if key not in memo:
             memo[key] = schedule_depth(runs[family], copies, P)
